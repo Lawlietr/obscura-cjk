@@ -10,6 +10,65 @@ speaks the Chrome DevTools Protocol, and is a drop-in replacement for headless
 Chrome with Puppeteer and Playwright. Rendering and stealth are both first-class
 capabilities. It targets web scraping and AI-agent automation.
 
+## Docker Deployment
+
+Obscura provides an official Docker image (`h4ckf0r0day/obscura`). For AI agent use,
+run MCP mode with recommended security hardening:
+
+```yaml
+services:
+  obscura:
+    image: h4ckf0r0day/obscura:latest
+    container_name: obscura
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:3000:3000"
+    command: ["mcp", "--http", "--port", "3000", "--host", "0.0.0.0"]
+    environment:
+      - OBSCURA_ALLOW_PRIVATE_NETWORK=0
+      - OBSCURA_PROXY=
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    mem_limit: 256m
+    cpus: 2.0
+```
+
+### CDP Mode
+
+For Puppeteer/Playwright integration, run CDP server mode:
+
+```yaml
+services:
+  obscura:
+    image: h4ckf0r0day/obscura:latest
+    container_name: obscura
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:9222:9222"
+    command: ["serve"]
+```
+
+Then connect clients at `ws://localhost:9222/devtools/browser`.
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `OBSCURA_ALLOW_PRIVATE_NETWORK` | Allow SSRF to loopback/RFC1918 | `0` |
+| `OBSCURA_PROXY` | Proxy URL for HTTP requests | empty |
+
+### Notes
+
+- **Stealth mode** is not included in the Docker image. Use source build with
+  `--features stealth` for fingerprint protections.
+- The default CMD binds to `0.0.0.0` inside the container for Docker port mapping.
+- Native binary defaults to `127.0.0.1` (loopback only).
+
 ## Build
 
 ```bash

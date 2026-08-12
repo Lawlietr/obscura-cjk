@@ -41,8 +41,15 @@ RUN echo "Building Obscura version ${OBSCURA_VERSION:-from Cargo.toml}" && \
 
 # ---
 
-# distroless/cc: glibc + libgcc + CA certs only — no shell, no package manager
-FROM gcr.io/distroless/cc-debian12
+# Debian 12 with full timezone support
+FROM debian:12-slim
+
+# Copy CA certs from distroless
+COPY --from=gcr.io/distroless/cc-debian12 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# Set timezone to Asia/Taipei
+ENV TZ=Asia/Taipei
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 COPY --from=builder /build/target/release/obscura /obscura
 COPY --from=builder /build/target/release/obscura-worker /obscura-worker

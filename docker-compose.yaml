@@ -1,0 +1,20 @@
+services:
+  obscura:
+    image: h4ckf0r0day/obscura:latest
+    container_name: obscura
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:3000:3000"
+    command: ["mcp", "--http", "--port", "3000", "--host", "0.0.0.0"]
+    environment:
+      - OBSCURA_ALLOW_PRIVATE_NETWORK=0
+      - OBSCURA_PROXY=
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    mem_limit: 256m
+    cpus: 2.0
