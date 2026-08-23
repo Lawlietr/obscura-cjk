@@ -15,6 +15,9 @@ capabilities. It targets web scraping and AI-agent automation.
 ```bash
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render
 
+# Rendering with embedded CJK fallback faces (recommended default; see below)
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render,cjk
+
 # Rendering and stealth
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render,stealth
 
@@ -25,6 +28,20 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
 
 - The first build compiles V8 from source: ~5 minutes and a few GB of disk.
   Incremental builds are seconds.
+- **CJK:** `--features render,cjk` embeds Noto Sans CJK SC/TC Regular as
+  glyph-level fallback faces (SIL OFL) so Chinese/Japanese text shapes without
+  any host fonts or page webfonts. It is off by default to keep the base
+  binary ~30 MB smaller; the Dockerfile and the recommended builds enable it.
+  Only Regular weight is embedded (bold CJK is not synthesized) and Hangul is
+  not covered; see the font-directory escape hatch below.
+- **Font directory (opt-in):** `OBSCURA_FONTS_DIR` (env) or the global CLI
+  flag `--fonts <PATH>` (valid before or after the subcommand, forwarded to
+  scrape workers) adds a directory of extra font files as fallback faces after
+  the bundled set. The scan is non-recursive, filename-sorted, and accepts
+  `ttf`/`otf`/`ttc`/`woff`/`woff2`; unparseable files are skipped with a
+  stderr warning. This is a deliberate escape hatch from the bundled-faces-only
+  determinism: layout then varies with the directory contents. Use it for
+  scripts the embedded faces lack (Korean Hangul, CJK weights, etc.).
 - **Iterating on one crate? Scope it:** `cargo build -p obscura-cli`. A bare
   `cargo build` can re-link the whole workspace; the V8 compile is the cost, so
   avoid touching it when you don't need to.
@@ -40,8 +57,8 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
 Run tests with **`cargo nextest`, not `cargo test`**:
 
 ```bash
-cargo nextest run --release --features render -p <crate>
-cargo nextest run --release --features render --no-fail-fast
+cargo nextest run --release --features render,cjk -p <crate>
+cargo nextest run --release --features render,cjk --no-fail-fast
 ```
 
 `cargo test` runs the whole test binary in one process, but the engine holds a
@@ -64,8 +81,9 @@ pass %, not whole-file pass.
 For any code change:
 
 1. Run focused release-mode nextest coverage for the crates and repro involved.
-2. Run `cargo nextest run --release --features render --no-fail-fast`.
-3. Run the exact release build shown above.
+2. Run `cargo nextest run --release --features render,cjk --no-fail-fast`.
+3. Run the exact release build shown above (with `render,cjk` when the change
+   touches fonts or the render layer).
 4. The obstacle course still reports **33/33**.
 5. For render changes, run deterministic fixtures and broad top/bottom real-site
    captures using the methodology below.

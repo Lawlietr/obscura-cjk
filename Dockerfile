@@ -30,14 +30,14 @@ RUN for crate in obscura-dom obscura-net obscura-browser obscura-cdp obscura-js 
     echo "fn main() {}" > crates/obscura-cli/src/main.rs && \
     echo "fn main() {}" > crates/obscura-cli/src/worker.rs
 
-RUN cargo build --release --features render --bin obscura --bin obscura-worker 2>/dev/null || true
+RUN cargo build --release --features render,cjk --bin obscura --bin obscura-worker 2>/dev/null || true
 
 ARG OBSCURA_VERSION
 
 # Copy real sources and build
 COPY crates/ crates/
 RUN echo "Building Obscura version ${OBSCURA_VERSION:-from Cargo.toml}" && \
-    touch crates/*/src/*.rs && cargo build --release --features render --bin obscura --bin obscura-worker
+    touch crates/*/src/*.rs && cargo build --release --features render,cjk --bin obscura --bin obscura-worker
 
 # ---
 
