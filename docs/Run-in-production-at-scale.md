@@ -6,7 +6,7 @@ docker run -d \
   --restart unless-stopped \
   -p 127.0.0.1:9222:9222 \
   -v /srv/obscura/data:/data \
-  h4ckf0r0day/obscura \
+  obscura-cjk \
   serve --host 0.0.0.0 --storage-dir /data --stealth
 ```
 

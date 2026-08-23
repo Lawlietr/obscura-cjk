@@ -12,13 +12,17 @@ capabilities. It targets web scraping and AI-agent automation.
 
 ## Docker Deployment
 
-Obscura provides an official Docker image (`h4ckf0r0day/obscura`). For AI agent use,
-run MCP mode with recommended security hardening:
+The Docker image is built from this repo's `Dockerfile` and tagged
+`obscura-cjk` (it is not published to a registry). The repo's
+`docker-compose.yaml` is the canonical local deployment (MCP mode with the
+recommended security hardening); `docker compose up -d` from the repo root is
+the default way to run it. Standalone examples for reference:
 
 ```yaml
 services:
   obscura:
-    image: h4ckf0r0day/obscura:latest
+    image: obscura-cjk
+    build: .
     container_name: obscura
     restart: unless-stopped
     ports:
@@ -45,7 +49,8 @@ For Puppeteer/Playwright integration, run CDP server mode:
 ```yaml
 services:
   obscura:
-    image: h4ckf0r0day/obscura:latest
+    image: obscura-cjk
+    build: .
     container_name: obscura
     restart: unless-stopped
     ports:
@@ -177,6 +182,17 @@ edit instead.
 
 ## Conventions
 
+- **Do not run verification automatically.** Builds, `nextest` runs, render
+  captures, and obstacle-course runs only happen when the user asks. "Before
+  you finish" below lists what to run *when asked*, not what to run by default.
+- **This repo is an independent fork (`Lawlietr/obscura-cjk`), not the
+  upstream.** It has diverged from `h4ckf0r0day/obscura`. All operational
+  references -- docs, install URLs, releases, Docker image (`obscura-cjk`,
+  built locally, not on a registry), CI, issue/security templates -- point at
+  this repo, never the upstream. Upstream is mentioned only where required or
+  factual: Apache-2.0 fork attribution in README/License, the
+  `obscura-benchmark` suite (which only exists upstream), and historical
+  citations of upstream PRs.
 - **Performance is a hard constraint** (Obscura is ~12x faster and uses ~6x less
   memory than headless Chrome on framework pages). Keep native Rust fast paths;
   add a JS fallback only for real spec edge cases. Benchmark old and new

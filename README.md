@@ -1,24 +1,13 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/h4ckf0r0day/obscura/main/assets/icon.png" alt="Obscura" width="80" />
+  <img src="assets/icon.png" alt="Obscura" width="80" />
 </p>
-<h2 align="center">Obscura</h2>
+<h2 align="center">Obscura (CJK fork)</h2>
 <p align="center">
-  <a href="https://trendshift.io/repositories/25837?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-25837" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/25837/daily" alt="h4ckf0r0day%2Fobscura | Trendshift" width="250" height="55"/></a>
-</p>
-<p align="center">
-  <a href="https://docs.obscura.sh"><img src="https://img.shields.io/badge/Docs-1a1a1a?style=for-the-badge&logo=gitbook&logoColor=white" alt="Documentation" /></a>
-  <a href="https://obscura.sh"><img src="https://img.shields.io/badge/Website-1a1a1a?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjE5MCAxNzAgNDIwIDQyMCI+PHBhdGggZmlsbD0iI0ZGRkZGRiIgZmlsbC1ydWxlPSJldmVub2RkIiBkPSJNNDA2LDE3NS4wMDA0MTIgQzQ0MC40OTg5MzIsMTc1LjAwMDM1MSA0NzQuNDk4MTA4LDE3NS4wODA5OTQgNTA4LjQ5NjczNSwxNzQuOTc1NjYyIEM1MzcuNzMzNjQzLDE3NC44ODUwODYgNTYxLjI3MDY5MSwxODcuMjIwNTUxIDU3OS45Mzk2MzYsMjA4Ljc4NjYyMSBDNTkwLjg0MTA2NCwyMjEuMzc5Nzc2IDU5Ny44ODM1NDUsMjM2LjM1MjY2MSA1OTkuOTgxODczLDI1My4yMjAzNjcgQzYwMC40NDU1NTcsMjU2Ljk0NzU0MCA2MDAuOTUxMTExLDI2MC43MDQ0MzcgNjAwLjk1NjYwNCwyNjQuNDQ4MzY0IEM2MDEuMDIyNjQ0LDMwOS42MTM1MjUgNjAxLjA3NTgwNiwzNTQuNzc5MDIyIDYwMC45NTE3ODIsMzk5Ljk0MzkzOSBDNjAwLjkxMzE0Nyw0MTQuMDMyMzQ5IDYwMC42NjMyNjksNDI4LjE0MDEwNiA1OTkuNzgyMjg4LDQ0Mi4xOTMzNTkgQzU5OS41NDEwMTYsNDQ2LjA0MDg5NCA1OTcuNTYwNzkxLDQ1MC42MTU2MDEgNTk0Ljg1MzIxMCw0NTMuMzQxMzA5IEM1NzEuMTc3NTUxLDQ3Ny4xNzUzMjMgNTQ3LjE4MDcyNSw1MDAuNjkwNzk2IDUyMy4yMjc5NjYsNTI0LjI0ODc3OSBDNTA2Ljc5OTgzNSw1NDAuNDA2MTI4IDQ5MC4yMDk5OTEsNTU2LjM5OTkwMiA0NzMuODY0NTYzLDU3Mi42NDAxMzcgQzQ2OC44MDA4NDIsNTc3LjY3MTIwNCA0NjMuMDgyODg2LDU4MC4wNTQxOTkgNDU1Ljk3MDYxMiw1ODAuMDQzODIzIEM0MDAuOTcyNDQzLDU3OS45NjM1MDEgMzQ1Ljk3MzY2Myw1ODAuMTMyMDE5IDI5MC45NzYwNDQsNTc5LjkzNjc2OCBDMjY3LjU4MDQxNCw1NzkuODUzNjk5IDI0Ni41NTEyMDgsNTcyLjA0MzU3OSAyMjguOTM5NzQzLDU1Ni44Mjc1MTUgQzIxMi44NDk2MjUsNTQyLjkyNTg0MiAyMDIuNzUxOTY4LDUyNC45MDIxMDAgMTk4LjE1NjE1OCw1MDQuMDM5NjczIEMxOTcuMjgyMTk2LDUwMC4wNzIyOTYgMTk3LjA1MjQxNCw0OTUuODk1Mzg2IDE5Ny4wNDczMzMsNDkxLjgxNDQ4NCBDMTk2Ljk3ODE0OSw0MzYuMTQ5NjU4IDE5Ny4wNTA3MjAsMzgwLjQ4NDYxOSAxOTYuOTMyNjE3LDMyNC44MTk5NDYgQzE5Ni45MTkxNDQsMzE4LjQ3MDkxNyAxOTkuMTg0ODQ1LDMxMy40MTYxOTkgMjAzLjQ5NTU3NSwzMDkuMTAwNTI1IEMyNDAuNTg3OTk3LDI3MS45NjU0MjQgMjc3LjY4MjQ5NSwyMzQuODMyMzA2IDMxNC44MzQ1NjQsMTk3Ljc1Njk1OCBDMzIwLjk1NjQyMSwxOTEuNjQ3Nzk3IDMyNy4yNjQ0MzUsMTg1LjcxNTI1NiAzMzMuNjczOTIwLDE3OS45MDgwODEgQzMzNy4zNzYwMzgsMTc2LjU1MzgzMyAzNDEuNzIxNDY2LDE3NC44NTMzMTcgMzQ3LjAwNTc5OCwxNzQuOTEyODcyIEMzNjYuNTAxNzA5LDE3NS4xMzI2MTQgMzg2LjAwMTYxNywxNzUuMDAwMzIwIDQwNiwxNzUuMDAwNDEyIFogTTUwMy4zNDQ2NjYsMjczLjg0MDE0OSBDNTA0LjEwMjcyMiwyNzYuMTY3NTcyIDUwNC45NDA5NDgsMjc4LjIxMTA5MCA1MDQuOTQzMjY4LDI4MC4yNTU1MjQgQzUwNS4wMTI4NDgsMzQxLjc0MjI0OSA1MDQuOTY5MTQ3LDQwMy4yMjkwNjUgNTA1LjAzMDc5Miw0NjQuNzE1NzkwIEM1MDUuMDQwODAyLDQ3NC42ODY0OTMgNDk2LjExNzQ2Miw0ODMuOTUzMTg2IDQ4NS43Nzc5MjQsNDgzLjk2NTI3MSBDNDI0LjYyNDQ1MSw0ODQuMDM2ODk2IDM2My40NzA5MTcsNDg0LjAwMzIzNSAzMDIuMzE3MzgzLDQ4My45OTY3MzUgQzI5NS41ODc3NjksNDgzLjk5NjAzMyAyOTMuMDAxMjUxLDQ4MS4zMDE2MDUgMjkzLjAwMDkxNiw0NzQuMzM4NTYyIEMyOTIuOTk3ODY0LDQxMy4zNTE2NTQgMjkzLjIwOTYyNSwzNTIuMzYzMzEyIDI5Mi43ODA3MDEsMjkxLjM3OTM5NSBDMjkyLjcxMzUzMSwyODEuODI4MDk0IDMwMy4yMTMwNDMsMjcwLjgyNDE1OCAzMTMuNDc4MjcxLDI3MC44OTQzMTggQzM1MS45NjgyMDEsMjcxLjE1NzQ0MCAzOTAuNDYwOTk5LDI3MC45OTk3ODYgNDI4Ljk1MjcyOCwyNzAuOTk5Nzg2IEM0NTEuMTE0NjI0LDI3MC45OTk3ODYgNDczLjI3NzI4MywyNzAuOTE3NDgwIDQ5NS40Mzc0NjksMjcxLjExMjE1MiBDNDk3Ljk3NzAyMCwyNzEuMTM0NDkxIDUwMC41MDI5MzAsMjcyLjcwNDM3NiA1MDMuMzQ0NjY2LDI3My44NDAxNDkgWiI+PC9wYXRoPjwvc3ZnPgo=&logoColor=white" alt="Website" /></a>
-  <a href="https://x.com/obscura_sh" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/TWITTER%20%2F%20X-1a1a1a?style=for-the-badge&logo=x&logoColor=white" alt="Obscura on Twitter/X" /></a>
-  <a href="https://cal.com/obscura/quick-chat"><img src="https://img.shields.io/badge/Book_a_Demo-1a1a1a?style=for-the-badge&logo=googlecalendar&logoColor=white" alt="Book a demo" /></a>
-  <a href="https://github.com/h4ckf0r0day/obscura/releases"><img src="https://img.shields.io/badge/Releases-1a1a1a?style=for-the-badge&logo=github&logoColor=white" alt="Releases" /></a>
+  <a href="https://github.com/Lawlietr/obscura-cjk/releases"><img src="https://img.shields.io/badge/Releases-1a1a1a?style=for-the-badge&logo=github&logoColor=white" alt="Releases" /></a>
 </p>
 <p align="center">
-  <strong>The open-source headless browser for AI agents and web scraping.</strong><br>
-  Lightweight, stealthy, and built in Rust.
-</p>
-<h3 align="center">Native rendering is here. No Chromium required. 🎉 </h3>
-<p align="center">
-  Capture screenshots, screencast live pages, and export PDFs directly with Obscura.
+  A fork of <a href="https://github.com/h4ckf0r0day/obscura">Obscura</a>
+  (Apache-2.0) with embedded CJK font rendering.
 </p>
 <p align="center">
   📄 Documentation: English (this file) · <a href="README_ZH.md">繁體中文</a>
@@ -26,7 +15,27 @@
 
 ---
 
-Obscura is a headless browser engine written in Rust, built for web scraping and AI agent automation. It runs real JavaScript via V8, supports the Chrome DevTools Protocol, and acts as a drop-in replacement for headless Chrome with Puppeteer and Playwright.
+This is a fork of [Obscura](https://github.com/h4ckf0r0day/obscura), a headless
+browser engine written in Rust for web scraping and AI agent automation. It
+runs real JavaScript via V8, speaks the Chrome DevTools Protocol, and is a
+drop-in replacement for headless Chrome with Puppeteer and Playwright. The
+upstream project is licensed under Apache-2.0; this fork keeps the engine
+unchanged and adds CJK font rendering.
+
+### What this fork adds
+
+- **Embedded CJK fallback fonts.** A `cjk` cargo feature embeds Noto Sans CJK
+  SC/TC (Regular, SIL OFL 1.1) in the binary, so Chinese and Japanese text
+  renders without host fonts or page webfonts. On in the release archives and
+  the Docker image.
+- **Runtime font directory.** A global `--fonts <PATH>` flag and the
+  `OBSCURA_FONTS_DIR` environment variable load extra font files at runtime,
+  for scripts the embedded set does not cover (e.g. Hangul).
+- **docker-compose deployment recipes** for the CDP server and the MCP HTTP
+  server, in [Docker](#docker).
+
+Everything else — rendering, screenshots, PDF export, CDP, MCP, stealth — is
+upstream functionality and works unchanged.
 
 ### Why Obscura over headless Chrome?
 
@@ -40,141 +49,29 @@ Obscura is a headless browser engine written in Rust, built for web scraping and
 | Puppeteer    | **Yes**      | Yes              |
 | Playwright   | **Yes**      | Yes              |
 
-<table>
-  <tr>
-    <td width="90" align="center">
-      <a href="https://blog.cloudflare.com/kitesurf/">
-        <img
-          src="https://cdn.simpleicons.org/cloudflare/F38020"
-          alt="Cloudflare"
-          width="54"
-        />
-      </a>
-    </td>
-    <td>
-      <strong>Obscura inspired Cloudflare Kitesurf’s first prototype</strong>
-      <br>
-      Cloudflare began by porting Obscura to Workers while developing its
-      new agent-first browser.
-      <br>
-      <a href="https://blog.cloudflare.com/kitesurf/">
-        Read Cloudflare’s engineering story →
-      </a>
-    </td>
-  </tr>
-</table>
-
-## Obscura Cloud
-
-We are working on **Obscura Cloud** the hosted version, with managed infrastructure, residential proxies, and dedicated support. For people who want the engine without operating it themselves.
-
-The open-source engine stays Apache-2.0, fully featured. No feature gating, ever.
-
-**[Get on the waitlist →](https://tally.so/r/gDWzdD)**
-<br>
-**[📅 Book a demo →](https://cal.com/obscura/quick-chat)**
-
-## Sponsors
-
-**Obscura** is supported by organizations helping us build independent open-source browser infrastructure.
-
-Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
-
-<table>
-   <tr>
-    <td width="200" align="center" valign="middle">
-      <a href="https://go.nodemaven.com/obscura" target="_blank">
-        <img alt="NodeMaven" src="assets/sponsors/nodemaven.svg" width="180"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://go.nodemaven.com/obscuraread"><b>NodeMaven</b></a> — the most reliable proxy provider with the highest quality IPs on the market. Built for automation, web scraping, SEO research, and social media management.<br><br>
-      <b>99.9% uptime<br>
-      Sticky sessions up to 7 days<br>
-      IP filtering on every proxy<br>
-      No KYC required<br>
-      Cashback on traffic — earn up to 10% back<br><br></b>
-      🎁 Use code <b>OBSCURA35</b> for 35% off Mobile & Residential, or <b>OBSCURA40</b> for 40% off ISP (Static) proxies.
-    </td>
-  </tr>
-  <tr>
-    <td width="200" align="center" valign="middle">
-      <a href="https://proxyempire.io/?ref=obscura&utm_source=obscuragithub" target="_blank">
-        <img alt="ProxyEmpire" src="assets/sponsors/proxyempire.png" width="180"/>
-      </a>
-    </td>
-    <td valign="middle">
-      🚀 <b>Obscura × ProxyEmpire</b><br>
-      Using Obscura for AI agents, browser automation, or web scraping? Power it with reliable residential and mobile proxies from <a href="https://proxyempire.io/?ref=obscura&utm_source=obscuragithub"><b>ProxyEmpire</b></a>.<br><br>
-      <b>🌍 30M+ residential IPs in 170+ countries<br>
-      📱 4G/5G mobile proxies<br>
-      🔄 Rotating & sticky sessions<br>
-      🎯 City, region & ISP targeting<br>
-      🔐 HTTP, HTTPS & SOCKS5 support<br><br>
-      🎁 Use code <b>OBSCURA35</b> for a <b>35% recurring discount</b>.<br><br></b>
-      Better proxies. Fewer blocks. More scalable automation.
-    </td>
-    </tr>
-    <td width="200" align="center" valign="middle">
-      <a href="https://www.thordata.com/?ls=dob&lk=dob" target="_blank">
-        <img alt="Thordata" src="/assets/sponsors/thordatalogo.png" width="180"/>
-      </a>
-    </td>
-    <td valign="middle">
-      🚀 <b>Obscura × Thordata</b><br>
-      Need more stable proxies for automation, public web scraping, SEO, or ad verification? Power your workflow with <a href="https://www.thordata.com/?ls=dob&lk=dob"><b>Thordata</b></a>.<br><br>
-      <b>🌍 Residential Proxies: 100M+ real residential IPs in 190+ countries<br>
-      ♾️ Unlimited Proxies: for heavy traffic and high concurrency<br>
-      ✨ Recently upgraded residential IP pool<br>
-      ✨ Unlimited Concurrent Sessions<br>
-      🔁 Rotating & Sticky Sessions<br>
-      📍 Flexible GEO targeting<br>
-      ⚡ Stable HTTP(S) connections<br><br>
-      🎁 Use code <b>obscura</b> for <b>10% off</b>.<br><br></b>
-      Get started with a 3-day free trial and test Thordata with your own workflow.
-    </td>
-  </tr>
- <tr>
-    <td width="200" align="center" valign="middle">
-      <a href="https://niuproxy.com/?utm_source=obscura&utm_medium=obscura&ref=obscura" target="_blank">
-        <img alt="NiuProxy" src="assets/sponsors/niuproxlogo.png" width="180"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://niuproxy.com/?utm_source=obscura&utm_medium=obscura&ref=obscura"><b>NiuProxy</b></a> Rotating Residential Proxies — Special Offer: 10TB at $0.35/GB | 1TB at $0.50/GB.<br><br>
-      🎁 Use code <b>PAY2</b> for <b>10% off</b> your recharge.
-    </td>
-  </tr>
-</table>
 
 ## Install
 
 ### Download
 
-Grab the latest binary from [Releases](https://github.com/h4ckf0r0day/obscura/releases):
+Grab the latest binary from [Releases](https://github.com/Lawlietr/obscura-cjk/releases):
 
 ```bash
 # Linux x86_64
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-linux.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-x86_64-linux.tar.gz
 tar xzf obscura-x86_64-linux.tar.gz
 ./obscura fetch https://example.com --eval "document.title"
 
 # Linux ARM64 (aarch64)
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-linux.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-aarch64-linux.tar.gz
 tar xzf obscura-aarch64-linux.tar.gz
 
-# Arch Linux (AUR)
-yay -S obscura-browser
-
-# NixOS
-nix-env -iA nixpkgs.obscura
-
 # macOS Apple Silicon
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-macos.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-aarch64-macos.tar.gz
 tar xzf obscura-aarch64-macos.tar.gz
 
 # macOS Intel
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-macos.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-x86_64-macos.tar.gz
 tar xzf obscura-x86_64-macos.tar.gz
 
 # Windows
@@ -197,17 +94,70 @@ usable on common LTS servers with glibc 2.35+.
 
 ### Docker
 
+The image is not on a registry yet; build it from the `Dockerfile` in this
+repo:
+
 ```bash
-docker run -d --name obscura -p 127.0.0.1:9222:9222 h4ckf0r0day/obscura
+docker build -t obscura-cjk .
+
+docker run -d --name obscura -p 127.0.0.1:9222:9222 obscura-cjk
 ```
 
-Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage build on `distroless/cc`, no shell, no package manager, ~57 MB compressed. The image is built with the `cjk` feature on, so CJK text renders out of the box (see [CJK and custom fonts](#cjk-and-custom-fonts)).
+Multi-stage build on `distroless/cc`, no shell, no package manager, ~57 MB
+compressed. The image is built with the `cjk` feature on, so CJK text renders
+out of the box (see [CJK and custom fonts](#cjk-and-custom-fonts)).
+
+#### docker-compose
+
+**CDP mode** (Puppeteer/Playwright, port 9222):
+
+```yaml
+services:
+  obscura:
+    image: obscura-cjk
+    container_name: obscura
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:9222:9222"
+    command: ["serve"]
+```
+
+Then connect clients at `ws://localhost:9222/devtools/browser`.
+
+**MCP mode** (AI agents over HTTP, port 3000):
+
+```yaml
+services:
+  obscura:
+    image: obscura-cjk
+    container_name: obscura
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:3000:3000"
+    command: ["mcp", "--http", "--port", "3000", "--host", "0.0.0.0"]
+    environment:
+      - OBSCURA_ALLOW_PRIVATE_NETWORK=0
+      - OBSCURA_PROXY=
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    mem_limit: 256m
+    cpus: 2.0
+```
+
+The MCP endpoint is `http://localhost:3000/mcp`. To add fonts the embedded set
+lacks (Hangul, CJK weights), mount a read-only directory with the font files
+and set `OBSCURA_FONTS_DIR` in `environment`.
 
 ### Build from source
 
 ```bash
-git clone https://github.com/h4ckf0r0day/obscura.git
-cd obscura
+git clone https://github.com/Lawlietr/obscura-cjk.git
+cd obscura-cjk
 
 # Rendering with embedded CJK fallback fonts (recommended)
 cargo build --release -p obscura-cli --bins --features render,cjk
@@ -476,7 +426,7 @@ Page load:
 | JS + XHR + fetch | **84 ms** | ~800 ms |
 | Dynamic scripts | **78 ms** | ~700 ms |
 
-The full benchmark suite (WPT conformance, obstacle course, real-world corpus, and vs-Chrome speed) lives in a separate repo: https://github.com/h4ckf0r0day/obscura-benchmark
+The full benchmark suite (WPT conformance, obstacle course, real-world corpus, and vs-Chrome speed) lives in the upstream repo: https://github.com/h4ckf0r0day/obscura-benchmark
 
 ## Stealth Mode
 
@@ -655,6 +605,9 @@ streaming `Page.startScreencast` protocol.
 
 ## License
 
-Apache 2.0
+Apache 2.0. Fork of [h4ckf0r0day/obscura](https://github.com/h4ckf0r0day/obscura)
+(Apache-2.0); the embedded CJK fonts are Noto Sans CJK SC/TC, released under
+SIL OFL 1.1 (see
+[crates/obscura-render/assets/LICENSE-OFL.txt](crates/obscura-render/assets/LICENSE-OFL.txt)).
 
 ---

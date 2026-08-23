@@ -1,7 +1,7 @@
 ## Linux x86_64
 
 ```bash
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-linux.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-x86_64-linux.tar.gz
 tar xzf obscura-x86_64-linux.tar.gz
 ./obscura --version
 ```
@@ -9,7 +9,7 @@ tar xzf obscura-x86_64-linux.tar.gz
 ## Linux ARM64
 
 ```bash
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-linux.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-aarch64-linux.tar.gz
 tar xzf obscura-aarch64-linux.tar.gz
 ./obscura --version
 ```
@@ -19,7 +19,7 @@ Linux builds target Ubuntu 22.04 and require glibc 2.35+.
 ## macOS Apple Silicon
 
 ```bash
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-macos.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-aarch64-macos.tar.gz
 tar xzf obscura-aarch64-macos.tar.gz
 ./obscura --version
 ```
@@ -27,30 +27,29 @@ tar xzf obscura-aarch64-macos.tar.gz
 ## macOS Intel
 
 ```bash
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-macos.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-x86_64-macos.tar.gz
 tar xzf obscura-x86_64-macos.tar.gz
 ./obscura --version
 ```
 
 ## Windows
 
-Download the `.zip` from [Releases](https://github.com/h4ckf0r0day/obscura/releases), extract, run `obscura.exe --version`.
-
-## Arch Linux (AUR)
-
-```bash
-yay -S obscura-browser
-```
+Download the `.zip` from [Releases](https://github.com/Lawlietr/obscura-cjk/releases), extract, run `obscura.exe --version`.
 
 ## Docker
 
+The image is not on a registry; build it from this repo's `Dockerfile` (or use
+the repo's `docker-compose.yaml`, which builds it for you):
+
 ```bash
-docker run -d --name obscura -p 127.0.0.1:9222:9222 h4ckf0r0day/obscura
+docker build -t obscura-cjk .
+docker run -d --name obscura -p 127.0.0.1:9222:9222 obscura-cjk
 ```
 
-Image: [h4ckf0r0day/obscura](https://hub.docker.com/r/h4ckf0r0day/obscura). Built on `distroless/cc`, with no shell or package manager in the runtime image.
+Built on `distroless/cc`, with no shell or package manager in the runtime
+image, and with the `cjk` feature on so CJK text renders out of the box.
 
-Official archives and the Docker image include the rendering engine. Source
+Release archives and the Docker image include the rendering engine. Source
 builders must pass `--features render`; see [Build from source](Build-from-source.md).
 
 ## From source

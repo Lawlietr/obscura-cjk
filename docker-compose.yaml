@@ -1,6 +1,7 @@
 services:
   obscura:
-    image: h4ckf0r0day/obscura:latest
+    image: obscura-cjk
+    build: .
     container_name: obscura
     restart: unless-stopped
     ports:

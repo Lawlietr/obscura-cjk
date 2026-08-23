@@ -9,8 +9,8 @@ First build takes about 5 minutes. Incremental builds are seconds.
 ## Build
 
 ```bash
-git clone https://github.com/h4ckf0r0day/obscura.git
-cd obscura
+git clone https://github.com/Lawlietr/obscura-cjk.git
+cd obscura-cjk
 cargo build --release -p obscura-cli --bins --features render
 ```
 
