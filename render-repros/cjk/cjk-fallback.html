@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>CJK fallback fixture</title>
+<style>
+  body { margin: 0; font-family: sans-serif; font-size: 16px; color: #111; }
+  main { width: 860px; padding: 24px; }
+  h1 { font-size: 28px; margin: 0 0 12px; }
+  h2 { font-size: 20px; margin: 20px 0 8px; }
+  p { margin: 0 0 10px; line-height: 1.5; }
+  .box { border: 1px solid #999; padding: 12px; margin: 0 0 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>字型測試 Font Fallback Test</h1>
+  <h2>繁體中文 Traditional</h2>
+  <p>觀海聽濤，山明水秀。繁體字面的點畫結構應完整可讀，而非豆腐方塊。</p>
+  <h2>简体中文 Simplified</h2>
+  <p>山高水长，风清月朗。简体字面的笔画结构应完整可读，而非豆腐方块。</p>
+  <h2>Japanese kana</h2>
+  <p>いろはにほへと ちりぬるを めもぬくえ</p>
+  <h2>Mixed</h2>
+  <div class="box">
+    <p>The quick 棕色狐狸 jumps over the 懶惰狗; 1234567890 全形空格　。</p>
+    <p>Layout metrics: 字距與行高 should track the real glyph advances.</p>
+  </div>
+</main>
+</body>
+</html>

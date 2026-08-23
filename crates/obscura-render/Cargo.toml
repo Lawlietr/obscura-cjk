@@ -12,6 +12,12 @@ default = []
 # shaping + line breaking, ab_glyph fallback) and images.
 # Off by default; the layout core (getBoundingClientRect etc.) works without it.
 paint = ["dep:tiny-skia", "dep:ab_glyph", "dep:cosmic-text", "dep:swash", "dep:image", "dep:ureq", "dep:base64", "dep:resvg", "dep:usvg", "dep:url", "dep:wuff"]
+# Embed Noto Sans CJK SC/TC Regular as glyph-level fallback faces so CJK text
+# renders without any host fonts or page webfonts. Implies paint (shaping only
+# exists there). Off by default to keep binaries smaller; the fontdb and
+# layout behavior are otherwise identical. The OBSCURA_FONTS_DIR directory
+# mechanism works regardless of this feature.
+cjk = ["paint"]
 
 [dependencies]
 taffy = { workspace = true }

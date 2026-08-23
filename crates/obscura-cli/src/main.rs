@@ -51,6 +51,15 @@ struct Args {
     #[arg(long, global = true)]
     allow_private_network: bool,
 
+    /// Directory of extra font files (ttf/otf/ttc/woff/woff2, scanned
+    /// non-recursively) added as fallback faces after the bundled set. Use it
+    /// for scripts the bundled faces lack, e.g. Korean Hangul or CJK weights
+    /// beyond the embedded Regular. Note: layout then varies with the
+    /// directory contents. Equivalent to `OBSCURA_FONTS_DIR`.
+    /// Global: applies to fetch, serve, scrape, and mcp.
+    #[arg(long, global = true, value_name = "PATH")]
+    fonts: Option<std::path::PathBuf>,
+
     /// Pass raw flags to V8, in the same form V8/Chromium/Node accept
     /// (e.g. `"--max-old-space-size=4096 --max-semi-space-size=64 --expose-gc"`).
     /// Applied once at startup before any isolate is created.
@@ -350,6 +359,16 @@ async fn main() -> anyhow::Result<()> {
         // threaded at this point.
         unsafe {
             std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        }
+    }
+
+    // Mirror the --fonts flag into OBSCURA_FONTS_DIR before any page engine
+    // is built (the font layer caches the directory scan per process), and
+    // scrape workers inherit it through their environment.
+    if let Some(ref fonts_dir) = args.fonts {
+        // SAFETY: same single-threaded startup window as above.
+        unsafe {
+            std::env::set_var("OBSCURA_FONTS_DIR", fonts_dir);
         }
     }
 
@@ -1582,6 +1601,10 @@ async fn run_parallel_scrape(
                 .env("OBSCURA_PROXY", proxy.as_deref().unwrap_or(""))
                 .env("OBSCURA_STEALTH", if stealth { "1" } else { "" })
                 .env("OBSCURA_OBEY_ROBOTS", if obey_robots { "1" } else { "" })
+                .env(
+                    "OBSCURA_FONTS_DIR",
+                    std::env::var("OBSCURA_FONTS_DIR").unwrap_or_default(),
+                )
                 .spawn()
             {
                 Ok(c) => c,

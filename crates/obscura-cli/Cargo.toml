@@ -17,6 +17,9 @@ path = "src/worker.rs"
 default = []
 stealth = ["obscura-browser/stealth", "obscura-net/stealth", "obscura-mcp/stealth"]
 render = ["obscura-browser/render", "obscura-cdp/render", "obscura-mcp/render"]
+# Render plus embedded Noto CJK fallback faces (screenshots of CJK pages
+# without host fonts or page webfonts).
+cjk = ["render", "obscura-browser/cjk"]
 
 [dependencies]
 obscura-browser = { workspace = true }

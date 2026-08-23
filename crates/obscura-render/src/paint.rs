@@ -2522,14 +2522,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     let seeded_content_images =
         resources.seed_content_image_intrinsics(tree, &mut intrinsic, &mut selected_images);
     let fonts = collect_web_fonts(tree, base_url, resources, dynamic_fonts);
-    // Most framework pages use web fonts and many decorative SVG icons, but
-    // only SVG text needs the page font faces. Avoid cloning/loading the page
-    // font database for ordinary icons and HTML-only text.
-    let svg_fonts = if has_inline_svg_text(tree) {
-        svg_font_database_with_web_fonts(&fonts)
-    } else {
-        svg_font_database()
-    };
+    let svg_fonts = svg_font_database_for_tree(tree, &fonts);
     let mut laid = match retained {
         Some((retained, mutations)) => layout_dom_with_web_fonts_and_retained_styles_with_animation_state(
             tree,
@@ -7082,15 +7075,7 @@ fn fetch_and_decode_font(
     if compressed.len() > 8 * 1024 * 1024 {
         return None;
     }
-    let decoded = match compressed.get(..4) {
-        Some(b"wOF2") => wuff::decompress_woff2(&compressed).ok(),
-        Some(b"wOFF") => wuff::decompress_woff1(&compressed).ok(),
-        // TrueType/OpenType collections and raw sfnt fonts already have the
-        // representation fontdb expects.
-        Some(b"\0\x01\0\0" | b"OTTO" | b"ttcf") => Some(compressed.as_ref().to_vec()),
-        _ => None,
-    }?;
-    (decoded.len() <= 32 * 1024 * 1024).then_some(decoded)
+    crate::inline::decode_font_bytes(&compressed)
 }
 
 fn font_face_blocks(css: &str) -> Vec<&str> {
@@ -10117,10 +10102,41 @@ fn svg_font_database() -> std::sync::Arc<usvg::fontdb::Database> {
     }))
 }
 
-fn svg_font_database_with_web_fonts(
+/// Base database plus the CJK/directory fallback faces the HTML text engine
+/// uses, so SVG text fallbacks match HTML fallbacks. Built only on pages that
+/// actually contain inline SVG text: the fallback faces (up to 32MB with
+/// feature `cjk`) parse for tens of milliseconds, and paying that on every
+/// first prepare blocks the event loop and delays early paint and observer
+/// callbacks on the far more common text-only pages.
+fn svg_font_database_with_fallbacks() -> std::sync::Arc<usvg::fontdb::Database> {
+    static DATABASE: std::sync::OnceLock<std::sync::Arc<usvg::fontdb::Database>> =
+        std::sync::OnceLock::new();
+    std::sync::Arc::clone(DATABASE.get_or_init(|| {
+        let base = svg_font_database();
+        let mut database = (*base).clone();
+        for font in crate::inline::extra_fallback_fonts() {
+            let bytes: &[u8] = font.as_ref().as_ref();
+            database.load_font_data(bytes.to_vec());
+        }
+        std::sync::Arc::new(database)
+    }))
+}
+
+fn svg_font_database_for_tree(
+    tree: &obscura_dom::tree::DomTree,
     web_fonts: &[crate::inline::WebFont],
 ) -> std::sync::Arc<usvg::fontdb::Database> {
-    let base = svg_font_database();
+    // Most framework pages use web fonts and many decorative SVG icons, but
+    // only SVG text needs the page font faces. Avoid cloning/loading the
+    // fallback or page font database for ordinary icons and HTML-only text.
+    if !has_inline_svg_text(tree) {
+        return svg_font_database();
+    }
+    let base = if crate::inline::extra_fallback_fonts().is_empty() {
+        svg_font_database()
+    } else {
+        svg_font_database_with_fallbacks()
+    };
     if web_fonts.is_empty() {
         return base;
     }

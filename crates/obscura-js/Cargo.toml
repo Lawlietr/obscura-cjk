@@ -15,6 +15,9 @@ stealth = ["obscura-net/stealth"]
 # (getBoundingClientRect, elementFromPoint, offset*), and with paint enabled,
 # rasterizes screenshots. Off by default so the scraping build stays lean.
 render = ["dep:obscura-render", "obscura-render/paint"]
+# Embed Noto CJK SC/TC fallback faces in the render layer. Weakly depends on
+# the render layer: cjk alone is a no-op until render enables obscura-render.
+cjk = ["obscura-render?/cjk"]
 
 [build-dependencies]
 deno_core = "0.350"

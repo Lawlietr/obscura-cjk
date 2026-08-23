@@ -209,6 +209,9 @@ cd obscura
 # Rendering
 cargo build --release -p obscura-cli --bins --features render
 
+# Rendering with embedded CJK fallback fonts (recommended)
+cargo build --release -p obscura-cli --bins --features render,cjk
+
 # Rendering and stealth
 cargo build --release -p obscura-cli --bins --features render,stealth
 
@@ -218,6 +221,10 @@ cargo build --release -p obscura-cli --bins --no-default-features
 # No rendering, with stealth
 cargo build --release -p obscura-cli --bins --no-default-features --features stealth
 ```
+
+The `cjk` feature embeds Noto Sans CJK SC/TC (SIL OFL) so Chinese and Japanese
+render without host fonts. It is optional to keep the base binary small; the
+release archives and Docker image are built with it on.
 
 Requires Rust 1.75+ ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).
 The stealth build also compiles BoringSSL and generates bindings, so it needs
@@ -308,6 +315,27 @@ platform font rasterization may differ from Chromium. The existing
 [Puppeteer](docs/Use-with-Puppeteer.md),
 [Playwright](docs/Use-with-Playwright.md), and
 [MCP](docs/Use-the-MCP-server.md) guides cover their capture APIs and limits.
+
+### CJK and custom fonts
+
+Obscura deliberately loads no system fonts, so layout is identical on every
+machine. For Chinese and Japanese, build with the `cjk` feature (on by default
+in the release archives and Docker image): Noto Sans CJK SC/TC are embedded as
+glyph-level fallbacks and text that the bundled Latin faces cover falls back
+to them automatically. Only the Regular weight is embedded, and Hangul is not
+covered.
+
+To add any font the bundled set lacks, point Obscura at a directory of font
+files (non-recursive; `ttf`/`otf`/`ttc`/`woff`/`woff2`). This is opt-in, so
+layout then depends on that directory's contents:
+
+```bash
+# Flag, before or after the subcommand
+obscura --fonts /path/to/fonts fetch https://example.com -s page.png
+
+# Or via the environment (applies to fetch, serve, scrape, and mcp)
+OBSCURA_FONTS_DIR=/path/to/fonts obscura fetch https://example.com -s page.png
+```
 
 ### Start the CDP server
 
@@ -498,6 +526,7 @@ Fetch and render a single page.
 | `--output` | — | Write dump or eval output to a file |
 | `--quiet` | off | Suppress banner |
 | `--proxy` | — | Inherited global HTTP/SOCKS5 proxy URL |
+| `--fonts` | — | Inherited global directory of extra fallback fonts (see CJK and custom fonts) |
 
 ### `obscura scrape <URL...>`
 
@@ -510,6 +539,7 @@ Scrape multiple URLs in parallel with worker processes.
 | `--format` | `json` | Output: `json` or `text` |
 | `--quiet` | off | Suppress scrape progress on stderr |
 | `--proxy` | — | Inherited global HTTP/SOCKS5 proxy URL for all workers |
+| `--fonts` | — | Inherited global font directory, forwarded to every worker |
 
 ## MCP (Model Context Protocol)
 

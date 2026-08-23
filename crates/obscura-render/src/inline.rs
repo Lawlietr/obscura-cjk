@@ -46,6 +46,13 @@ static MONO_BO: &[u8] = include_bytes!("../assets/liberation-mono-boldoblique.tt
 static SYSTEM_R: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
 static SYSTEM_B: &[u8] = include_bytes!("../assets/dejavu-sans-bold.ttf");
 static EMOJI_R: &[u8] = include_bytes!("../assets/noto-color-emoji.ttf");
+// CJK fallback faces (feature `cjk`): Noto Sans CJK SC/TC Regular cover the
+// ideographs, kana, and fullwidth punctuation that the Latin faces lack.
+// Regular weight only; bold CJK is not synthesized.
+#[cfg(feature = "cjk")]
+static CJK_SC_R: &[u8] = include_bytes!("../assets/noto-sans-cjk-sc-regular.otf");
+#[cfg(feature = "cjk")]
+static CJK_TC_R: &[u8] = include_bytes!("../assets/noto-sans-cjk-tc-regular.otf");
 #[cfg(test)]
 static FALLBACK: &[u8] = SYSTEM_R;
 
@@ -91,6 +98,107 @@ pub(crate) fn text_may_need_emoji_font(text: &str) -> bool {
                 | '\u{FE0F}' | '\u{1F000}'..='\u{1FAFF}'
         )
     })
+}
+
+/// Decode font file bytes into the sfnt bytes fontdb/cosmic-text (and usvg)
+/// consume: WOFF and WOFF2 are decompressed, raw TrueType/OpenType files and
+/// collections already have the expected representation. Returns None for
+/// anything unparseable or oversized.
+pub(crate) fn decode_font_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() > 32 * 1024 * 1024 {
+        return None;
+    }
+    let decoded = match bytes.get(..4) {
+        Some(b"wOF2") => wuff::decompress_woff2(bytes).ok()?,
+        Some(b"wOFF") => wuff::decompress_woff1(bytes).ok()?,
+        // TrueType/OpenType collections and raw sfnt fonts already have the
+        // representation fontdb expects.
+        Some(b"\0\x01\0\0" | b"OTTO" | b"ttcf") => bytes.to_vec(),
+        _ => return None,
+    };
+    (decoded.len() <= 32 * 1024 * 1024).then_some(decoded)
+}
+
+/// Opt-in user font directory: additional faces beyond the bundled set.
+/// Deliberate escape hatch from "bundled faces only" determinism, so using
+/// it makes layout vary with the directory contents. Scanned once per process
+/// (engines are rebuilt per page) as a non-recursive, filename-sorted pass so
+/// a given directory always yields the same face set.
+fn directory_fonts() -> Vec<Arc<dyn AsRef<[u8]> + Send + Sync + 'static>> {
+    static FONTS: std::sync::OnceLock<Vec<Arc<dyn AsRef<[u8]> + Send + Sync + 'static>>> =
+        std::sync::OnceLock::new();
+    FONTS.get_or_init(scan_fonts_dir).to_vec()
+}
+
+fn scan_fonts_dir() -> Vec<Arc<dyn AsRef<[u8]> + Send + Sync + 'static>> {
+    let path = match std::env::var_os("OBSCURA_FONTS_DIR") {
+        Some(path) if !path.is_empty() => path,
+        _ => return Vec::new(),
+    };
+    let entries = match std::fs::read_dir(&path) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!(
+                "obscura: OBSCURA_FONTS_DIR: cannot read {}: {}",
+                path.to_string_lossy(),
+                err
+            );
+            return Vec::new();
+        }
+    };
+    let mut files: Vec<(std::ffi::OsString, std::path::PathBuf)> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| (entry.file_name(), entry.path()))
+        .filter(|(_, path)| {
+            path.is_file()
+                && matches!(
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(str::to_ascii_lowercase)
+                        .as_deref(),
+                    Some("ttf" | "otf" | "ttc" | "woff" | "woff2")
+                )
+        })
+        .collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut fonts = Vec::new();
+    for (name, path) in files {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                eprintln!("obscura: OBSCURA_FONTS_DIR: cannot read {}: {}", name.to_string_lossy(), err);
+                continue;
+            }
+        };
+        match decode_font_bytes(&bytes) {
+            Some(sfnt) => {
+                let owned: Arc<Vec<u8>> = Arc::from(sfnt);
+                let face: Arc<dyn AsRef<[u8]> + Send + Sync + 'static> = owned;
+                fonts.push(face);
+            }
+            None => eprintln!(
+                "obscura: OBSCURA_FONTS_DIR: skipping {}: not a parseable ttf/otf/ttc/woff/woff2 font",
+                name.to_string_lossy()
+            ),
+        }
+    }
+    fonts
+}
+
+/// Extra fallback faces appended after every bundled face in each fontdb:
+/// the embedded CJK faces (feature `cjk`) plus the opt-in directory faces.
+/// Loaded without a declared family, so each is reachable by its internal
+/// name in CSS and serves as the final glyph-level fallback during
+/// cosmic-text's advanced shaping.
+pub(crate) fn extra_fallback_fonts() -> Vec<Arc<dyn AsRef<[u8]> + Send + Sync + 'static>> {
+    let mut fonts = Vec::new();
+    #[cfg(feature = "cjk")]
+    for bytes in [CJK_SC_R, CJK_TC_R] {
+        let face: Arc<dyn AsRef<[u8]> + Send + Sync + 'static> = Arc::new(bytes);
+        fonts.push(face);
+    }
+    fonts.extend(directory_fonts());
+    fonts
 }
 
 /// Map a CSS `font-family` list to a bundled face the way Chromium resolves the
@@ -1004,6 +1112,13 @@ impl TextEngine {
         }
         if load_emoji {
             for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(EMOJI_R))) {
+                declarations.push((id, None, None, None));
+            }
+        }
+        // CJK/directory fallbacks come after the bundled faces so a page's
+        // own webfont still wins for CJK code points it covers.
+        for font in extra_fallback_fonts() {
+            for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(font)) {
                 declarations.push((id, None, None, None));
             }
         }
@@ -4979,5 +5094,114 @@ gamma</div>"#,
             colors.len() > 20,
             "the bundled CBDT face must rasterize as color, not a monochrome mask"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "cjk")]
+    fn cjk_fallback_faces_shape_ideographs() {
+        let tree = obscura_dom::parse_html("<p id='t'>中文測試abc</p>");
+        let copy = tree.get_element_by_id("t").unwrap();
+        let style = LayoutStyle {
+            display: Display::Block,
+            font_size: Some(16.0),
+            ..Default::default()
+        };
+        let mut engine = TextEngine::new_with_web_fonts_and_emoji(&[], false);
+        let cjk_ids: std::collections::HashSet<_> = engine
+            .loaded_families
+            .iter()
+            .filter(|(name, _)| name.contains("noto sans cjk"))
+            .flat_map(|(_, family)| family.faces.iter())
+            .filter_map(|face| face.font_id)
+            .collect();
+        assert!(!cjk_ids.is_empty(), "expected bundled Noto Sans CJK faces");
+
+        let item = engine
+            .try_build(&tree, copy, &HashMap::from([(copy, style)]))
+            .unwrap();
+        engine.finalize(item, (0.0, 0.0), 300.0, None);
+        let glyphs: Vec<(cosmic_text::fontdb::ID, u16)> = engine.items[item]
+            .buffer
+            .layout_runs()
+            .flat_map(|run| run.glyphs.iter())
+            .map(|glyph| (glyph.font_id, glyph.glyph_id))
+            .collect();
+        assert!(glyphs.len() >= 7, "expected 7 clusters, got {}", glyphs.len());
+        assert!(
+            !glyphs.iter().any(|(_, index)| *index == 0),
+            "no cluster may fall back to .notdef: {glyphs:?}"
+        );
+        let cjk_glyphs = glyphs.iter().filter(|(id, _)| cjk_ids.contains(id)).count();
+        assert!(
+            cjk_glyphs >= 4,
+            "ideographs must shape with a bundled CJK face, only {cjk_glyphs} did: {glyphs:?}"
+        );
+        let latin_ids: std::collections::HashSet<_> = engine.loaded_families["liberation sans"]
+            .faces
+            .iter()
+            .filter_map(|face| face.font_id)
+            .collect();
+        assert!(
+            glyphs
+                .iter()
+                .filter(|(id, _)| latin_ids.contains(id))
+                .count()
+                >= 3,
+            "latin clusters must keep shaping with Liberation Sans: {glyphs:?}"
+        );
+    }
+
+    #[test]
+    fn fonts_dir_adds_user_faces() {
+        // nextest runs each test in its own process, so mutating the process
+        // environment and the font layer's per-process scan cache here is safe.
+        let dir = std::env::temp_dir().join(format!("obscura-fonts-dir-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let font = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/cosmic-text/fonts/NotoSansArabic.ttf");
+        std::fs::copy(&font, dir.join("NotoSansArabic.ttf")).unwrap();
+        // A non-font file in the same directory must be skipped, not fatal.
+        std::fs::write(dir.join("not-a-font.ttf"), b"junk").unwrap();
+        std::env::set_var("OBSCURA_FONTS_DIR", &dir);
+
+        let engine = TextEngine::new_with_web_fonts_and_emoji(&[], false);
+        let arabic_ids: std::collections::HashSet<_> = engine.loaded_families
+            .get("noto sans arabic")
+            .map(|family| {
+                family
+                    .faces
+                    .iter()
+                    .filter_map(|face| face.font_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !arabic_ids.is_empty(),
+            "directory font must be loaded under its family name"
+        );
+
+        let tree = obscura_dom::parse_html("<p id='t'>ب</p>");
+        let copy = tree.get_element_by_id("t").unwrap();
+        let style = LayoutStyle {
+            display: Display::Block,
+            font_size: Some(16.0),
+            ..Default::default()
+        };
+        let mut engine = engine;
+        let item = engine
+            .try_build(&tree, copy, &HashMap::from([(copy, style)]))
+            .unwrap();
+        engine.finalize(item, (0.0, 0.0), 300.0, None);
+        let glyph_ids: std::collections::HashSet<_> = engine.items[item]
+            .buffer
+            .layout_runs()
+            .flat_map(|run| run.glyphs.iter())
+            .map(|glyph| glyph.font_id)
+            .collect();
+        assert!(
+            !glyph_ids.is_disjoint(&arabic_ids),
+            "the arabic cluster must shape with the directory face"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
