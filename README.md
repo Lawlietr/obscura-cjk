@@ -20,6 +20,9 @@
 <p align="center">
   Capture screenshots, screencast live pages, and export PDFs directly with Obscura.
 </p>
+<p align="center">
+  📄 Documentation: English (this file) · <a href="README_ZH.md">繁體中文</a>
+</p>
 
 ---
 
@@ -198,7 +201,7 @@ usable on common LTS servers with glibc 2.35+.
 docker run -d --name obscura -p 127.0.0.1:9222:9222 h4ckf0r0day/obscura
 ```
 
-Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage build on `distroless/cc`, no shell, no package manager, ~57 MB compressed.
+Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage build on `distroless/cc`, no shell, no package manager, ~57 MB compressed. The image is built with the `cjk` feature on, so CJK text renders out of the box (see [CJK and custom fonts](#cjk-and-custom-fonts)).
 
 ### Build from source
 
@@ -206,11 +209,11 @@ Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage
 git clone https://github.com/h4ckf0r0day/obscura.git
 cd obscura
 
-# Rendering
-cargo build --release -p obscura-cli --bins --features render
-
 # Rendering with embedded CJK fallback fonts (recommended)
 cargo build --release -p obscura-cli --bins --features render,cjk
+
+# Rendering only, without CJK
+cargo build --release -p obscura-cli --bins --features render
 
 # Rendering and stealth
 cargo build --release -p obscura-cli --bins --features render,stealth
@@ -223,8 +226,8 @@ cargo build --release -p obscura-cli --bins --no-default-features --features ste
 ```
 
 The `cjk` feature embeds Noto Sans CJK SC/TC (SIL OFL) so Chinese and Japanese
-render without host fonts. It is optional to keep the base binary small; the
-release archives and Docker image are built with it on.
+render without host fonts. It is optional, to keep the base binary ~30 MB
+smaller; the release archives and Docker image are built with it on.
 
 Requires Rust 1.75+ ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).
 The stealth build also compiles BoringSSL and generates bindings, so it needs
@@ -318,16 +321,59 @@ platform font rasterization may differ from Chromium. The existing
 
 ### CJK and custom fonts
 
-Obscura deliberately loads no system fonts, so layout is identical on every
-machine. For Chinese and Japanese, build with the `cjk` feature (on by default
-in the release archives and Docker image): Noto Sans CJK SC/TC are embedded as
-glyph-level fallbacks and text that the bundled Latin faces cover falls back
-to them automatically. Only the Regular weight is embedded, and Hangul is not
-covered.
+**What changed**
 
-To add any font the bundled set lacks, point Obscura at a directory of font
-files (non-recursive; `ttf`/`otf`/`ttc`/`woff`/`woff2`). This is opt-in, so
-layout then depends on that directory's contents:
+- A new `cjk` cargo feature (on in the release archives and the Docker image).
+  When enabled, two faces are embedded in the binary as glyph-level fallbacks:
+  **Noto Sans CJK SC** and **Noto Sans CJK TC**, Regular weight, SIL OFL 1.1
+  (~16 MB each).
+- A new global `--fonts <PATH>` flag and the `OBSCURA_FONTS_DIR` environment
+  variable load extra font files from a directory at runtime, for scripts the
+  embedded set does not cover.
+
+**Why we did it this way**
+
+Obscura deliberately loads **no system fonts**. That keeps layout
+bit-for-bit identical on every machine and startup instant, but it meant
+Chinese and Japanese text rendered as tofu (empty boxes) — a dealbreaker for
+one of Obscura's core use cases, scraping CJK-language websites. The fix
+intentionally does **not** reintroduce host fonts:
+
+- **No font system scanning.** Walking fontconfig or `~/.fonts` would make
+  layout depend on the host, break cross-machine determinism, and add startup
+  cost. The CJK faces ship inside the binary instead.
+- **No shaping changes.** cosmic-text's `Shaping::Advanced` already falls back
+  per glyph across every face in its font database. The CJK faces simply join
+  that database: code points the bundled Latin faces cover keep using
+  Liberation/DejaVu, and only missing glyphs fall through to the CJK faces.
+  Latin layout is unchanged, byte for byte.
+- **Performance stays protected.** The feature is off by default, so a
+  `render`-only binary stays ~30 MB smaller. And the SVG rasterizer's extended
+  font database (which also carries the CJK faces) is built lazily, only for
+  pages that actually contain inline SVG text, so ordinary pages pay nothing
+  for the 32 MB of font data.
+
+**What you get**
+
+- Chinese (Simplified and Traditional), Japanese kanji and kana, and full-width
+  punctuation render with real glyphs — no host fonts and no page webfonts
+  required.
+- Mixed CJK/Latin text gets real layout metrics: advance widths and line
+  height come from the actual glyphs, not from tofu boxes.
+- Everything downstream picks it up with no extra configuration: `obscura
+  fetch ... --screenshot`, CDP screenshots and screencasts, PDF export, and
+  the MCP `browser_screenshot` / `browser_pdf` tools.
+
+**Limitations and the escape hatch**
+
+- Only the Regular weight is embedded: bold CJK renders at normal weight (no
+  faux bolding).
+- Hangul is not covered by the embedded faces.
+- For any font the bundled set lacks, point Obscura at a directory of font
+  files. The scan is non-recursive, filename-sorted, and accepts
+  `ttf`/`otf`/`ttc`/`woff`/`woff2`; unparseable files are skipped with a
+  warning. This is opt-in: layout then depends on the directory's contents,
+  which is a deliberate escape hatch from bundled-faces-only determinism.
 
 ```bash
 # Flag, before or after the subcommand
