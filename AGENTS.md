@@ -212,6 +212,12 @@ behavior, and a reduced fixture. Pixel-distance metrics are useful regression
 tripwires, not standalone correctness verdicts. Never add hostname-specific
 layout, style, or resource behavior.
 
+`render-repros/cjk/` is a subdirectory on purpose: `run.sh` only globs top-level
+`*.html`, so the CJK fixture does not enter the paired corpus on hosts without
+the `cjk` feature. Run it directly, e.g.
+`OBSCURA_BIN=./target/release/obscura fetch file://$PWD/render-repros/cjk/cjk-fallback.html --screenshot "$RUN_ROOT/cjk.png"`
+(on a `render,cjk` build).
+
 `render-repros/**` is the tracked public evidence harness. Git-ignored internal
 handover notes are private working material: do not edit them, link them from
 public documentation, stage them, or commit them. Do not commit generated
