@@ -160,7 +160,7 @@ edit instead.
 
 ## Architecture
 
-- **obscura-cli** — CLI: `fetch` (`--dump assets|html|text|links|markdown|original|cookies`, `--eval <JS>`, `--screenshot <PNG>`), `serve` (CDP server), `scrape`, `mcp`. `--proxy`, `--stealth`, and `--allow-private-network` are global flags: valid before or after the subcommand and applied to `fetch`, `serve`, `scrape`, and `mcp` (a `scrape` run forwards `--stealth` to each worker via `OBSCURA_STEALTH`).
+- **obscura-cli** — CLI: `fetch` (`--dump assets|html|text|links|markdown|original|cookies`, `--eval <JS>`, `--screenshot <PNG>`), `serve` (CDP server), `scrape`, `mcp`. `--proxy`, `--stealth`, `--allow-private-network`, and `--fonts <PATH>` are global flags: valid before or after the subcommand and applied to `fetch`, `serve`, `scrape`, and `mcp` (a `scrape` run forwards `--stealth` to each worker via `OBSCURA_STEALTH` and `--fonts` via `OBSCURA_FONTS_DIR`).
 - **obscura-cdp** — Chrome DevTools Protocol server (WebSocket). Managed page
   sessions use `"{targetId}-session"`; explicit flattened attachments receive
   distinct session ids so Playwright and Puppeteer can open raw page sessions.
@@ -226,6 +226,13 @@ screenshots or reports.
 - **Multi-statement `--eval` starting with `const` returns `null`** (V8 gives
   `const` an empty completion value). Wrap snippets in an IIFE:
   `(function(){ ...; return result; })()`.
+- **Keep the SVG fallback faces out of the base font database.** `svg_font_database()`
+  is called on every `prepare`; with feature `cjk` the fallback faces add 32MB of
+  OTF that parse for ~30ms, and paying that on the first prepare blocks the V8
+  event loop, delaying early paint and IntersectionObserver callbacks enough to
+  break the IO timing tests. `svg_font_database_with_fallbacks()` (separate
+  OnceLock) is only built when a page actually contains inline SVG text.
+  Verify with the `svg` nextest filter after touching this area.
 - **`canAccessOpener` must be in every `TargetInfo` payload**, or strict CDP
   clients (chromiumoxide) panic.
 - **The DOM reparenting guards in `tree.rs` are load-bearing.** `append_child` /
