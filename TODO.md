@@ -53,6 +53,29 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與重要事項。
 - 額度備註：公開倉庫每月 2000 分鐘免費 Actions；5 平台 × V8 全編
   約每平台 10–15 分鐘，单次 release 沒有額度問題。
 
+## Dependabot（依賴更新）
+
+現況：`deny.toml` + `ci.yml` 的 `cargo-deny-action` 已有被動式漏洞/授權/
+bans 檢查（有 5 個明確 ignore 的 RUSTSEC），但「只擋不升」：transitive
+crate 出新版本時沒有任何機制自動提 PR。加官方 Dependabot 補主動式更新，
+與 cargo-deny 互補不衝突。公開倉庫免費。
+
+- [ ] **新增 `.github/dependabot.yml`。** 建議設定：
+  - `package-ecosystem: "cargo"`, `directory: "/"`, `schedule: weekly`（較安靜；
+    本倉庫 V8 全編一個 PR 的 CI 成本不低，daily 會比較吵）。
+  - Security updates 開，`open-limit` 調小（如 5）。
+  - 例行 version updates 可先只對 lockfile 更新開（`lockfile: true`），並用
+    `groups` 合併，避免 468 個套件一次開一堆 PR。
+  - `v8` / `deno_core` 這類重依賴建議先 exclude 或獨立 group，升版涉及
+    V8 ABI/編譯，要人工看 diff 再合。
+- [ ] Repo Settings 確認 Dependabot GitHub App 權限（public repo 預設已啟用，
+  無需額外開關；security alerts 預設開）。
+- [ ] 觀察首批 PR：確認 `[patch.crates-io]` 的 vendored `taffy` / `cosmic-text`
+  行為符合預期（本體不會被更新，屬正常 warning；其 transitive 依賴仍會進
+  lockfile 更新）。
+- [ ] 後續維護：升級後視需要同步清理 `deny.toml` 的 ignore 清單
+  （RUSTSEC ID 綁定 transitive 版本，cargo-deny CI 會提示）。
+
 ## 合併前必做（cjk → main）
 
 - [ ] 完整回歸：`CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run
