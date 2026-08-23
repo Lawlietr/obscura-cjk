@@ -1,5 +1,7 @@
 Obscura is an open-source headless browser engine written in Rust. It runs JavaScript via V8, speaks the Chrome DevTools Protocol, and works as a drop-in replacement for headless Chrome with Puppeteer and Playwright.
 
+This documentation covers the [obscura-cjk fork](https://github.com/Lawlietr/obscura-cjk): the engine is upstream Apache-2.0 code, with embedded CJK fallback fonts and a runtime font directory added on top (see [CJK and custom fonts](CJK-and-custom-fonts.md)).
+
 ## Versus headless Chrome
 
 | Metric      | Obscura  | Headless Chrome |
@@ -27,6 +29,7 @@ the wreq/BoringSSL transport and browser-identity protections.
 ## Guides
 
 - [Build from source](Build-from-source.md)
+- [CJK and custom fonts](CJK-and-custom-fonts.md)
 - [Configure stealth and proxies](Configure-stealth-and-proxies.md)
 - [Markdown extraction](Markdown-extraction.md)
 - [Use with Puppeteer](Use-with-Puppeteer.md)
@@ -47,6 +50,10 @@ the wreq/BoringSSL transport and browser-identity protections.
 - [Architecture overview](Architecture-overview.md)
 - [Adding a CDP method or Web API](Adding-a-CDP-method-or-Web-API.md)
 - [Testing and debugging](Testing-and-debugging.md)
+
+## Integrations
+
+- **[Hermes agent plugin](https://github.com/SGavrl/hermes-plugin-obscura)**: run [Hermes](https://github.com/NousResearch/hermes-agent) agent browser tasks on Obscura. The plugin spawns `obscura serve` per session (or connects to an already running server) and drives it over CDP, with optional `--stealth`.
 
 ## Links
 

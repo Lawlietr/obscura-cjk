@@ -47,7 +47,8 @@ docker run -d --name obscura -p 127.0.0.1:9222:9222 obscura-cjk
 ```
 
 Built on `distroless/cc`, with no shell or package manager in the runtime
-image, and with the `cjk` feature on so CJK text renders out of the box.
+image, and with the `cjk` feature on so CJK text renders out of the box
+(see [CJK and custom fonts](CJK-and-custom-fonts.md)).
 
 Release archives and the Docker image include the rendering engine. Source
 builders must pass `--features render`; see [Build from source](Build-from-source.md).

@@ -12,6 +12,7 @@
 ## Guides
 
 * [Build from source](Build-from-source.md)
+* [CJK and custom fonts](CJK-and-custom-fonts.md)
 * [Configure stealth and proxies](Configure-stealth-and-proxies.md)
 * [Markdown extraction](Markdown-extraction.md)
 * [Use with Puppeteer](Use-with-Puppeteer.md)

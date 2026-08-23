@@ -100,6 +100,25 @@ Session IDs are `"{targetId}-session"`. The dispatcher routes by `sessionId` in 
 
 Targets are created by `Target.createTarget`. Closing the WebSocket detaches all sessions but leaves the pages running.
 
+## CDP surface
+
+Implemented domains (the subset that keeps Puppeteer and Playwright working):
+
+| Domain | Methods |
+|--------|---------|
+| **Target** | createTarget, closeTarget, attachToTarget, createBrowserContext, disposeBrowserContext |
+| **Page** | navigate, getFrameTree, lifecycleEvents, captureScreenshot, start/stopScreencast, printToPDF |
+| **Runtime** | evaluate, callFunctionOn, getProperties, addBinding |
+| **DOM** | getDocument, querySelector, querySelectorAll, getOuterHTML, resolveNode |
+| **Network** | enable, setCookies, getCookies, setExtraHTTPHeaders, setUserAgentOverride |
+| **Fetch** | enable, continueRequest, fulfillRequest, failRequest (live interception), takeResponseBodyAsStream |
+| **IO** | read, close (stream a large response body in chunks) |
+| **Storage** | getCookies, setCookies, deleteCookies |
+| **Input** | dispatchMouseEvent, dispatchKeyEvent |
+| **LP** | getMarkdown (DOM-to-Markdown conversion) |
+
+To download a large resource without one giant `Network.getResponseBody` blob, call `Fetch.takeResponseBodyAsStream` then read it in chunks with `IO.read` / `IO.close`. Response bodies over the cache limit (`OBSCURA_NETWORK_BODY_BUFFER_BYTES`, default 2 MiB) are not retained, so raise that limit when you intend to stream large downloads.
+
 ## Lifecycle
 
 Lifecycle events are emitted by `obscura-browser/lifecycle.rs` as the page transitions:

@@ -31,11 +31,23 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與重要事項。
       （上游 `1.0.103`，Cargo.toml 已同步該版本）。建議形如
       `v1.0.104-cjk.1` 之類。`docs/Use-as-a-Rust-library.md` 的 git 依賴
       pin 已從 `tag` 改為 `rev`（等第一個 tag 出來後可再改回 tag pin）。
-- [ ] **決定 `docker.yml` 的去留。** 目前會推到上游的 Docker Hub 帳密
-      變數所指向的帳號，fork 沒有該帳號。政策已是「映像檔本地 build，
-      不發布 registry」，選項：(a) 停用/移除 `docker.yml`，
-      (b) 改推到 `Lawlietr` 自己的 Docker Hub 帳號（需在 fork 的
-      Settings → Secrets 配置）。
+- [x] **決定 `docker.yml` 的去留。** 已定**路線 A**：改推 GitHub
+      Container Registry（`ghcr.io/Lawlietr/obscura-cjk`），不用 Docker
+      Hub、不配任何外部 secret（GH Actions 的 `GITHUB_TOKEN` 加上
+      `packages:write` permission 即可）。公開倉庫的 GHCR 儲存免費額度
+      5GB，映像 ~60MB 綽綽有餘。
+- [ ] **`docker.yml` 改造為 GHCR 發佈。** 改動清單：
+      1. base image 改成 `ghcr.io/Lawlietr/obscura-cjk`，push 目標改 GHCR；
+      2. V8 在 buildx 交叉編譯（QEMU 模擬）下太慢，拆成 per-platform
+         native runner 各自 build 單平台 image 並 push（tag 加 platform
+         suffix，runner 矩陣可參考 `release.yml`），最後一個 job 用
+         `buildx imagetools create` 組多平台 manifest list；
+      3. job 加 `permissions: contents: read, packages: write`。
+      全部編譯在 GitHub Actions 上完成，本機不需要 build；本機最多 pull
+      驗證。
+- [ ] GHCR 映像上線後同步文件：`docker-compose.yaml` 與 README / README_ZH
+      的 Docker 節保留「本地 `build: .`」為主線，GHCR pull 列為可選
+      （`image: ghcr.io/Lawlietr/obscura-cjk:vX.Y.Z-cjk.N`）。
 - [ ] 打第一個 tag push 觸發首次 release；驗證 artifacts 的 CJK 變體
       截圖正常。
 - 額度備註：公開倉庫每月 2000 分鐘免費 Actions；5 平台 × V8 全編
@@ -61,12 +73,21 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與重要事項。
 
 ## 文件同步
 
-- [ ] **README_ZH.md 重寫。** 目前仍是舊結構（含上游 trendshift 徽章、
-      Docker Hub 連結、舊 Install 連結）。英文 README 已重寫為 fork 版本
-      （34 個標題、fork 歸屬、本地 Docker build、docker-compose 範例），
-      中文版需完整跟進，繁體中文、技術識別字保留英文、結構 1:1 對應。
+- [x] **README.md 精簡（614 → 243 行）。** 結構：Header / What this fork
+      adds / Why / Install（Download、Docker、docker-compose、source 全保留）
+      / Documentation 索引 / License。中間各節移至 docs：CJK 節新增
+      `docs/CJK-and-custom-fonts.md`；CDP domain table 移入
+      `docs/Architecture-overview.md`（新節「CDP surface」）；Integrations
+      移入 `docs/README.md`；`--fonts` / `OBSCURA_FONTS_DIR` 補進
+      `docs/CLI-reference.md` 與 `docs/Environment-variables.md`；Quick Start /
+      localhost SSRF / scrape / stealth 各節確認已有 docs 對應（Your-first-fetch、
+      Extract-data、CLI-reference、Environment-variables、Configure-stealth-and-proxies）。
+- [x] **README_ZH.md 重寫（237 行，與新版英文 README 標題 1:1）。**
+      砍掉上游 trendshift 徽章、Docker Hub 映像、AUR/NixOS 舊節；
+      icon 改本倉庫相對路徑；所有安裝/文件連結指本倉庫與 docs/。
+      docs/ 保持英文不翻譯（中文版只鏈到英文 docs）。
 - [ ] `docker-compose.yaml` 與文件已一致（`obscura-cjk` + `build: .`）；
-      若 (b) 選項生效（發布自己的 Docker Hub），需再同步。
+      GHCR 映像上線後再同步（見上方待辦）。
 
 ## 本機環境（非仓库變更）
 
