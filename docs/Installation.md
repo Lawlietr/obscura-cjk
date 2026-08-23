@@ -1,7 +1,7 @@
 ## Linux x86_64
 
 ```bash
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-linux.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-x86_64-linux.tar.gz
 tar xzf obscura-x86_64-linux.tar.gz
 ./obscura --version
 ```
@@ -9,7 +9,7 @@ tar xzf obscura-x86_64-linux.tar.gz
 ## Linux ARM64
 
 ```bash
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-linux.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-aarch64-linux.tar.gz
 tar xzf obscura-aarch64-linux.tar.gz
 ./obscura --version
 ```
@@ -19,7 +19,7 @@ Linux builds target Ubuntu 22.04 and require glibc 2.35+.
 ## macOS Apple Silicon
 
 ```bash
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-macos.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-aarch64-macos.tar.gz
 tar xzf obscura-aarch64-macos.tar.gz
 ./obscura --version
 ```
@@ -27,31 +27,47 @@ tar xzf obscura-aarch64-macos.tar.gz
 ## macOS Intel
 
 ```bash
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-macos.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-x86_64-macos.tar.gz
 tar xzf obscura-x86_64-macos.tar.gz
 ./obscura --version
 ```
 
 ## Windows
 
-Download the `.zip` from [Releases](https://github.com/h4ckf0r0day/obscura/releases), extract, run `obscura.exe --version`.
-
-## Arch Linux (AUR)
-
-```bash
-yay -S obscura-browser
-```
+Download the `.zip` from [Releases](https://github.com/Lawlietr/obscura-cjk/releases), extract, run `obscura.exe --version`.
 
 ## Docker
 
+Pull the published image (linux/amd64, linux/arm64; pushed by GitHub Actions
+on every `v*` tag; `latest` tracks the newest release):
+
 ```bash
-docker run -d --name obscura -p 127.0.0.1:9222:9222 h4ckf0r0day/obscura
+docker run -d --name obscura -p 127.0.0.1:9222:9222 ghcr.io/lawlietr/obscura-cjk:latest
+
+# Pin a specific release for reproducibility and easy rollback
+docker run -d --name obscura -p 127.0.0.1:9222:9222 ghcr.io/lawlietr/obscura-cjk:0.1.0-cjk
 ```
 
-Image: [h4ckf0r0day/obscura](https://hub.docker.com/r/h4ckf0r0day/obscura). Built on `distroless/cc:nonroot`, with no shell or package manager in the runtime image, running as uid 65532. Note the `-p 127.0.0.1:...` above: it publishes the port to host loopback only. A mounted `--storage-dir` must be writable by uid 65532 — see [Run in production at scale](Run-in-production-at-scale.md#the-container-does-not-run-as-root).
+The repo's `docker-compose.yaml` deploys this image. For local development,
+build from this repo's `Dockerfile`:
 
-Official archives and the Docker image include the rendering engine. Source
-builders must pass `--features render`; see [Build from source](Build-from-source.md).
+```bash
+docker build -t obscura-cjk .
+docker run -d --name obscura -p 127.0.0.1:9222:9222 obscura-cjk
+```
+
+Multi-stage build on a `rust:1-slim-bookworm` builder stage; the runtime layer
+is `debian:12-slim` with CA certificates taken from the distroless base image.
+The `cjk` feature is on, so CJK text renders out of the box
+(see [CJK and custom fonts](CJK-and-custom-fonts.md)).
+The container runs as uid 65532, not root. A mounted `--storage-dir` must be
+writable by that uid or the cookie jar silently fails to persist; see
+[Run in production at scale](Run-in-production-at-scale.md#the-container-does-not-run-as-root).
+
+The rendering release archives (`-cjk`, `-stealth`, and no suffix) and the
+Docker image include the rendering engine; the `-no-render` variants omit it.
+Source builders must pass `--features render`; see
+[Build from source](Build-from-source.md).
 
 ## From source
 
@@ -63,7 +79,8 @@ See [Build from source](Build-from-source.md).
 - `obscura-worker`: helper for the parallel `scrape` command. Keep both in the same directory.
 
 Archive suffixes identify the feature set: no suffix includes rendering,
-`-stealth` includes rendering and stealth, `-no-render` includes neither, and
+`-cjk` adds embedded CJK fallback fonts on top of rendering, `-stealth`
+includes rendering and stealth, `-no-render` includes neither, and
 `-no-render-stealth` includes stealth without rendering.
 
 ## Smoke test

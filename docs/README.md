@@ -50,8 +50,8 @@ the wreq/BoringSSL transport and browser-identity protections.
 
 ## Links
 
-- Source: https://github.com/h4ckf0r0day/obscura
-- Releases: https://github.com/h4ckf0r0day/obscura/releases
-- Issues: https://github.com/h4ckf0r0day/obscura/issues
+- Source: https://github.com/Lawlietr/obscura-cjk
+- Releases: https://github.com/Lawlietr/obscura-cjk/releases
+- Issues: https://github.com/Lawlietr/obscura-cjk/issues
 
 License: Apache-2.0.
