@@ -36,18 +36,6 @@ engine，只加入 CJK 字型渲染。
 可用。設計與限制詳見
 [CJK 與自訂字型](docs/CJK-and-custom-fonts.md)。
 
-### 為什麼選 Obscura 而不是 headless Chrome？
-
-| 指標         | Obscura      | Headless Chrome |
-|--------------|--------------|------------------|
-| 記憶體       | **30 MB**    | 200+ MB          |
-| 二進位大小   | **70 MB**    | 300+ MB          |
-| 反偵測       | **內建**     | 無              |
-| 頁面載入     | **85 ms**    | ~500 ms          |
-| 啟動         | **即開**     | ~2s              |
-| Puppeteer    | **支援**     | 支援             |
-| Playwright   | **支援**     | 支援             |
-
 ## 安裝
 
 ### 下載

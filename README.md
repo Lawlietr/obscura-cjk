@@ -39,18 +39,6 @@ upstream functionality and works unchanged. See
 [CJK and custom fonts](docs/CJK-and-custom-fonts.md) for the design and
 limitations.
 
-### Why Obscura over headless Chrome?
-
-| Metric       | Obscura      | Headless Chrome |
-|--------------|--------------|------------------|
-| Memory       | **30 MB**    | 200+ MB          |
-| Binary size  | **70 MB**    | 300+ MB          |
-| Anti-detect  | **Built-in** | None          |
-| Page load    | **85 ms**    | ~500 ms          |
-| Startup      | **Instant**  | ~2s              |
-| Puppeteer    | **Yes**      | Yes              |
-| Playwright   | **Yes**      | Yes              |
-
 ## Install
 
 ### Download
