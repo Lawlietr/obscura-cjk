@@ -132,6 +132,22 @@ jobs:
             cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/stealth/
           fi
 
+      - name: Build render,cjk release binary
+        run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --features render,cjk
+
+      - name: Stage render,cjk release binary
+        shell: bash
+        run: |
+          # This fork's flagship variant: embeds the Noto Sans CJK fallback
+          # faces so Chinese/Japanese text shapes without host fonts.
+          BIN_DIR=target/${{ matrix.target }}/release
+          mkdir -p dist/cjk
+          if [ -f "$BIN_DIR/obscura.exe" ]; then
+            cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/cjk/
+          else
+            cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/cjk/
+          fi
+
       - name: Smoke test release binaries (V8 snapshot)
         # Run the V8 path once so a release never ships a binary that crashes at
         # isolate init from a mismatched snapshot (issue #290). The data: URL
@@ -139,7 +155,7 @@ jobs:
         # execute all variants it just built.
         shell: bash
         run: |
-          for VARIANT in default stealth no-render no-render-stealth; do
+          for VARIANT in default stealth cjk no-render no-render-stealth; do
             BIN=dist/$VARIANT/obscura
             [ -f "$BIN.exe" ] && BIN="$BIN.exe"
             "$BIN" fetch "data:text/html,<title>ok</title>" --eval "1+1"
@@ -151,6 +167,14 @@ jobs:
             test -s smoke.png
             rm smoke.png
           done
+          # Exercise the embedded CJK fallback faces. Numeric character
+          # references keep the data: URL pure ASCII while the DOM decodes to
+          # han and hiragana glyphs, so shaping runs through the fallback path.
+          BIN=dist/cjk/obscura
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          "$BIN" fetch "data:text/html,<style>body{margin:0}</style><h1>&#32321;&#39636;&#20013;&#25991;&#12486;&#12473;&#12488;</h1>" --screenshot smoke-cjk.png
+          test -s smoke-cjk.png
+          rm smoke-cjk.png
           for VARIANT in no-render no-render-stealth; do
             BIN=dist/$VARIANT/obscura
             [ -f "$BIN.exe" ] && BIN="$BIN.exe"
@@ -166,6 +190,7 @@ jobs:
         run: |
           tar czf ${{ matrix.name }}.tar.gz -C dist/default obscura obscura-worker
           tar czf ${{ matrix.name }}-stealth.tar.gz -C dist/stealth obscura obscura-worker
+          tar czf ${{ matrix.name }}-cjk.tar.gz -C dist/cjk obscura obscura-worker
           tar czf ${{ matrix.name }}-no-render.tar.gz -C dist/no-render obscura obscura-worker
           tar czf ${{ matrix.name }}-no-render-stealth.tar.gz -C dist/no-render-stealth obscura obscura-worker
 
@@ -176,6 +201,8 @@ jobs:
           7z a ../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
           cd ../stealth
           7z a ../../${{ matrix.name }}-stealth.zip obscura.exe obscura-worker.exe
+          cd ../cjk
+          7z a ../../${{ matrix.name }}-cjk.zip obscura.exe obscura-worker.exe
           cd ../no-render
           7z a ../../${{ matrix.name }}-no-render.zip obscura.exe obscura-worker.exe
           cd ../no-render-stealth
@@ -188,10 +215,12 @@ jobs:
           path: |
             ${{ matrix.name }}.tar.gz
             ${{ matrix.name }}-stealth.tar.gz
+            ${{ matrix.name }}-cjk.tar.gz
             ${{ matrix.name }}-no-render.tar.gz
             ${{ matrix.name }}-no-render-stealth.tar.gz
             ${{ matrix.name }}.zip
             ${{ matrix.name }}-stealth.zip
+            ${{ matrix.name }}-cjk.zip
             ${{ matrix.name }}-no-render.zip
             ${{ matrix.name }}-no-render-stealth.zip
           if-no-files-found: error
