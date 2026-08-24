@@ -25,7 +25,7 @@ engine，只加入 CJK 字型渲染。
 
 - **內嵌 CJK fallback 字型。** 新的 `cjk` cargo feature 把 Noto Sans CJK
   SC/TC（Regular、SIL OFL 1.1）嵌入二進位，中文與日文字形不依賴主機字型或
-  頁面 webfont。release 打包與 Docker 映像皆已啟用。
+  頁面 webfont。`-cjk` release 打包與 Docker 映像皆已啟用。
 - **執行期字型目錄。** 全域 `--fonts <PATH>` flag 與 `OBSCURA_FONTS_DIR`
   環境變數可在執行期載入額外字型檔，補內嵌字集沒覆蓋的書寫系統（例如
   Hangul 韓文）。
@@ -79,12 +79,13 @@ tar xzf obscura-x86_64-macos.tar.gz
 不需要 Chrome、不需要 Node.js、零相依。release 打包內含 `obscura` 與
 `obscura-worker` 兩個執行檔；並行的 `scrape` 命令需要它們放在同一目錄。
 
-| 打包副檔名 | 渲染 | Stealth transport |
-|------------|------|-------------------|
-| 無 | 有 | 無 |
-| `-stealth` | 有 | 有 |
-| `-no-render` | 無 | 無 |
-| `-no-render-stealth` | 無 | 有 |
+| 打包副檔名 | 渲染 | Stealth transport | 內嵌 CJK |
+|------------|------|-------------------|----------|
+| 無 | 有 | 無 | 無 |
+| `-cjk` | 有 | 無 | 有 |
+| `-stealth` | 有 | 有 | 無 |
+| `-no-render` | 無 | 無 | 無 |
+| `-no-render-stealth` | 無 | 有 | 無 |
 
 Linux release 以 Ubuntu 22.04 為目標建置，故下載的二進位可在使用
 glibc 2.35+ 的常見 LTS server 上執行。
@@ -99,8 +100,9 @@ docker build -t obscura-cjk .
 docker run -d --name obscura -p 127.0.0.1:9222:9222 obscura-cjk
 ```
 
-多階段建置於 `distroless/cc`，無 shell、無套件管理器，壓縮後約 57 MB。
-映像檔以 `cjk` feature 建置，CJK 文字開箱即渲染（見
+多階段建置：builder 階段在 `rust:1-slim-bookworm` 上由原始碼編譯 V8，執行層
+為 `debian:12-slim`，CA 憑證取自 distroless base image。映像檔以 `cjk`
+feature 建置，CJK 文字開箱即渲染（見
 [CJK 與自訂字型](docs/CJK-and-custom-fonts.md)）。
 
 #### docker-compose
@@ -172,8 +174,8 @@ cargo build --release -p obscura-cli --bins --no-default-features --features ste
 ```
 
 `cjk` feature 內嵌 Noto Sans CJK SC/TC（SIL OFL），讓中文與日文不依賴主機
-字型即可渲染。它為選填，目的在讓基礎二進位小約 30 MB；release 打包與
-Docker 映像都已啟用。
+字型即可渲染。它為選填，目的在讓基礎二進位小約 30 MB；`-cjk` release 打包
+與 Docker 映像都已啟用。
 
 需要 Rust 1.75+（[rustup.rs](https://rustup.rs)）。首次建置約 5 分鐘（V8
 由原始碼編譯，之後有快取）。stealth 建置另需編譯 BoringSSL 並產生 bindings，

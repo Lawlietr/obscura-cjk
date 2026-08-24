@@ -15,41 +15,49 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與重要事項。
   `no-render,stealth`），各打包 `obscura` + `obscura-worker`，
   上傳前逐變體 smoke test（V8 isolate + 截圖），
   發布 job 只下載 artifacts、不 checkout 程式碼（token 隔離）。
-- `docker.yml`：`v*` tag 觸發，buildx 多平台映像推 Docker Hub，
-  需要 repo secrets `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`。
+- `docker.yml`：`v*` tag 觸發，per-platform native runner 各自 build 單平台
+  image 推 GHCR（`ghcr.io/lawlietr/obscura-cjk`），最後一個 job 組
+  multi-platform manifest list；只用內建 `GITHUB_TOKEN`
+  （`packages: write`），無外部 secret。
 - `ci.yml`：PR checks，read-only token。
 
 ### 待辦
 
-- [ ] **`release.yml` 加 `render,cjk` 變體。** 現狀只 build 上游的
-      feature 組合，照現狀打 tag 出的 release 二進位**沒有內嵌 CJK 字型**，
-      與 README 宣稱的 fork 特性不符。改法：build job 加一段
-      `--features render,cjk` 的 build + stage + package（每平台多一個
-      tarball，約 +20 行），smoke test 迴圈加入該變體。
-- [ ] **首次發布前決定 tag 策略。** fork 目前沒有任何 tag
-      （`git ls-remote --tags lawlietr` 為空）。version 號避免與上游撞
-      （上游 `1.0.103`，Cargo.toml 已同步該版本）。建議形如
-      `v1.0.104-cjk.1` 之類。`docs/Use-as-a-Rust-library.md` 的 git 依賴
-      pin 已從 `tag` 改為 `rev`（等第一個 tag 出來後可再改回 tag pin）。
+- [x] **`release.yml` 加 `render,cjk` 變體。** build + stage（`dist/cjk`）
+      + package（每平台多一個 `<name>-cjk.tar.gz` / `.zip`）+ smoke test
+      迴圈加入該變體；cjk 變體額外對含漢字/平假名的頁面截圖（HTML 用
+      numeric character references 保持 data: URL 純 ASCII），實際走內嵌
+      fallback 字形的 shaping 路徑。
+- [x] **決定 tag 策略。** 全新 fork 版本線，自 **`v0.1.0-cjk`** 起跳，
+      後續 `vX.Y.Z-cjk[.N]`。workspace version 已是 `0.1.0`（非先前筆記
+      所述的上游 1.0.103），二進位 `--version` 與 tag 自然對齊。第一個
+      tag 推出後可把 `docs/Use-as-a-Rust-library.md` 的依賴 pin 從 `rev`
+      改回 `tag`。
 - [x] **決定 `docker.yml` 的去留。** 已定**路線 A**：改推 GitHub
       Container Registry（`ghcr.io/Lawlietr/obscura-cjk`），不用 Docker
       Hub、不配任何外部 secret（GH Actions 的 `GITHUB_TOKEN` 加上
       `packages:write` permission 即可）。公開倉庫的 GHCR 儲存免費額度
       5GB，映像 ~60MB 綽綽有餘。
-- [ ] **`docker.yml` 改造為 GHCR 發佈。** 改動清單：
-      1. base image 改成 `ghcr.io/Lawlietr/obscura-cjk`，push 目標改 GHCR；
-      2. V8 在 buildx 交叉編譯（QEMU 模擬）下太慢，拆成 per-platform
-         native runner 各自 build 單平台 image 並 push（tag 加 platform
-         suffix，runner 矩陣可參考 `release.yml`），最後一個 job 用
-         `buildx imagetools create` 組多平台 manifest list；
-      3. job 加 `permissions: contents: read, packages: write`。
-      全部編譯在 GitHub Actions 上完成，本機不需要 build；本機最多 pull
-      驗證。
-- [ ] GHCR 映像上線後同步文件：`docker-compose.yaml` 與 README / README_ZH
-      的 Docker 節保留「本地 `build: .`」為主線，GHCR pull 列為可選
-      （`image: ghcr.io/Lawlietr/obscura-cjk:vX.Y.Z-cjk.N`）。
-- [ ] 打第一個 tag push 觸發首次 release；驗證 artifacts 的 CJK 變體
-      截圖正常。
+- [x] **`docker.yml` 改造為 GHCR 發佈。** 實作：per-platform native
+      runner 矩陣（amd64=`ubuntu-latest`、arm64=`ubuntu-24.04-arm`）各自
+      build 單平台 image，push 到
+      `ghcr.io/lawlietr/obscura-cjk:<version>-<arch>`；最後 `publish-manifest`
+      job 用 `docker buildx imagetools create` 組出 `<version>` 與 `latest`
+      的 multi-platform manifest list 並 `imagetools inspect` 驗證。無
+      QEMU、無外部 secret（job 層 `permissions: contents: read,
+      packages: write`）；buildx GHA cache 按 platform scope 分離避免並行
+      寫入衝突。映像 path 必須全小寫（GHCR 規定）。
+- [ ] **首發後一次性設定：** 第一次 push 映像後，到 repo Packages →
+      `obscura-cjk` → Package settings 把 visibility 改 public（GHCR 新
+      package 預設 private，不設 public 匿名 pull 會被拒）。
+- [ ] GHCR 映像上線後同步文件（方案 B：registry 相關描述等首次發布成功
+      後再改）：README / README_ZH / docs/Installation.md 三處「image is
+      not on a registry (yet)」改為本地 build 主線 + GHCR pull 可選
+      （`ghcr.io/lawlietr/obscura-cjk:vX.Y.Z-cjk.N`）；AGENTS.md 兩處
+      「not published to a registry」（Docker Deployment 節與 fork 政策節）
+      同步修正；`docker-compose.yaml` 視需要加註解版 GHCR image 替代行。
+- [ ] 打第一個 tag（`v0.1.0-cjk`）push 觸發首次 release；驗證 artifacts
+      的 CJK 變體截圖正常、`docker pull` 多平台 manifest list 成功。
 - 額度備註：公開倉庫每月 2000 分鐘免費 Actions；5 平台 × V8 全編
   約每平台 10–15 分鐘，单次 release 沒有額度問題。
 
@@ -96,6 +104,14 @@ crate 出新版本時沒有任何機制自動提 PR。加官方 Dependabot 補�
 
 ## 文件同步
 
+- [x] **Release 前置文件同步（2026-08-24，方案 B 範圍）。** README.md /
+      README_ZH.md 下載變體表加「Embedded CJK / 內嵌 CJK」欄與 `-cjk` 列；
+      fork 特性清單與 Build-from-source 節的「release archives 內建 CJK」
+      收斂為 `-cjk` 變體專屬；README.md Docker 節、docs/Installation.md、
+      docs/CJK-and-custom-fonts.md 同步；修正 Docker 映像描述錯誤（runtime
+      實為 `debian:12-slim` 非 `distroless/cc`，CA 憑證取自 distroless，
+      移除未驗證的 ~57 MB 數字）；docs/Installation.md 的「release archives
+      皆含渲染引擎」改為精確列舉渲染變體。
 - [x] **README.md 精簡（614 → 243 行）。** 結構：Header / What this fork
       adds / Why / Install（Download、Docker、docker-compose、source 全保留）
       / Documentation 索引 / License。中間各節移至 docs：CJK 節新增

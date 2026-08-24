@@ -26,8 +26,8 @@ unchanged and adds CJK font rendering.
 
 - **Embedded CJK fallback fonts.** A `cjk` cargo feature embeds Noto Sans CJK
   SC/TC (Regular, SIL OFL 1.1) in the binary, so Chinese and Japanese text
-  renders without host fonts or page webfonts. On in the release archives and
-  the Docker image.
+  renders without host fonts or page webfonts. On in the `-cjk` release
+  archives and the Docker image.
 - **Runtime font directory.** A global `--fonts <PATH>` flag and the
   `OBSCURA_FONTS_DIR` environment variable load extra font files at runtime,
   for scripts the embedded set does not cover (e.g. Hangul).
@@ -83,12 +83,13 @@ No Chrome, no Node.js, no dependencies. Release archives include both
 `obscura` and `obscura-worker`; keep them in the same directory for the
 parallel `scrape` command.
 
-| Archive suffix | Rendering | Stealth transport |
-|----------------|-----------|-------------------|
-| none | Yes | No |
-| `-stealth` | Yes | Yes |
-| `-no-render` | No | No |
-| `-no-render-stealth` | No | Yes |
+| Archive suffix | Rendering | Stealth transport | Embedded CJK |
+|----------------|-----------|-------------------|--------------|
+| none | Yes | No | No |
+| `-cjk` | Yes | No | Yes |
+| `-stealth` | Yes | Yes | No |
+| `-no-render` | No | No | No |
+| `-no-render-stealth` | No | Yes | No |
 
 Linux release builds target Ubuntu 22.04 so the downloaded binary remains
 usable on common LTS servers with glibc 2.35+.
@@ -104,9 +105,11 @@ docker build -t obscura-cjk .
 docker run -d --name obscura -p 127.0.0.1:9222:9222 obscura-cjk
 ```
 
-Multi-stage build on `distroless/cc`, no shell, no package manager, ~57 MB
-compressed. The image is built with the `cjk` feature on, so CJK text renders
-out of the box (see [CJK and custom fonts](docs/CJK-and-custom-fonts.md)).
+Multi-stage build: V8 is compiled from source on a `rust:1-slim-bookworm`
+builder stage; the runtime layer is `debian:12-slim` with CA certificates
+taken from the distroless base image. The image is built with the `cjk`
+feature on, so CJK text renders out of the box (see
+[CJK and custom fonts](docs/CJK-and-custom-fonts.md)).
 
 #### docker-compose
 
@@ -178,7 +181,7 @@ cargo build --release -p obscura-cli --bins --no-default-features --features ste
 
 The `cjk` feature embeds Noto Sans CJK SC/TC (SIL OFL) so Chinese and Japanese
 render without host fonts. It is optional, to keep the base binary ~30 MB
-smaller; the release archives and Docker image are built with it on.
+smaller; the `-cjk` release archive and Docker image are built with it on.
 
 Requires Rust 1.75+ ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).
 The stealth build also compiles BoringSSL and generates bindings, so it needs

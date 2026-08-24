@@ -46,12 +46,15 @@ docker build -t obscura-cjk .
 docker run -d --name obscura -p 127.0.0.1:9222:9222 obscura-cjk
 ```
 
-Built on `distroless/cc`, with no shell or package manager in the runtime
-image, and with the `cjk` feature on so CJK text renders out of the box
+Multi-stage build on a `rust:1-slim-bookworm` builder stage; the runtime layer
+is `debian:12-slim` with CA certificates taken from the distroless base image.
+The `cjk` feature is on, so CJK text renders out of the box
 (see [CJK and custom fonts](CJK-and-custom-fonts.md)).
 
-Release archives and the Docker image include the rendering engine. Source
-builders must pass `--features render`; see [Build from source](Build-from-source.md).
+The rendering release archives (`-cjk`, `-stealth`, and no suffix) and the
+Docker image include the rendering engine; the `-no-render` variants omit it.
+Source builders must pass `--features render`; see
+[Build from source](Build-from-source.md).
 
 ## From source
 
@@ -63,7 +66,8 @@ See [Build from source](Build-from-source.md).
 - `obscura-worker`: helper for the parallel `scrape` command. Keep both in the same directory.
 
 Archive suffixes identify the feature set: no suffix includes rendering,
-`-stealth` includes rendering and stealth, `-no-render` includes neither, and
+`-cjk` adds embedded CJK fallback fonts on top of rendering, `-stealth`
+includes rendering and stealth, `-no-render` includes neither, and
 `-no-render-stealth` includes stealth without rendering.
 
 ## Smoke test

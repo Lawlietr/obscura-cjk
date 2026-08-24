@@ -6,7 +6,8 @@ other missing font can be supplied at runtime.
 
 ## What it is
 
-- A `cjk` cargo feature (on in the release archives and the Docker image).
+- A `cjk` cargo feature (on in the `-cjk` release archives and the Docker
+  image).
   When enabled, two faces are embedded in the binary as glyph-level fallbacks:
   **Noto Sans CJK SC** and **Noto Sans CJK TC**, Regular weight, SIL OFL 1.1
   (~16 MB each).
