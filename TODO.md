@@ -63,6 +63,11 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與重要事項。
       文件以「釘選特定版本」範例呈現該機制（範例值會過時但語意不變）。
       適用：README.md / README_ZH.md / docs/Installation.md /
       AGENTS.md（含兩個 compose 範例）/ docker-compose.yaml。
+- [x] **README 移除上游 Chrome 對比表（2026-08-24，EN/ZH 同步）。**
+      理由：數據為上游行銷數字、無出處無方法；「Anti-detect: Built-in」
+      對本 fork 錯誤（stealth 是 build-time feature，Docker 映像不含）；
+      fork 身份下該賣點屬上游。intro 的 V8/CDP/drop-in 描述已涵蓋核心
+      資訊，AGENTS.md 的效能基準紀律條目不受影響。
 - [x] **打第一個 tag（`v0.1.0-cjk`）push 觸發首次 release（2026-08-24）。**
       Release run 成功（約 28 分鐘），25 個資產 = 5 平台 × 5 變體；
       Docker run 成功（約 7 分鐘），manifest list 含 linux/amd64 +
