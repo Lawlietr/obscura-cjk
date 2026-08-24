@@ -9,10 +9,10 @@ tokio = { version = "1", features = ["rt", "macros"] }
 anyhow = "1"
 ```
 
-The first build compiles V8 from source, so it is slow and needs the same build tools as [Build from source](Build-from-source.md). Pin a commit for reproducible builds:
+The first build compiles V8 from source, so it is slow and needs the same build tools as [Build from source](Build-from-source.md). Pin a release tag for reproducible builds:
 
 ```toml
-obscura = { git = "https://github.com/Lawlietr/obscura-cjk", rev = "<commit>" }
+obscura = { git = "https://github.com/Lawlietr/obscura-cjk", tag = "v0.1.0-cjk" }
 ```
 
 ## Quickstart

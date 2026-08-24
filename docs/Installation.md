@@ -38,8 +38,18 @@ Download the `.zip` from [Releases](https://github.com/Lawlietr/obscura-cjk/rele
 
 ## Docker
 
-The image is not on a registry; build it from this repo's `Dockerfile` (or use
-the repo's `docker-compose.yaml`, which builds it for you):
+Pull the published image (linux/amd64, linux/arm64; pushed by GitHub Actions
+on every `v*` tag; `latest` tracks the newest release):
+
+```bash
+docker run -d --name obscura -p 127.0.0.1:9222:9222 ghcr.io/lawlietr/obscura-cjk:latest
+
+# Pin a specific release for reproducibility and easy rollback
+docker run -d --name obscura -p 127.0.0.1:9222:9222 ghcr.io/lawlietr/obscura-cjk:0.1.0-cjk
+```
+
+The repo's `docker-compose.yaml` deploys this image. For local development,
+build from this repo's `Dockerfile`:
 
 ```bash
 docker build -t obscura-cjk .

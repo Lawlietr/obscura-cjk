@@ -96,8 +96,19 @@ usable on common LTS servers with glibc 2.35+.
 
 ### Docker
 
-The image is not on a registry yet; build it from the `Dockerfile` in this
-repo:
+The multi-platform image (linux/amd64, linux/arm64) is published to GHCR by
+GitHub Actions on every `v*` tag; `latest` tracks the newest release:
+
+```bash
+docker run -d --name obscura -p 127.0.0.1:9222:9222 ghcr.io/lawlietr/obscura-cjk:latest
+
+# Pin a specific release for reproducibility and easy rollback
+docker run -d --name obscura -p 127.0.0.1:9222:9222 ghcr.io/lawlietr/obscura-cjk:0.1.0-cjk
+```
+
+The repo's `docker-compose.yaml` deploys this image.
+
+For local development, build it from this repo's `Dockerfile`:
 
 ```bash
 docker build -t obscura-cjk .
@@ -118,7 +129,7 @@ feature on, so CJK text renders out of the box (see
 ```yaml
 services:
   obscura:
-    image: obscura-cjk
+    image: ghcr.io/lawlietr/obscura-cjk:latest
     container_name: obscura
     restart: unless-stopped
     ports:
@@ -133,7 +144,7 @@ Then connect clients at `ws://localhost:9222/devtools/browser`.
 ```yaml
 services:
   obscura:
-    image: obscura-cjk
+    image: ghcr.io/lawlietr/obscura-cjk:latest
     container_name: obscura
     restart: unless-stopped
     ports:

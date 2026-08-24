@@ -1,7 +1,11 @@
 services:
   obscura:
-    image: obscura-cjk
-    build: .
+    # Published multi-platform image, pushed by GitHub Actions on every v* tag;
+    # `latest` tracks the newest release. Pin an explicit version tag
+    # (e.g. 0.1.0-cjk) instead for reproducible deployments and easy rollback.
+    # Local development build: `docker build -t obscura-cjk .` from this repo,
+    # then point `image:` at `obscura-cjk` (or use a compose.override.yaml).
+    image: ghcr.io/lawlietr/obscura-cjk:latest
     container_name: obscura
     restart: unless-stopped
     ports:

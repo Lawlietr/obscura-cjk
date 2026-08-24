@@ -12,17 +12,19 @@ capabilities. It targets web scraping and AI-agent automation.
 
 ## Docker Deployment
 
-The Docker image is built from this repo's `Dockerfile` and tagged
-`obscura-cjk` (it is not published to a registry). The repo's
-`docker-compose.yaml` is the canonical local deployment (MCP mode with the
-recommended security hardening); `docker compose up -d` from the repo root is
-the default way to run it. Standalone examples for reference:
+Release images are published to `ghcr.io/lawlietr/obscura-cjk` by GitHub
+Actions on every `v*` tag; `latest` tracks the newest release, and versioned
+tags remain available for rollback. The repo's `docker-compose.yaml` follows
+`latest` and is
+the canonical deployment (MCP mode with the recommended security hardening);
+`docker compose up -d` from the repo root is the default way to run it.
+For local development, build from the repo's `Dockerfile`
+(`docker build -t obscura-cjk .`). Standalone examples for reference:
 
 ```yaml
 services:
   obscura:
-    image: obscura-cjk
-    build: .
+    image: ghcr.io/lawlietr/obscura-cjk:latest
     container_name: obscura
     restart: unless-stopped
     ports:
@@ -49,8 +51,7 @@ For Puppeteer/Playwright integration, run CDP server mode:
 ```yaml
 services:
   obscura:
-    image: obscura-cjk
-    build: .
+    image: ghcr.io/lawlietr/obscura-cjk:latest
     container_name: obscura
     restart: unless-stopped
     ports:
@@ -187,8 +188,9 @@ edit instead.
   you finish" below lists what to run *when asked*, not what to run by default.
 - **This repo is an independent fork (`Lawlietr/obscura-cjk`), not the
   upstream.** It has diverged from `h4ckf0r0day/obscura`. All operational
-  references -- docs, install URLs, releases, Docker image (`obscura-cjk`,
-  built locally, not on a registry), CI, issue/security templates -- point at
+  references -- docs, install URLs, releases, Docker image (published to
+  ghcr.io/lawlietr/obscura-cjk on `v*` tags), CI, issue/security templates --
+  point at
   this repo, never the upstream. Upstream is mentioned only where required or
   factual: Apache-2.0 fork attribution in README/License, the
   `obscura-benchmark` suite (which only exists upstream), and historical

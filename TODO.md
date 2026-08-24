@@ -1,8 +1,7 @@
 # TODO
 
 Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與重要事項。
-分支：`cjk`（已 rebase 到 `lawlietr/main` `2810cb4`，已 force-push）。
-主分支合併前，先跑完「合併前必做」的項目。
+工作分支：`main`。首個 release：**`v0.1.0-cjk`**（2026-08-24 發佈成功）。
 
 ## Release：GitHub Actions 二進位發布
 
@@ -11,9 +10,9 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與重要事項。
 
 - `release.yml`：push 任何 `v*` tag 觸發。5 平台全部**原生**建置
   （x86_64 linux / aarch64 linux / aarch64 macos / x86_64 macos / windows），
-  每平台 4 個 feature 變體（`render`、`render,stealth`、`no-render`、
-  `no-render,stealth`），各打包 `obscura` + `obscura-worker`，
-  上傳前逐變體 smoke test（V8 isolate + 截圖），
+  每平台 5 個 feature 變體（`render,cjk`、`render`、`render,stealth`、
+  `no-render`、`no-render,stealth`），各打包 `obscura` + `obscura-worker`，
+  上傳前逐變體 smoke test（V8 isolate + 截圖；cjk 變體另截漢字頁），
   發布 job 只下載 artifacts、不 checkout 程式碼（token 隔離）。
 - `docker.yml`：`v*` tag 觸發，per-platform native runner 各自 build 單平台
   image 推 GHCR（`ghcr.io/lawlietr/obscura-cjk`），最後一個 job 組
@@ -47,17 +46,30 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與重要事項。
       QEMU、無外部 secret（job 層 `permissions: contents: read,
       packages: write`）；buildx GHA cache 按 platform scope 分離避免並行
       寫入衝突。映像 path 必須全小寫（GHCR 規定）。
-- [ ] **首發後一次性設定：** 第一次 push 映像後，到 repo Packages →
-      `obscura-cjk` → Package settings 把 visibility 改 public（GHCR 新
-      package 預設 private，不設 public 匿名 pull 會被拒）。
-- [ ] GHCR 映像上線後同步文件（方案 B：registry 相關描述等首次發布成功
-      後再改）：README / README_ZH / docs/Installation.md 三處「image is
-      not on a registry (yet)」改為本地 build 主線 + GHCR pull 可選
-      （`ghcr.io/lawlietr/obscura-cjk:vX.Y.Z-cjk.N`）；AGENTS.md 兩處
-      「not published to a registry」（Docker Deployment 節與 fork 政策節）
-      同步修正；`docker-compose.yaml` 視需要加註解版 GHCR image 替代行。
-- [ ] 打第一個 tag（`v0.1.0-cjk`）push 觸發首次 release；驗證 artifacts
-      的 CJK 變體截圖正常、`docker pull` 多平台 manifest list 成功。
+- [x] **首發後一次性設定。** 實測免做：經由 repo workflow token 發佈的
+      GHCR package 自動繼承 public repo 可見性，匿名 pull manifest list
+      回 HTTP 200（`0.1.0-cjk` 與 `latest` 皆公開可讀）。
+- [x] **GHCR 映像上線後同步文件（方案 B 收尾，2026-08-24 完成）。**
+      README.md / README_ZH.md Docker 節改為「GHCR pull 為部署主線 +
+      本地 build 保留為本地開發流程」，compose 範例指向
+      `ghcr.io/lawlietr/obscura-cjk:0.1.0-cjk`；docs/Installation.md 同步；
+      AGENTS.md 四處更新（Docker Deployment 節、MCP/CDP 兩個 compose
+      範例、fork 政策節）；docs/Use-as-a-Rust-library.md 的 pin 從
+      `rev` 改回 `tag = "v0.1.0-cjk"`。
+- [x] **映像 tag 慣例定案：說明文件與 docker-compose.yaml 一律以
+      `latest` 為主（2026-08-24）。** 寫死版本號會讓每次發佈都要回頭改
+      README ×2 / Installation.md / AGENTS.md 範例，必然漂移。慣例：
+      `latest` 跟隨最新 release；版本 tag 保留作為回退與可重現部署用，
+      文件以「釘選特定版本」範例呈現該機制（範例值會過時但語意不變）。
+      適用：README.md / README_ZH.md / docs/Installation.md /
+      AGENTS.md（含兩個 compose 範例）/ docker-compose.yaml。
+- [x] **打第一個 tag（`v0.1.0-cjk`）push 觸發首次 release（2026-08-24）。**
+      Release run 成功（約 28 分鐘），25 個資產 = 5 平台 × 5 變體；
+      Docker run 成功（約 7 分鐘），manifest list 含 linux/amd64 +
+      linux/arm64 + attestation。本機抽檔通過：cjk 二進位 vs 預設二進位
+      對照渲染 CJK fixture（中日文段落墨量比 5.7–9.2×、nocjk 版呈固定
+      豆腐框、Latin 行逐像素相同）、容器內 eval + 截圖、compose 以映像
+      重建後 MCP endpoint 正常回應 initialize。
 - 額度備註：公開倉庫每月 2000 分鐘免費 Actions；5 平台 × V8 全編
   約每平台 10–15 分鐘，单次 release 沒有額度問題。
 
@@ -84,7 +96,10 @@ crate 出新版本時沒有任何機制自動提 PR。加官方 Dependabot 補�
 - [ ] 後續維護：升級後視需要同步清理 `deny.toml` 的 ignore 清單
   （RUSTSEC ID 綁定 transitive 版本，cargo-deny CI 會提示）。
 
-## 合併前必做（cjk → main）
+## 回歸驗證（原「合併前必做」；cjk 分支工作已直接進 main，以下作為下次 release 前的品質關卡）
+
+> 註：首個 release（v0.1.0-cjk）的 CI smoke test 已全數通過，但完整本地
+> 回歸仍建議補跑。
 
 - [ ] 完整回歸：`CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run
       --release --features render,cjk --no-fail-fast`。
@@ -125,8 +140,10 @@ crate 出新版本時沒有任何機制自動提 PR。加官方 Dependabot 補�
       砍掉上游 trendshift 徽章、Docker Hub 映像、AUR/NixOS 舊節；
       icon 改本倉庫相對路徑；所有安裝/文件連結指本倉庫與 docs/。
       docs/ 保持英文不翻譯（中文版只鏈到英文 docs）。
-- [ ] `docker-compose.yaml` 與文件已一致（`obscura-cjk` + `build: .`）；
-      GHCR 映像上線後再同步（見上方待辦）。
+- [x] `docker-compose.yaml` 已切換為 GHCR 映像部署
+      （`image: ghcr.io/lawlietr/obscura-cjk:latest`，移除 `build: .`；
+      升級時改 pin 版本號即可回退），本地 build 說明保留在註解與 README；
+      本機已用新 compose 重建容器驗證。
 
 ## 本機環境（非仓库變更）
 
@@ -139,8 +156,11 @@ crate 出新版本時沒有任何機制自動提 PR。加官方 Dependabot 補�
 - fork 政策：本倉庫是獨立 fork，所有操作面引用（文件、安裝、release、
   Docker、CI、issue/security）指向本倉庫；上游僅保留於 Apache-2.0 授權
   歸屬、`obscura-benchmark`（僅存於上游）、歷史 PR 引述。
-- Docker：映像檔本地 build（`obscura-cjk`，`docker-compose.yaml` 為正式
-  部署方式）；本機容器已由 compose 管理。
+- Docker：release 映像由 GitHub Actions 發佈至
+  `ghcr.io/lawlietr/obscura-cjk`（每個 `v*` tag；`latest` 跟隨最新，
+  版本 tag 供回退）；`docker-compose.yaml` 跟隨 `latest` 為正式部署，
+  `docker build -t obscura-cjk .` 保留為本地開發流程；本機容器已由
+  compose 管理。
 - 不自動跑驗證：build / nextest / render capture / obstacle course
   只在用戶明確要求時執行。
 - SVG fallback 字型 lazy loading 的 gotcha（`svg_font_database_with_fallbacks`
@@ -150,10 +170,8 @@ crate 出新版本時沒有任何機制自動提 PR。加官方 Dependabot 補�
 
 ## 分支 / remote 現況
 
-- `origin` → `h4ckf0r0day/obscura`（upstream，只讀參考）
-- `lawlietr` → `Lawlietr/obscura-cjk`（自己的倉庫）
-- `lawlietr/main` @ `2810cb4`（= 上游最新，933 commits ahead of 舊 base）
-- `lawlietr/cjk` @ 本分支（rebased，5 commits：Docker config → CJK feature
-  → AGENTS.md flags → README/README_ZH → AGENTS.md fixture note，
-  + 本輪的 fork 身份重寫）
-- 合併入口：https://github.com/Lawlietr/obscura-cjk/pull/new/cjk
+- `origin` → `Lawlietr/obscura-cjk`（自己的倉庫，唯一 remote）
+- 工作分支：`main`（追蹤 `origin/main`）
+- 首個 tag：`v0.1.0-cjk` @ `84c7223`（2026-08-24 推送，觸發首次 release）
+- 上游 `h4ckf0r0day/obscura` 目前未設 remote，僅歷史與 Apache-2.0 授權歸屬
+  參考

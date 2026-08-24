@@ -92,7 +92,19 @@ glibc 2.35+ 的常見 LTS server 上執行。
 
 ### Docker
 
-映像檔尚未發布到任何 registry；請用本倉庫的 `Dockerfile` 本地建置：
+多平台映像（linux/amd64、linux/arm64）由 GitHub Actions 在每個 `v*` tag 推送
+到 GHCR；`latest` 跟隨最新 release：
+
+```bash
+docker run -d --name obscura -p 127.0.0.1:9222:9222 ghcr.io/lawlietr/obscura-cjk:latest
+
+# 或釘選特定版本，方便重現部署與回退
+docker run -d --name obscura -p 127.0.0.1:9222:9222 ghcr.io/lawlietr/obscura-cjk:0.1.0-cjk
+```
+
+本倉庫的 `docker-compose.yaml` 部署的就是這個映像。
+
+本地開發時，仍可從本倉庫的 `Dockerfile` 建置映像：
 
 ```bash
 docker build -t obscura-cjk .
@@ -112,7 +124,7 @@ feature 建置，CJK 文字開箱即渲染（見
 ```yaml
 services:
   obscura:
-    image: obscura-cjk
+    image: ghcr.io/lawlietr/obscura-cjk:latest
     container_name: obscura
     restart: unless-stopped
     ports:
@@ -127,7 +139,7 @@ client 連線位址為 `ws://localhost:9222/devtools/browser`。
 ```yaml
 services:
   obscura:
-    image: obscura-cjk
+    image: ghcr.io/lawlietr/obscura-cjk:latest
     container_name: obscura
     restart: unless-stopped
     ports:
