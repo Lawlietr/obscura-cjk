@@ -85,14 +85,16 @@ bans 檢查（有 5 個明確 ignore 的 RUSTSEC），但「只擋不升」：tr
 crate 出新版本時沒有任何機制自動提 PR。加官方 Dependabot 補主動式更新，
 與 cargo-deny 互補不衝突。公開倉庫免費。
 
-- [ ] **新增 `.github/dependabot.yml`。** 建議設定：
-  - `package-ecosystem: "cargo"`, `directory: "/"`, `schedule: weekly`（較安靜；
-    本倉庫 V8 全編一個 PR 的 CI 成本不低，daily 會比較吵）。
-  - Security updates 開，`open-limit` 調小（如 5）。
-  - 例行 version updates 可先只對 lockfile 更新開（`lockfile: true`），並用
-    `groups` 合併，避免 468 個套件一次開一堆 PR。
-  - `v8` / `deno_core` 這類重依賴建議先 exclude 或獨立 group，升版涉及
-    V8 ABI/編譯，要人工看 diff 再合。
+- [x] **新增 `.github/dependabot.yml`（2026-08-24 已寫入，push 後生效）。**
+      實作：兩個 cargo entry（同 directory，週一 schedule）——例行 version
+      updates 用 `lockfile: true`（只改 Cargo.lock、不動 Cargo.toml）並全部
+      併入 `routine` group（一個週報 PR，CI 每週約一次 V8 全編）；
+      `exclude-patterns` 排除 `v8` / `deno-core` / `deno-*`（ABI 敏感，升版
+      留人工），`lockfile: true` 下 major bump 也只重寫 lockfile，故不設
+      update-type 過濾、直接併入同一 group。Security entry 另開，
+      `security-advisories: enabled`（V8/deno 家族的 RUSTSEC 也會進 PR），
+      併入 `security` group，`open-pull-requests-limit: 5`。另加
+      github-actions ecosystem（低頻、CI 便宜）。
 - [ ] Repo Settings 確認 Dependabot GitHub App 權限（public repo 預設已啟用，
   無需額外開關；security alerts 預設開）。
 - [ ] 觀察首批 PR：確認 `[patch.crates-io]` 的 vendored `taffy` / `cosmic-text`
