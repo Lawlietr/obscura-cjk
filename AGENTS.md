@@ -164,8 +164,7 @@ For any code change:
    touches fonts or the render layer).
 4. The obstacle course still reports **32/33** (`observer-intersection` is a
    known issue: headless mode does not scroll, so IntersectionObserver
-   callbacks fire only once when the sentinel stays below viewport; upstream
-   has the same behavior despite fixture comments claiming otherwise).
+   callbacks fire only once when the sentinel stays below viewport).
 5. For render changes, run deterministic fixtures and broad top/bottom real-site
    captures using the methodology below.
 6. For stealth changes, re-test with `--stealth` (a non-stealth binary won't
@@ -258,10 +257,9 @@ screenshots or reports.
   Expected `'io:50'`, got `''`. Root cause: Obscura headless mode does not
   scroll, so the IntersectionObserver callback on the sentinel element fires
   only once (when the page loads). The sentinel remains below the viewport
-  and never triggers the expected scroll-based callback. Upstream Obscura
-  has the same behavior despite the fixture comment claiming targets are
-  treated as intersecting. This is an inherent headless-mode limitation,
-  not a fork-specific regression.
+  and never triggers the expected scroll-based callback. Fixture comments
+  claim targets are treated as intersecting, but they are not. This is an
+  inherent headless-mode limitation.
 
 ## Gotchas
 

@@ -122,9 +122,8 @@ crate 出新版本時沒有任何機制自動提 PR。加官方 Dependabot 補�
       32/33 stages passed。已知問題：`observer-intersection` 失敗
       （預期 `'io:50'`，實際 `''`）。根因：Obscura headless 模式不模擬
       scroll，IntersectionObserver 的 sentinel element 在 viewport 下方，
-      callback 只觸發一次。上游 Obscura 同樣有這個問題（fixture 註解
-      聲稱 treat targets as intersecting，但實際上沒有）。此為 headless
-      模式的本質限制，非本 fork 問題。
+      callback 只觸發一次。Fixture 註解聲稱 treat targets as intersecting，
+      但實際上沒有。此為 headless 模式的本質限制。
 
 ## 文件同步
 

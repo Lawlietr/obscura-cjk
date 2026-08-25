@@ -136,10 +136,9 @@ also preserve non-render automation behavior and the no-render build.
   Expected `'io:50'`, got `''`. Root cause: Obscura headless mode does not
   scroll, so the IntersectionObserver callback on the sentinel element fires
   only once (when the page loads). The sentinel remains below the viewport
-  and never triggers the expected scroll-based callback. Upstream Obscura
-  has the same behavior despite the fixture comment claiming targets are
-  treated as intersecting. This is an inherent headless-mode limitation,
-  not a regression.
+  and never triggers the expected scroll-based callback. Fixture comments
+  claim targets are treated as intersecting, but they are not. This is an
+  inherent headless-mode limitation.
 
 ## Before you open a PR
 
