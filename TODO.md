@@ -105,22 +105,19 @@ crate 出新版本時沒有任何機制自動提 PR。加官方 Dependabot 補�
 
 ## 回歸驗證（原「合併前必做」；cjk 分支工作已直接進 main，以下作為下次 release 前的品質關卡）
 
-> 註：首個 release（v0.1.0-cjk）的 CI smoke test 已全數通過，但完整本地
-> 回歸仍建議補跑。
+> 註：首個 release（v0.1.0-cjk）的 CI smoke test 已全數通過，完整本地
+> 回歸已於 2026-08-25 補跑。
 
-- [ ] 完整回歸：`CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run
-      --release --features render,cjk --no-fail-fast`。
-      **post-rebase 尚未跑過**（rebase 前是 1399/1399，不適用現況）。
-      上游 933 commits 中有 1 個動到 `paint.rs`（box-shadow clip，
-      `00a8a81`，+178 行）——低風險但未驗證。
-- [ ] **先查磁碟**：`df -h /` 確保 ≥15G。`target/` 目前 ~8.7G，
-      nextest 會再產 ~5G 測試二進位（~134MB × ~40 個，V8-linked）。
-      不足時先清 `target/release/deps` 舊 binary。
-- [ ] CJK 視覺抽檢：
-      `OBSCURA_BIN=./target/release/obscura fetch
-      file://$PWD/render-repros/cjk/cjk-fallback.html --screenshot
-      "$RUN_ROOT/cjk.png"`，確認繁/簡/日文字形正確。
-- [ ] 非 cjk 路徑抽測（`--features render`）確認無回歸。
+- [x] **完整回歸（2026-08-25）。**
+      `render,cjk`：**1487/1487** passed（4 skipped）。
+      `render`：**1486/1486** passed（4 skipped）。
+      建置 6m 19s，測試各 ~16s。上游 933 commits 中有 1 個動到
+      `paint.rs`（box-shadow clip，`00a8a81`）已驗證通過。
+- [x] **磁碟檢查（2026-08-25）。** 起始 14G 可用，測試後 6.5G 可用
+      （78%）。清理測試二進位後 target/ 從 6.5G → 802M。
+- [x] **CJK 視覺抽檢（2026-08-25）。** 繁/簡/日文字形渲染正確，
+      截圖 55KB，無豆腐框。
+- [x] **非 cjk 路徑抽測（2026-08-25）。** 1486/1486 passed，無回歸。
 - [ ] `obscura-benchmark` 障礙課程 33/33（該倉庫只存在於上游，本機沒有
       clone；可選，但 AGENTS.md 列為正式 gate）。
 
