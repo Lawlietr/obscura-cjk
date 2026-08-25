@@ -146,6 +146,13 @@ It serves local fixtures, so it is deterministic and offline. WPT conformance
 and the real-world render corpus also live in that repo; report WPT as subtest
 pass %, not whole-file pass.
 
+Dependabot runs weekly (see `.github/dependabot.yml`). Routine cargo PRs are
+lockfile-only by design (`lockfile: true`): they rewrite `Cargo.lock` but must
+never touch `Cargo.toml`. The V8/deno family (`v8`, `deno-core`, `deno-*`)
+is excluded from routine updates on purpose, since upgrading it changes the
+V8 ABI and requires a manual review plus the full regression gate; only
+security advisories may produce PRs against those crates.
+
 ## Before you finish
 
 For any code change:
