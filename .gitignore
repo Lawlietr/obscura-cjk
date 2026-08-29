@@ -1,2 +1,5 @@
 target/
 .DS_Store
+
+# Local Docker Compose override (contains secrets)
+docker-compose.yaml
