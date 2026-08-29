@@ -47,21 +47,21 @@ Grab the latest binary from [Releases](https://github.com/Lawlietr/obscura-cjk/r
 
 ```bash
 # Linux x86_64
-curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-x86_64-linux.tar.gz
-tar xzf obscura-x86_64-linux.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-x86_64-linux-cjk.tar.gz
+tar xzf obscura-x86_64-linux-cjk.tar.gz
 ./obscura fetch https://example.com --eval "document.title"
 
 # Linux ARM64 (aarch64)
-curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-aarch64-linux.tar.gz
-tar xzf obscura-aarch64-linux.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-aarch64-linux-cjk.tar.gz
+tar xzf obscura-aarch64-linux-cjk.tar.gz
 
 # macOS Apple Silicon
-curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-aarch64-macos.tar.gz
-tar xzf obscura-aarch64-macos.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-aarch64-macos-cjk.tar.gz
+tar xzf obscura-aarch64-macos-cjk.tar.gz
 
 # macOS Intel
-curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-x86_64-macos.tar.gz
-tar xzf obscura-x86_64-macos.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-x86_64-macos-cjk.tar.gz
+tar xzf obscura-x86_64-macos-cjk.tar.gz
 
 # Windows
 Download the `.zip` from the releases page and extract it manually.
@@ -73,11 +73,9 @@ parallel `scrape` command.
 
 | Archive suffix | Rendering | Stealth transport | Embedded CJK |
 |----------------|-----------|-------------------|--------------|
-| none | Yes | No | No |
-| `-cjk` | Yes | No | Yes |
 | `-stealth` | Yes | Yes | No |
-| `-no-render` | No | No | No |
-| `-no-render-stealth` | No | Yes | No |
+| `-cjk` | Yes | No | Yes |
+| `-cjk-stealth` | Yes | Yes | Yes |
 
 Linux release builds target Ubuntu 22.04 so the downloaded binary remains
 usable on common LTS servers with glibc 2.35+.

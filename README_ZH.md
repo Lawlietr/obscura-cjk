@@ -44,21 +44,21 @@ engine，只加入 CJK 字型渲染。
 
 ```bash
 # Linux x86_64
-curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-x86_64-linux.tar.gz
-tar xzf obscura-x86_64-linux.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-x86_64-linux-cjk.tar.gz
+tar xzf obscura-x86_64-linux-cjk.tar.gz
 ./obscura fetch https://example.com --eval "document.title"
 
 # Linux ARM64 (aarch64)
-curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-aarch64-linux.tar.gz
-tar xzf obscura-aarch64-linux.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-aarch64-linux-cjk.tar.gz
+tar xzf obscura-aarch64-linux-cjk.tar.gz
 
 # macOS Apple Silicon
-curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-aarch64-macos.tar.gz
-tar xzf obscura-aarch64-macos.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-aarch64-macos-cjk.tar.gz
+tar xzf obscura-aarch64-macos-cjk.tar.gz
 
 # macOS Intel
-curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-x86_64-macos.tar.gz
-tar xzf obscura-x86_64-macos.tar.gz
+curl -LO https://github.com/Lawlietr/obscura-cjk/releases/latest/download/obscura-x86_64-macos-cjk.tar.gz
+tar xzf obscura-x86_64-macos-cjk.tar.gz
 
 # Windows
 從 releases 頁面下載 `.zip` 並手動解壓縮。
@@ -69,11 +69,9 @@ tar xzf obscura-x86_64-macos.tar.gz
 
 | 打包副檔名 | 渲染 | Stealth transport | 內嵌 CJK |
 |------------|------|-------------------|----------|
-| 無 | 有 | 無 | 無 |
-| `-cjk` | 有 | 無 | 有 |
 | `-stealth` | 有 | 有 | 無 |
-| `-no-render` | 無 | 無 | 無 |
-| `-no-render-stealth` | 無 | 有 | 無 |
+| `-cjk` | 有 | 無 | 有 |
+| `-cjk-stealth` | 有 | 有 | 有 |
 
 Linux release 以 Ubuntu 22.04 為目標建置，故下載的二進位可在使用
 glibc 2.35+ 的常見 LTS server 上執行。
