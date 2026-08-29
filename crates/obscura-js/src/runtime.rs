@@ -1117,6 +1117,41 @@ impl ObscuraJsRuntime {
         )
     }
 
+    /// Paint an unprepared view of the current document against the runtime's
+    /// retained resource cache.
+    ///
+    /// `Page` falls back to a raw-DOM paint when a capture's viewport does not
+    /// match the prepared render key. That fallback used a fresh
+    /// `RenderResourceCache`, so it refetched every image on every call and a
+    /// repeated capture paid the network cost per frame. Reusing the cache the
+    /// runtime already holds for this document keeps the fallback correct while
+    /// fetching each resource once.
+    #[cfg(feature = "render")]
+    pub fn screenshot_unprepared_with_retained_resources(
+        &self,
+        viewport: (f32, f32),
+        base_url: Option<&str>,
+        scroll: (f32, f32),
+        animation_sample_time: obscura_render::AnimationSampleTime,
+        surface_color: [u8; 4],
+    ) -> Option<Vec<u8>> {
+        let mut state = self.state.borrow_mut();
+        let ObscuraState {
+            dom,
+            render_resources,
+            ..
+        } = &mut *state;
+        obscura_render::screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources(
+            dom.as_ref()?,
+            viewport,
+            base_url,
+            scroll,
+            animation_sample_time,
+            surface_color,
+            render_resources,
+        )
+    }
+
     #[cfg(feature = "render")]
     pub fn screenshot_prepared_with_surface_color(
         &self,
@@ -13084,6 +13119,259 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!("yes"));
+    }
+
+    #[test]
+    fn test_label_click_activates_its_labeled_control() {
+        let mut rt = setup_runtime(
+            r#"<label id="explicit" for="a">a</label><input type="checkbox" id="a">
+               <label id="implicit">b <input type="checkbox" id="b"></label>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const ids = ['explicit', 'implicit'];
+            for (const id of ids) { document.getElementById(id).click(); }
+            return [document.getElementById('a').checked, document.getElementById('b').checked];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true]));
+    }
+
+    #[test]
+    fn test_label_click_honors_the_association_rules() {
+        // A present `for` associates by id alone: an empty value associates
+        // nothing and must not fall back to the nested control, and a dangling
+        // id activates nothing. A disabled control has no activation behavior.
+        let mut rt = setup_runtime(
+            r#"<label id="empty" for="">a <input type="checkbox" id="a"></label>
+               <label id="dangling" for="missing">b</label><input type="checkbox" id="b">
+               <label id="disabled" for="c">c</label><input type="checkbox" id="c" disabled>
+               <label id="both" for="d">d <input type="checkbox" id="e"></label>
+               <input type="checkbox" id="d">"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            for (const id of ['empty', 'dangling', 'disabled', 'both']) {
+                document.getElementById(id).click();
+            }
+            return ['a', 'b', 'c', 'd', 'e'].map(id => document.getElementById(id).checked);
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([false, false, false, true, false])
+        );
+    }
+
+    #[test]
+    fn test_label_activation_does_not_double_fire_or_recurse() {
+        // Clicking the control inside its own label toggles once, and a click
+        // handler that clicks that label back cannot re-enter the forwarding.
+        let mut rt = setup_runtime(
+            r#"<label id="wrapper"><input type="checkbox" id="nested"></label>
+               <label id="host" for="reentrant">r</label>
+               <input type="checkbox" id="reentrant">"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const reentrant = document.getElementById('reentrant');
+            document.getElementById('nested').click();
+            let bounces = 0;
+            reentrant.addEventListener('click', () => {
+                if (bounces++ < 1) { document.getElementById('host').click(); }
+            });
+            document.getElementById('host').click();
+            return [document.getElementById('nested').checked, reentrant.checked, bounces];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true, 1]));
+    }
+
+    #[test]
+    fn test_click_respects_disabled_controls_and_interactive_content() {
+        // A disabled control has no activation behaviour, whether it is clicked
+        // directly, reached through its label, or disabled by an ancestor
+        // fieldset. Interactive content inside a label swallows the label's
+        // activation, but an <a> without href is not interactive content.
+        let mut rt = setup_runtime(
+            r#"<input type="checkbox" id="direct" disabled>
+               <fieldset disabled><label id="in-set" for="set-box">s</label>
+                 <input type="checkbox" id="set-box"></fieldset>
+               <label id="link"><a href="/x"><span id="in-link">go</span></a>
+                 <input type="checkbox" id="link-box"></label>
+               <label id="plain"><a><span id="in-plain">go</span></a>
+                 <input type="checkbox" id="plain-box"></label>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const ids = ['direct', 'in-set', 'in-link', 'in-plain'];
+            for (const id of ids) { document.getElementById(id).click(); }
+            return ['direct', 'set-box', 'link-box', 'plain-box']
+                .map(id => document.getElementById(id).checked);
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([false, false, false, true]));
+    }
+
+    #[test]
+    fn test_disabled_only_applies_to_disableable_elements() {
+        // A `disabled` attribute is meaningless on anything that cannot be
+        // disabled, and only listed form controls inherit it from a fieldset.
+        // Component libraries do put `disabled` on plain <div>s, so treating
+        // that as disabled would silently stop their clicks.
+        let mut rt = setup_runtime(
+            r#"<div id="plain" disabled>x</div>
+               <fieldset disabled><a id="link" href="x">l</a>
+                 <input type="checkbox" id="control"></fieldset>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const seen = [];
+            for (const id of ['plain', 'link']) {
+                const el = document.getElementById(id);
+                el.addEventListener('click', e => { seen.push(id); e.preventDefault(); });
+                el.click();
+            }
+            document.getElementById('control').click();
+            return [seen.join(','), document.getElementById('control').checked];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["plain,link", false]));
+    }
+
+    #[test]
+    fn test_label_forwarding_uses_interactive_content_not_labelable() {
+        // meter, output and progress are labelable but not interactive, so a
+        // click on one still activates the label. An <a> counts only with href.
+        let mut rt = setup_runtime(
+            r#"<label id="l1" for="c1"><output id="o">v</output></label>
+               <input type="checkbox" id="c1">
+               <label id="l2" for="c2"><a id="bare">t</a></label>
+               <input type="checkbox" id="c2">
+               <label id="l3" for="c3"><a id="linked" href="x">t</a></label>
+               <input type="checkbox" id="c3">
+               <label id="l4" for="c4"><button id="btn" type="button">b</button></label>
+               <input type="checkbox" id="c4">"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const ids = ['o', 'bare', 'linked', 'btn'];
+            for (const id of ids) { document.getElementById(id).click(); }
+            return ['c1', 'c2', 'c3', 'c4'].map(id => document.getElementById(id).checked);
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true, false, false]));
+    }
+
+    #[test]
+    fn test_radio_activation_moves_the_checked_peer_and_reverts_on_cancel() {
+        let mut rt = setup_runtime(
+            r#"<form><label id="pick" for="b">b</label>
+                 <input type="radio" name="g" id="a" checked>
+                 <input type="radio" name="g" id="b"></form>
+               <form><label id="veto" for="d">d</label>
+                 <input type="radio" name="h" id="c" checked>
+                 <input type="radio" name="h" id="d"></form>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const seen = [];
+            document.getElementById('b').addEventListener('change', () => seen.push('change'));
+            document.getElementById('pick').click();
+            document.getElementById('d').addEventListener('click', e => e.preventDefault());
+            document.getElementById('veto').click();
+            return [
+                document.getElementById('a').checked, document.getElementById('b').checked,
+                document.getElementById('c').checked, document.getElementById('d').checked,
+                seen.join(','),
+            ];
+        "#,
+            )
+            .unwrap();
+        // Activating b unchecks its peer a; the cancelled activation of d
+        // restores c.
+        assert_eq!(
+            result,
+            serde_json::json!([false, true, true, false, "change"])
+        );
+    }
+
+    #[test]
+    fn test_disabled_fieldset_exemption_is_the_first_legend_child_only() {
+        // Every disabled fieldset ancestor counts, and only descendants of that
+        // fieldset's first <legend> child escape it. A legend wrapped in a div
+        // is not the fieldset's legend, a second legend does not exempt, and an
+        // inner fieldset's legend does not escape an outer disabled fieldset.
+        let mut rt = setup_runtime(
+            r#"<fieldset disabled><legend><input type="checkbox" id="a"></legend>
+                 <input type="checkbox" id="b"></fieldset>
+               <fieldset disabled><legend>x</legend>
+                 <legend><input type="checkbox" id="c"></legend></fieldset>
+               <fieldset disabled><div><legend>
+                 <input type="checkbox" id="d"></legend></div></fieldset>
+               <fieldset disabled><div><fieldset disabled><legend>
+                 <input type="checkbox" id="e"></legend></fieldset></div></fieldset>
+               <fieldset disabled><fieldset><legend>
+                 <input type="checkbox" id="f"></legend></fieldset></fieldset>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const ids = ['a', 'b', 'c', 'd', 'e', 'f'];
+            for (const id of ids) { document.getElementById(id).click(); }
+            return ids.map(id => document.getElementById(id).checked);
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, false, false, false, false, false])
+        );
+    }
+
+    #[test]
+    fn test_label_click_runs_checkbox_pre_click_activation() {
+        // The control flips before the click event dispatches, so listeners
+        // observe the new state, `input` and `change` follow, and a cancelled
+        // event restores the old state.
+        let mut rt = setup_runtime(
+            r#"<label id="live" for="live-box">a</label><input type="checkbox" id="live-box">
+               <label id="cancel" for="cancel-box">b</label>
+               <input type="checkbox" id="cancel-box">"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const events = [];
+            const live = document.getElementById('live-box');
+            for (const type of ['click', 'input', 'change']) {
+                live.addEventListener(type, () => events.push(type + ':' + live.checked));
+            }
+            document.getElementById('live').click();
+            const cancelled = document.getElementById('cancel-box');
+            cancelled.addEventListener('click', event => event.preventDefault());
+            document.getElementById('cancel').click();
+            return [events.join(','), live.checked, cancelled.checked];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["click:true,input:true,change:true", true, false])
+        );
     }
 
     #[test]

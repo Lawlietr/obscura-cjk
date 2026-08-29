@@ -239,10 +239,15 @@ pub async fn handle(
                 let page = ctx
                     .get_session_page_mut(session_id)
                     .ok_or("No page")?;
-                let escaped_oid = oid.replace('\\', "\\\\").replace('\'', "\\'");
+                // The child ids minted below are `<parent>::<key>` and the key
+                // is a property name off a page object, so the page decides
+                // what ends up inside this literal. A JSON literal covers the
+                // C0 controls a manual quote/backslash pair leaves alone; see
+                // `util::object_id_literal`.
+                let oid_literal = crate::util::object_id_literal(oid);
                 let code = format!(
                     "(function() {{\
-                        var obj = globalThis.__obscura_objects['{oid}'];\
+                        var obj = globalThis.__obscura_objects[{oid}];\
                         if (!obj || typeof obj !== 'object') return [];\
                         var keys = Object.keys(obj);\
                         return keys.map(function(k) {{\
@@ -251,7 +256,7 @@ pub async fn handle(
                             var item = {{ name: k, type: t }};\
                             if (v === null) {{ item.value = null; return item; }}\
                             if (t !== 'object' && t !== 'function') {{ item.value = v; return item; }}\
-                            var childOid = '{oid}::' + k;\
+                            var childOid = {oid} + '::' + k;\
                             globalThis.__obscura_objects[childOid] = v;\
                             item.childOid = childOid;\
                             if (typeof v.nodeType === 'number') {{\
@@ -269,7 +274,7 @@ pub async fn handle(
                             return item;\
                         }});\
                     }})()",
-                    oid = escaped_oid,
+                    oid = oid_literal,
                 );
                 let result = page.evaluate(&code);
                 if let serde_json::Value::Array(props) = result {

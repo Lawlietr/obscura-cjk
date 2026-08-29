@@ -19,7 +19,8 @@
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
-    '__obscura_registerLinkedStylesheet',
+    '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
+    '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
     '__obscura_nextPendingTimeoutDelay',
@@ -2576,6 +2577,107 @@ function _htmlAttrName(el, n) {
 // A submit button per the HTML spec: a <button> whose type is submit — the
 // default, including when the type attribute is missing or invalid — or an
 // <input> of type submit/image. Used to validate requestSubmit's submitter.
+// The HTML "labeled control" of a <label>: the element referenced by its `for`
+// attribute, or the first labelable descendant. Labelable elements per spec are
+// button, input (excluding type=hidden), meter, output, progress, select,
+// textarea.
+const _LABELABLE = 'button,input:not([type=hidden]),meter,output,progress,select,textarea';
+function _labeledControl(label) {
+  if (!label || label.tagName !== 'LABEL') return null;
+  // A present `for` attribute means association by ID only; an empty value
+  // associates nothing (no fallback to a descendant).
+  const forId = label.getAttribute ? label.getAttribute('for') : null;
+  if (forId !== null && forId !== undefined) {
+    if (forId === '') return null;
+    const doc = label.ownerDocument || globalThis.document;
+    const el = doc && doc.getElementById ? doc.getElementById(forId) : null;
+    if (!el) return null;
+    return el.matches && el.matches(_LABELABLE) ? el : null;
+  }
+  return label.querySelector ? label.querySelector(_LABELABLE) : null;
+}
+
+// Run a label's activation behaviour once, and report whether it ran. The set
+// of labels currently forwarding is closure-private, so a control that clicks
+// its own label from a click handler cannot recurse and page script can neither
+// read nor forge the state. Marking the label itself would leave an enumerable
+// property on a DOM node. The CDP click path shares this guard through the
+// non-enumerable __obscura_activateLabel helper, so both click paths apply the
+// same rule.
+// Interactive content inside a label has its own activation behaviour and
+// swallows the label's, so only a click landing on ordinary content forwards.
+// This is the HTML interactive-content set, which is not the labelable set:
+// meter, output and progress are labelable but inert, while an <a> counts only
+// with an href.
+const _INTERACTIVE = 'a[href],audio[controls],button,details,embed,iframe,'
+  + 'img[usemap],input:not([type=hidden]),select,textarea,video[controls]';
+
+const _forwardingLabels = new WeakSet();
+// Passed to click() only by label activation on behalf of a real input event,
+// so the forwarded control events keep the trustedness of the click that
+// caused them, as they do in a real browser. The symbol itself is
+// closure-private, so click() cannot be called with it directly, but
+// __obscura_activateLabel below will supply it on request, exactly as
+// __obscura_markTrusted already does for any event.
+const _TRUSTED_ACTIVATION = Symbol('obscura.trustedActivation');
+
+// Only these elements can be actually disabled. A `disabled` attribute on
+// anything else, which component libraries do put on plain <div>s, has no
+// effect on event dispatch.
+const _DISABLEABLE = 'button,input,select,textarea,optgroup,option,fieldset';
+// Of those, only the listed form-associated ones inherit disabled from an
+// ancestor <fieldset>.
+const _FIELDSET_DISABLEABLE = 'button,input,select,textarea';
+
+// Disabled per the HTML spec: the element's own attribute, or any disabled
+// <fieldset> ancestor. Walking every ancestor rather than the nearest one
+// matters because the exemption is narrow: only the descendants of a disabled
+// fieldset's *first <legend> child* escape, so a control can sit in an inner
+// fieldset's legend and still be disabled by an outer fieldset. Checking the
+// first legend child, not the first legend descendant, keeps a legend wrapped
+// in a div from granting the exemption.
+function _isActuallyDisabled(el) {
+  if (!el || !el.matches || !el.matches(_DISABLEABLE)) return false;
+  if (el.disabled || (el.hasAttribute && el.hasAttribute('disabled'))) return true;
+  if (!el.matches(_FIELDSET_DISABLEABLE)) return false;
+  let child = el;
+  let parent = el.parentElement;
+  while (parent) {
+    if (parent.tagName === 'FIELDSET' && parent.hasAttribute('disabled')) {
+      let firstLegend = null;
+      for (let c = parent.firstElementChild; c; c = c.nextElementSibling) {
+        if (c.tagName === 'LEGEND') { firstLegend = c; break; }
+      }
+      if (child !== firstLegend) return true;
+    }
+    child = parent;
+    parent = parent.parentElement;
+  }
+  return false;
+}
+
+globalThis.__obscura_activateLabel = function(label, control, trusted) {
+  if (!label || !control || _forwardingLabels.has(label)) return false;
+  if (_isActuallyDisabled(control) || typeof control.click !== 'function') return false;
+  _forwardingLabels.add(label);
+  try { control.click(trusted ? _TRUSTED_ACTIVATION : undefined); }
+  finally { _forwardingLabels.delete(label); }
+  return true;
+};
+// The CDP click path runs its own JS snippet, so it reaches the same rules
+// through these helpers rather than restating the selectors.
+globalThis.__obscura_isDisabled = function(el) { return _isActuallyDisabled(el); };
+globalThis.__obscura_labeledControl = function(label) { return _labeledControl(label); };
+globalThis.__obscura_interactiveHost = function(el) {
+  return el && el.closest ? el.closest(_INTERACTIVE) : null;
+};
+// Frozen so page script can neither replace the helpers to suppress or fake
+// label activation, nor delete them and make later clicks throw.
+for (const _name of ['__obscura_activateLabel', '__obscura_isDisabled',
+                     '__obscura_labeledControl', '__obscura_interactiveHost']) {
+  Object.defineProperty(globalThis, _name, { writable: false, configurable: false });
+}
+
 function _isSubmitButton(el) {
   if (!el || typeof el.localName !== "string") return false;
   const type = ((el.getAttribute && el.getAttribute("type")) || "").toLowerCase();
@@ -3436,7 +3538,74 @@ class Element extends Node {
     return cache[name];
   }
   click() {
-    const cancelled = !this.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true}));
+    // A label activating this control on behalf of a real input event passes a
+    // private token so the forwarded events stay trusted. Read from arguments
+    // to keep click.length at 0, as in a real browser.
+    const _trusted = arguments[0] === _TRUSTED_ACTIVATION;
+    // Pre-click activation steps (HTML spec): a checkbox/radio flips BEFORE the
+    // click event dispatches, so listeners observe the new state, and the change
+    // is reverted if the event is cancelled. This mirrors the CDP mouse path in
+    // obscura-cdp/src/domains/input.rs, which already implements it; without it
+    // el.click() dispatched an event but never toggled the control.
+    const _tag = this.tagName;
+    const _type = ((this.getAttribute && this.getAttribute('type')) || '').toLowerCase();
+    const _checkable = _tag === 'INPUT' && (_type === 'checkbox' || _type === 'radio')
+      && !_isActuallyDisabled(this);
+    // A disabled form control has no activation behaviour and dispatches no
+    // click event at all.
+    if (_isActuallyDisabled(this) && _tag !== 'LABEL') {
+      return;
+    }
+    let _oldChecked = false, _radioStates = null;
+    if (_checkable) {
+      _oldChecked = !!this.checked;
+      if (_type === 'radio') {
+        const _name = this.getAttribute('name') || '';
+        if (_name) {
+          _radioStates = [];
+          const _all = (this.ownerDocument || globalThis.document).querySelectorAll('input');
+          for (let i = 0; i < _all.length; i++) {
+            const r = _all[i];
+            if (((r.getAttribute('type') || '').toLowerCase()) !== 'radio') continue;
+            if ((r.getAttribute('name') || '') !== _name || r.form !== this.form) continue;
+            _radioStates.push([r, !!r.checked]);
+            if (r !== this) r.checked = false;
+          }
+        }
+        this.checked = true;
+      } else {
+        this.checked = !_oldChecked;
+      }
+    }
+    const _clickEvent = new MouseEvent("click", {bubbles: true, cancelable: true});
+    if (_trusted) globalThis.__obscura_markTrusted(_clickEvent);
+    const cancelled = !this.dispatchEvent(_clickEvent);
+    if (cancelled) {
+      if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _radioStates[i][0].checked = _radioStates[i][1]; }
+      else if (_checkable) this.checked = _oldChecked;
+      return;
+    }
+    if (_checkable && this.checked !== _oldChecked) {
+      for (const _type of ['input', 'change']) {
+        const _e = new Event(_type, {bubbles: true});
+        if (_trusted) globalThis.__obscura_markTrusted(_e);
+        try { this.dispatchEvent(_e); } catch (e) {}
+      }
+      return;
+    }
+    // Label activation behaviour (HTML spec): activating a label runs a
+    // synthetic click on its labeled control. The re-entrancy guard stops a
+    // control nested inside its own label from bouncing the click back.
+    const _label = _tag === 'LABEL'
+      ? this
+      : (this.closest && !this.matches(_INTERACTIVE) ? this.closest('label') : null);
+    if (_label && !(this.closest && this.closest(_INTERACTIVE) &&
+        _label.contains(this.closest(_INTERACTIVE)))) {
+      const control = _labeledControl(_label);
+      if (control && control !== this && globalThis.__obscura_activateLabel(_label, control)) {
+        return;
+      }
+    }
     if (!cancelled) {
       const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
       if (link) {

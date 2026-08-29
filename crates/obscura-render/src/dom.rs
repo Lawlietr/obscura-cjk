@@ -11813,11 +11813,32 @@ where
         };
         let horizontal_edges =
             style.padding.left + style.padding.right + style.border.left + style.border.right;
-        let used_declaration = if style.box_sizing == crate::BoxSizing::ContentBox {
+        let mut used_declaration = if style.box_sizing == crate::BoxSizing::ContentBox {
             (layout.size.width - horizontal_edges).max(0.0)
         } else {
             layout.size.width
         };
+        // A content-sized flex item (auto width, auto basis) whose only
+        // definite inline content was a cyclic-percentage image measured 0
+        // during the intrinsic pass: the deferred preferred width collapsed
+        // the item, and every restored percentage under it then resolved
+        // against that 0 (a `width:100%` image laid out 0x0 and never
+        // painted, #698). CSS Sizing contributes the replaced element's
+        // natural inline size instead, so lift such an item to its deferred
+        // images' natural width before pinning. An item with a definite
+        // width or flex-basis keeps its already-correct measurement.
+        if style.width == crate::Dimension::Auto && style.flex_basis == crate::Dimension::Auto {
+            let natural_floor = deferred
+                .iter()
+                .filter(|entry| entry.flex_item == flex_item && entry.slot == 0)
+                .filter_map(|entry| styles.get(&entry.node))
+                .filter_map(|style| style.replaced_intrinsic)
+                .filter_map(|metadata| metadata.natural_size())
+                .map(|(width, _)| width)
+                .filter(|width| width.is_finite() && *width > 0.0)
+                .fold(0.0_f32, f32::max);
+            used_declaration = used_declaration.max(natural_floor);
+        }
         if let Ok(current) = taffy_tree.style(taffy_id) {
             let mut fixed = current.clone();
             fixed.size.width = taffy::Dimension::length(used_declaration);
@@ -11833,10 +11854,28 @@ where
         let DeferredCyclicInlineSource::Percent(percent) = &entry.source else {
             continue;
         };
+        let mut restore_maximum = None;
         if let Some(style) = styles.get_mut(&entry.node) {
             let value = crate::Dimension::Percent(*percent);
             match entry.slot {
-                0 => style.width = value,
+                0 => {
+                    style.width = value;
+                    // The measured-leaf build encodes a percentage or fixed
+                    // maximum inline size as `min(preferred, maximum)`, and
+                    // the preferred width it sampled was the deferred zero:
+                    // a permanent 0px cap. Restore the authored maximum
+                    // alongside the width so the final layout resolves both
+                    // against the pinned flex item (#698).
+                    restore_maximum = Some(match style.max_width {
+                        crate::Dimension::Percent(maximum) => {
+                            taffy::Dimension::percent(maximum)
+                        }
+                        crate::Dimension::Px(maximum) => {
+                            taffy::Dimension::length(maximum.max(0.0))
+                        }
+                        _ => taffy::Dimension::auto(),
+                    });
+                }
                 2 => style.min_width = value,
                 4 => style.max_width = value,
                 _ => unreachable!(),
@@ -11853,6 +11892,9 @@ where
                 2 => restored.min_size.width = value,
                 4 => restored.max_size.width = value,
                 _ => unreachable!(),
+            }
+            if let Some(maximum) = restore_maximum {
+                restored.max_size.width = maximum;
             }
             let _ = taffy_tree.set_style(taffy_id, restored);
         }
@@ -18342,6 +18384,44 @@ mod tests {
             laid.styles[&node("banner")].max_width,
             crate::Dimension::Percent(1.0),
             "a fit-content maximum must not be frozen from intrinsic geometry"
+        );
+    }
+
+    #[test]
+    fn cyclic_percentage_image_keeps_natural_intrinsic_contribution() {
+        // A `width:100%` image inside a content-sized flex item is a cyclic
+        // percentage: intrinsic flex sizing cannot resolve it against the
+        // item's not-yet-known width. Chrome treats that percentage as `auto`
+        // for the intrinsic contribution, so the item measures to the image's
+        // natural width. Zeroing the contribution instead collapsed the item,
+        // the restored percentage then resolved against 0, and the decoded
+        // image laid out 0x0 and never painted (#698).
+        let tree = parse_html(
+            r#"<style>
+               html, body { margin:0; font-size:16px }
+               * { box-sizing:border-box }
+               #shell { display:flex; width:800px }
+               #item { display:block }
+               #item img { display:block; width:100%; height:auto; max-width:100% }
+               </style>
+               <main id="shell"><div id="item"><img id="art" src="hero.png"></div></main>"#,
+        );
+        let art = tree.get_element_by_id("art").unwrap();
+        let mut intrinsic = HashMap::new();
+        intrinsic.insert(art, (100.0, 50.0));
+        let laid = layout_dom_with_images(&tree, (800.0, 300.0), &intrinsic);
+        let node = |id: &str| tree.get_element_by_id(id).unwrap();
+        let rect = |id: &str| -> Rect { laid.rects[&node(id)] };
+
+        assert!(
+            (rect("item").width - 100.0).abs() < 0.01,
+            "a content-sized flex item must measure the image's natural width: {:?}",
+            rect("item")
+        );
+        assert!(
+            (rect("art").width - 100.0).abs() < 0.01 && (rect("art").height - 50.0).abs() < 0.01,
+            "the percentage image must resolve against the measured item width: {:?}",
+            rect("art")
         );
     }
 

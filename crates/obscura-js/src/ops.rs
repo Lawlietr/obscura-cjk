@@ -3053,6 +3053,21 @@ mod tests {
         assert!(validate_fetch_url(&loopback, true).is_ok());
     }
 
+    // SEC-005 / #708 — fetch() must not accept file:// (deny-by-default, matching
+    // Page.navigate / Target.createTarget). The transports can't fetch it, but
+    // it should be rejected up front rather than short-circuiting the gate.
+    #[test]
+    fn fetch_url_validation_rejects_file_scheme() {
+        let file = url::Url::parse("file:///etc/passwd").unwrap();
+        // Rejected even with private-network access granted.
+        let err = validate_fetch_url(&file, true)
+            .expect_err("file:// must be rejected by the fetch scheme gate");
+        assert!(
+            err.to_lowercase().contains("scheme"),
+            "error should name the forbidden scheme: {err}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn posted_task_chains_complete_without_zero_delay_timer_floor() {
         let mut runtime = ObscuraJsRuntime::new();
@@ -3418,17 +3433,18 @@ mod tests {
 
 fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(), String> {
     let scheme = url.scheme();
-    if scheme != "http" && scheme != "https" && scheme != "file" {
+    // file:// is denied by default here, matching Page.navigate /
+    // Target.createTarget (which gate it behind --allow-file-access). The
+    // transports cannot fetch file:// anyway, so a page never reaches the
+    // filesystem through fetch()/XHR.
+    if scheme != "http" && scheme != "https" {
         return Err(format!(
-            "Forbidden URL scheme '{}' - only http, https, and file are allowed",
+            "Forbidden URL scheme '{}' - only http and https are allowed",
             scheme
         ));
     }
 
-    if scheme == "file"
-        || allow_private_network
-        || obscura_net::env_allows_private_network()
-    {
+    if allow_private_network || obscura_net::env_allows_private_network() {
         return Ok(());
     }
 

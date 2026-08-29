@@ -2104,14 +2104,41 @@ pub fn paint_dom_scrolled_at_animation_time_with_surface_color(
     surface_color: [u8; 4],
 ) -> Option<Pixmap> {
     let mut resources = RenderResourceCache::default();
+    paint_dom_scrolled_at_animation_time_with_surface_color_and_resources(
+        tree,
+        viewport,
+        base_url,
+        scroll,
+        animation_sample_time,
+        surface_color,
+        &mut resources,
+    )
+}
+
+/// As [`paint_dom_scrolled_at_animation_time_with_surface_color`], but painting
+/// against a caller-owned resource cache instead of a fresh one.
+///
+/// The default-cache version starts empty, so every image is fetched again on
+/// every call. A caller that already holds a warm cache for this document — a
+/// page repeating a capture, for instance — can pass it here and pay the
+/// network cost once rather than per frame.
+pub fn paint_dom_scrolled_at_animation_time_with_surface_color_and_resources(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    scroll: (f32, f32),
+    animation_sample_time: crate::AnimationSampleTime,
+    surface_color: [u8; 4],
+    resources: &mut RenderResourceCache,
+) -> Option<Pixmap> {
     let mut prepared = prepare_dom_at_animation_time(
         tree,
         viewport,
         base_url,
-        &mut resources,
+        resources,
         animation_sample_time,
     )?;
-    paint_prepared_with_surface_color(tree, &mut prepared, &mut resources, scroll, surface_color)
+    paint_prepared_with_surface_color(tree, &mut prepared, resources, scroll, surface_color)
 }
 
 /// Resolve image candidates and web fonts, then create the single final layout
@@ -6262,6 +6289,28 @@ pub fn screenshot_png_scrolled_at_animation_time_with_surface_color(
     .and_then(|pixmap| pixmap.encode_png().ok())
 }
 
+/// PNG wrapper for [`paint_dom_scrolled_at_animation_time_with_surface_color_and_resources`].
+pub fn screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    scroll: (f32, f32),
+    animation_sample_time: crate::AnimationSampleTime,
+    surface_color: [u8; 4],
+    resources: &mut RenderResourceCache,
+) -> Option<Vec<u8>> {
+    paint_dom_scrolled_at_animation_time_with_surface_color_and_resources(
+        tree,
+        viewport,
+        base_url,
+        scroll,
+        animation_sample_time,
+        surface_color,
+        resources,
+    )
+    .and_then(|pixmap| pixmap.encode_png().ok())
+}
+
 /// PNG convenience wrapper for a retained resource-aware layout.
 pub fn screenshot_prepared(
     tree: &DomTree,
@@ -10092,6 +10141,15 @@ fn svg_font_database() -> std::sync::Arc<usvg::fontdb::Database> {
             FONT_BOLD_OBLIQUE_BYTES,
             SERIF_FONT_BYTES,
             MONO_FONT_BYTES,
+            // The Liberation families stop at Latin/Greek/Cyrillic: an SVG
+            // text run with a symbol glyph (★/U+2605 and friends) had no face
+            // covering it anywhere in the database, so usvg's per-glyph
+            // fallback dropped the glyph and warned per character (#701).
+            // DejaVu Sans is the same embedded broad-coverage face the HTML
+            // engine already keeps for `system-ui`; family selection is
+            // unchanged (Liberation stays the sans/serif/mono default), it
+            // only extends what the fallback search can find.
+            SYSTEM_FONT_BYTES,
         ] {
             database.load_font_data(bytes.to_vec());
         }
@@ -14685,6 +14743,61 @@ mod tests {
         assert!(
             painted_green,
             "author-styled SVG text should rasterize with embedded fonts"
+        );
+    }
+
+    #[test]
+    fn svg_text_symbol_glyphs_resolve_in_the_font_database() {
+        // The Liberation faces stop at Latin/Greek/Cyrillic: without a
+        // broad-coverage face in the SVG database, usvg's per-glyph fallback
+        // finds nothing for ★/U+2605, renders the .notdef tofu, and warns per
+        // character (#701). Pixel presence cannot distinguish a real glyph
+        // from tofu, so capture usvg's warnings while rasterizing a
+        // symbol-bearing SVG text run through the same database the page
+        // pipeline uses.
+        static WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        struct SymbolWarningLogger;
+        impl log::Log for SymbolWarningLogger {
+            fn enabled(&self, _metadata: &log::Metadata) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record) {
+                if record.level() == log::Level::Warn {
+                    WARNINGS.lock().unwrap().push(record.args().to_string());
+                }
+            }
+            fn flush(&self) {}
+        }
+        let _ = log::set_boxed_logger(Box::new(SymbolWarningLogger));
+        log::set_max_level(log::LevelFilter::Warn);
+        WARNINGS.lock().unwrap().clear();
+
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="60" height="50">
+            <text x="8" y="34" font-size="24" fill="#00cc55">★</text>
+            <text x="8" y="4" font-size="24" fill="#00cc55">&#x378;</text>
+        </svg>"##;
+        let pixmap = render_svg_with_font_database(svg.as_bytes(), 60, 50, &svg_font_database())
+            .expect("raster");
+        assert!(
+            pixmap
+                .pixels()
+                .iter()
+                .any(|pixel| pixel.green() > 150 && pixel.red() < 80 && pixel.blue() < 120),
+            "the ★ text run should rasterize"
+        );
+        let warnings = WARNINGS.lock().unwrap();
+        // Positive control first: an unassigned codepoint must still warn, so
+        // the test fails loudly if the logger wiring breaks instead of
+        // vacuously passing.
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("U+378 character")),
+            "the unassigned-codepoint control must warn: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|warning| warning.contains("U+2605")),
+            "the SVG font database must cover ★ instead of dropping to .notdef: {warnings:?}"
         );
     }
 

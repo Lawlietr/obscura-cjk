@@ -2019,6 +2019,7 @@ dependencies = [
  "cosmic-text",
  "cssparser",
  "image",
+ "log",
  "obscura-dom",
  "resvg",
  "swash",

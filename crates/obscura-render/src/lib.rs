@@ -99,6 +99,7 @@ mod paint;
 pub use paint::{
     image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
     paint_dom_scrolled_at_animation_time,
+    paint_dom_scrolled_at_animation_time_with_surface_color_and_resources,
     paint_dom_scrolled_at_animation_time_with_surface_color, paint_prepared,
     paint_prepared_region_with_scroll, paint_prepared_region_with_scroll_and_surface_color,
     paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces,
@@ -111,6 +112,7 @@ pub use paint::{
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state,
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state,
     screenshot_png, screenshot_png_scrolled, screenshot_png_scrolled_at_animation_time,
+    screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources,
     screenshot_png_scrolled_at_animation_time_with_surface_color,
     prepare_dom_with_retained_attribute_styles, prepare_dom_with_retained_styles,
     prepare_dom_with_retained_styles_at_animation_time,

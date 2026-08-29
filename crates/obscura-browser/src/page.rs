@@ -3400,6 +3400,22 @@ impl Page {
             .as_ref()
             .map(|js| js.scroll_offset())
             .unwrap_or((0.0, 0.0));
+        // When there IS a runtime, paint against the resource cache it already
+        // holds for this document. Building a fresh one here refetched every
+        // image on every capture, so a caller repeating a screenshot at a
+        // viewport that does not match the prepared key paid the whole network
+        // cost per frame.
+        if let Some(js) = &self.js {
+            if let Some(png) = js.screenshot_unprepared_with_retained_resources(
+                viewport,
+                base_url,
+                scroll,
+                animation_sample.time,
+                self.capture_surface_color(),
+            ) {
+                return Some(png);
+            }
+        }
         self.with_dom(|dom| {
             obscura_js::screenshot_png_scrolled_at_animation_time_with_surface_color(
                 dom,

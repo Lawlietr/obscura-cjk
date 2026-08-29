@@ -157,6 +157,7 @@ pub async fn handle(
                             if (!clickTarget) return;\
                             var tag = clickTarget.tagName;\
                             var type = (clickTarget.getAttribute && clickTarget.getAttribute('type') || '').toLowerCase();\
+                            if (globalThis.__obscura_isDisabled(clickTarget)) return;\
                             var checkable = tag === 'INPUT' && (type === 'checkbox' || type === 'radio');\
                             var oldChecked = checkable ? !!clickTarget.checked : false;\
                             var radioStates = null;\
@@ -188,6 +189,12 @@ pub async fn handle(
                                 try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}}))); }} catch(e) {{}}\
                                 try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}}))); }} catch(e) {{}}\
                                 return;\
+                            }}\
+                            var labelHost = tag === 'LABEL' ? clickTarget : (clickTarget.closest ? clickTarget.closest('label') : null);\
+                            var interactiveHost = globalThis.__obscura_interactiveHost(clickTarget);\
+                            if (labelHost && !(interactiveHost && labelHost.contains(interactiveHost))) {{\
+                                var ctl = globalThis.__obscura_labeledControl(labelHost);\
+                                if (ctl && ctl !== clickTarget && globalThis.__obscura_activateLabel(labelHost, ctl, true)) {{ return; }}\
                             }}\
                             var link = clickTarget.closest ? clickTarget.closest('a[href]') : null;\
                             if (!link && tag === 'A' && clickTarget.getAttribute('href')) link = clickTarget;\
