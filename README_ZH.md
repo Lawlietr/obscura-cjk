@@ -69,7 +69,6 @@ tar xzf obscura-x86_64-macos-cjk.tar.gz
 
 | 打包副檔名 | 渲染 | Stealth transport | 內嵌 CJK |
 |------------|------|-------------------|----------|
-| `-stealth` | 有 | 有 | 無 |
 | `-cjk` | 有 | 無 | 有 |
 | `-cjk-stealth` | 有 | 有 | 有 |
 

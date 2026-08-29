@@ -76,20 +76,6 @@ jobs:
         run: |
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Build render,stealth release binary
-        run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --features render,stealth
-
-      - name: Stage stealth release binary
-        shell: bash
-        run: |
-          BIN_DIR=target/${{ matrix.target }}/release
-          mkdir -p dist/stealth
-          if [ -f "$BIN_DIR/obscura.exe" ]; then
-            cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/stealth/
-          else
-            cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/stealth/
-          fi
-
       - name: Build render,cjk release binary
         run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --features render,cjk
 
@@ -127,12 +113,12 @@ jobs:
         # execute all variants it just built.
         shell: bash
         run: |
-          for VARIANT in stealth cjk cjk-stealth; do
+          for VARIANT in cjk cjk-stealth; do
             BIN=dist/$VARIANT/obscura
             [ -f "$BIN.exe" ] && BIN="$BIN.exe"
             "$BIN" fetch "data:text/html,<title>ok</title>" --eval "1+1"
           done
-          for VARIANT in stealth cjk cjk-stealth; do
+          for VARIANT in cjk cjk-stealth; do
             BIN=dist/$VARIANT/obscura
             [ -f "$BIN.exe" ] && BIN="$BIN.exe"
             "$BIN" fetch "data:text/html,<style>body{margin:0;background:%23123456}</style>" --screenshot smoke.png
@@ -153,16 +139,13 @@ jobs:
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          tar czf ${{ matrix.name }}-stealth.tar.gz -C dist/stealth obscura obscura-worker
           tar czf ${{ matrix.name }}-cjk.tar.gz -C dist/cjk obscura obscura-worker
           tar czf ${{ matrix.name }}-cjk-stealth.tar.gz -C dist/cjk-stealth obscura obscura-worker
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
-          cd dist/stealth
-          7z a ../../${{ matrix.name }}-stealth.zip obscura.exe obscura-worker.exe
-          cd ../cjk
+          cd dist/cjk
           7z a ../../${{ matrix.name }}-cjk.zip obscura.exe obscura-worker.exe
           cd ../cjk-stealth
           7z a ../../${{ matrix.name }}-cjk-stealth.zip obscura.exe obscura-worker.exe
@@ -172,10 +155,8 @@ jobs:
         with:
           name: release-${{ matrix.name }}
           path: |
-            ${{ matrix.name }}-stealth.tar.gz
             ${{ matrix.name }}-cjk.tar.gz
             ${{ matrix.name }}-cjk-stealth.tar.gz
-            ${{ matrix.name }}-stealth.zip
             ${{ matrix.name }}-cjk.zip
             ${{ matrix.name }}-cjk-stealth.zip
           if-no-files-found: error

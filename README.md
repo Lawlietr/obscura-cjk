@@ -73,7 +73,6 @@ parallel `scrape` command.
 
 | Archive suffix | Rendering | Stealth transport | Embedded CJK |
 |----------------|-----------|-------------------|--------------|
-| `-stealth` | Yes | Yes | No |
 | `-cjk` | Yes | No | Yes |
 | `-cjk-stealth` | Yes | Yes | Yes |
 
