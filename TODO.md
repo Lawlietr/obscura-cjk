@@ -125,6 +125,30 @@ crate 出新版本時沒有任何機制自動提 PR。加官方 Dependabot 補�
       callback 只觸發一次。Fixture 註解聲稱 treat targets as intersecting，
       但實際上沒有。此為 headless 模式的本質限制。
 
+## 引擎 API 缺口（DOM/SVG shim，中-高優先級）
+
+自動化 Leaflet 地圖頁時發現的 shim 層缺口（`bootstrap.js` + `ops.rs`），
+目前 test page 以 polyfill 規避，真實瀏覽器無此問題。已評估補上，難度
+低、維護成本近零（API 皆已定案多年），排程待實作。
+
+- [ ] **`createSVGRect` 等 SVG 靜態幾何 API（中-高優先級）。**
+      `bootstrap.js`（~L11256）的 `SVGElement` 是空 class，未實作
+      `createSVGRect()` 等靜態方法，Leaflet 等地圖庫會拿到 `undefined`。
+      修法：純 JS shim，補一個 `SVGRect` 物件（`{x, y, width, height}` +
+      `x.baseVal` + `getX()` / `setWidth()` 等），不需要 layout 資料，
+      估計 0.5 天含測試。注意：補完後跑 `svg` filter 的 nextest 確認未
+      延遲首次 prepare（SVG fallback 字型 gotcha 同類風險）。
+- [ ] **`clientLeft` / `clientTop` 等 CSSOM View 盒模型 getter（中-高優先級）。**
+      目前未實作，頁面 JS 讀取得 `undefined`；Leaflet 用它換算點擊座標
+      時算出 NaN，地圖點擊定位失誤。資料幾乎已就位：`op_layout_geometry`
+      （`ops.rs` ~L5273）已回傳 `clientWidth` / `clientHeight`（padding box），
+      batch op `op_resize_observer_measurements` 已回傳 computed style 的
+      border / padding 值（同一模式）。修法：geometry payload 加 border
+      width 欄位（~10 行 Rust）+ JS 端 getter（~15 行），估計 0.5–1 天
+      含測試。邊界依 CSSOM View 規範：`clientLeft` = 左 border 寬（不計
+      padding）；inline 元素回 0；`display:none` / detached 回 0；
+      non-render build 的 fallback 回 0。補完後 test page 的 polyfill 可移除。
+
 ## 文件同步
 
 - [x] **Release 前置文件同步（2026-08-24，方案 B 範圍）。** README.md /
