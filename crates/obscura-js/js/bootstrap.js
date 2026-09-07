@@ -326,7 +326,7 @@ async function __fetchDynClassicScript(task) {
     body = _decodeDataScriptUrl(task.url);
   } else {
     const raw = await Deno.core.ops.op_fetch_url(
-      task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin"
+      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin"
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -552,7 +552,7 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   if (depth > 4 || seen.has(url)) return "";
   seen.add(url);
   const raw = await Deno.core.ops.op_fetch_url(
-    url, "GET", "{}", "", pageOrigin, "no-cors", "same-origin"
+    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin"
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
@@ -699,9 +699,11 @@ function _fp(key) { return _getFp()[key]; }
 globalThis._eventRegistry = globalThis._eventRegistry || {};
 globalThis._formValues = globalThis._formValues || {};
 globalThis._formChecked = globalThis._formChecked || {};
+globalThis._formIndeterminate = globalThis._formIndeterminate || {};
 const _eventRegistry = globalThis._eventRegistry;
 const _formValues = globalThis._formValues;
 const _formChecked = globalThis._formChecked;
+const _formIndeterminate = globalThis._formIndeterminate;
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
 
 // HTML "ASCII whitespace": U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
@@ -738,31 +740,90 @@ function _getElementsByClassName(root, classNames) {
   }
   return HTMLCollection._from(matched);
 }
+let _consoleOid = 0;
+const _consoleObjectId = (value) => {
+  const objectId = "console-" + (globalThis.__obscura_frameId >>> 0) + "-" + (++_consoleOid);
+  const store = globalThis.__obscura_objects || (globalThis.__obscura_objects = {});
+  store[objectId] = value;
+  return objectId;
+};
+const _consoleRemoteObject = (value) => {
+  const type = typeof value;
+  if (value === null) return { type: "object", subtype: "null", value: null, description: "null" };
+  if (type === "undefined") return { type: "undefined" };
+  if (type === "string" || type === "boolean") return { type, value, description: String(value) };
+  if (type === "number") {
+    if (Number.isNaN(value)) return { type, unserializableValue: "NaN", description: "NaN" };
+    if (value === Infinity) return { type, unserializableValue: "Infinity", description: "Infinity" };
+    if (value === -Infinity) return { type, unserializableValue: "-Infinity", description: "-Infinity" };
+    if (Object.is(value, -0)) return { type, unserializableValue: "-0", description: "-0" };
+    return { type, value, description: String(value) };
+  }
+  if (type === "bigint") {
+    const description = String(value) + "n";
+    return { type, unserializableValue: description, description };
+  }
+  if (type === "symbol") return { type, description: String(value) };
+  if (value instanceof Error) {
+    const _pst = Error.prepareStackTrace;
+    if (_pst !== undefined) Error.prepareStackTrace = undefined;
+    const description = value.stack || value.message || String(value);
+    if (_pst !== undefined) Error.prepareStackTrace = _pst;
+    return {
+      type: "object", subtype: "error",
+      className: (value.constructor && value.constructor.name) || "Error",
+      description, objectId: _consoleObjectId(value)
+    };
+  }
+  const className = type === "function"
+    ? "Function"
+    : ((value.constructor && value.constructor.name) || "Object");
+  const remote = { type, className, description: type === "function" ? String(value) : className };
+  if (Array.isArray(value)) {
+    remote.subtype = "array";
+    remote.description = "Array(" + value.length + ")";
+  } else if (type === "object" && typeof value._nid === "number") {
+    remote.subtype = "node";
+    remote.description = value.tagName ? value.tagName.toLowerCase() : (value.nodeName || "node");
+  }
+  remote.objectId = _consoleObjectId(value);
+  return remote;
+};
 const _consoleFn = (level, args) => {
-  try { Deno.core.ops.op_console_msg(level, args.map(a => {
-    if (a === null) return "null";
-    if (a === undefined) return "undefined";
-    if (a instanceof Error) {
-      const _pst = Error.prepareStackTrace;
-      if (_pst !== undefined) Error.prepareStackTrace = undefined;
-      const _s = a.stack || a.message || String(a);
-      if (_pst !== undefined) Error.prepareStackTrace = _pst;
-      return _s;
-    }
-    if (typeof a === "object") {
-      try {
-        const s = JSON.stringify(a);
-        return s === "{}" && a.message ? a.message : s;
-      } catch { return String(a); }
-    }
-    return String(a);
-  }).join(" ")); } catch {}
+  try {
+    const text = args.map(a => {
+      if (a === null) return "null";
+      if (a === undefined) return "undefined";
+      if (a instanceof Error) {
+        const _pst = Error.prepareStackTrace;
+        if (_pst !== undefined) Error.prepareStackTrace = undefined;
+        const _s = a.stack || a.message || String(a);
+        if (_pst !== undefined) Error.prepareStackTrace = _pst;
+        return _s;
+      }
+      if (typeof a === "object") {
+        try {
+          const s = JSON.stringify(a);
+          return s === "{}" && a.message ? a.message : s;
+        } catch { return String(a); }
+      }
+      return String(a);
+    }).join(" ");
+    const eventArgs = Deno.core.ops.op_runtime_events_enabled()
+      ? JSON.stringify(args.map(a => {
+          try { return _consoleRemoteObject(a); }
+          catch { return { type: typeof a, description: "<unavailable>" }; }
+        }))
+      : "";
+    Deno.core.ops.op_console_msg(level, text, eventArgs);
+  } catch {}
 };
 
 globalThis.console = {
-  log: (...a) => _consoleFn("log", a), warn: (...a) => _consoleFn("warn", a),
-  error: (...a) => _consoleFn("error", a), info: (...a) => _consoleFn("log", a),
-  debug: () => {}, dir: () => {}, trace: () => {}, table: () => {}, group: () => {},
+  log: (...a) => _consoleFn("log", a), warn: (...a) => _consoleFn("warning", a),
+  error: (...a) => _consoleFn("error", a), info: (...a) => _consoleFn("info", a),
+  debug: (...a) => _consoleFn("debug", a), dir: (...a) => _consoleFn("dir", a),
+  trace: (...a) => _consoleFn("trace", a), table: (...a) => _consoleFn("table", a), group: () => {},
   groupEnd: () => {}, groupCollapsed: () => {}, time: () => {}, timeEnd: () => {},
   timeLog: () => {}, count: () => {}, countReset: () => {}, clear: () => {},
   assert: (c, ...a) => { if (!c) _consoleFn("error", ["Assertion failed:", ...a]); },
@@ -867,23 +928,41 @@ const _coerceTimerFn = (fn) => {
   return typeof fn === "function" ? fn : null;
 };
 
+let _timerTaskNestingLevel = 0;
+const _timerDelayForNesting = (delay, nestingLevel) =>
+  nestingLevel > 5 ? Math.max(4, delay) : delay;
+const _runTimerTask = (nestingLevel, fn) => {
+  const previous = _timerTaskNestingLevel;
+  _timerTaskNestingLevel = nestingLevel;
+  try { return fn(); }
+  finally { _timerTaskNestingLevel = previous; }
+};
+
 globalThis.setTimeout = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
   if (f === null) return ++_tid;
   const id = ++_tid;
   const normalizedDelay = Math.max(0, Number(delay) || 0);
+  const parentNestingLevel = _timerTaskNestingLevel;
+  const taskNestingLevel = parentNestingLevel + 1;
+  const scheduledDelay = _timerDelayForNesting(normalizedDelay, parentNestingLevel);
   const state = { cancelled: false };
-  const nativeId = _scheduleAfter(normalizedDelay, () => {
-    _timerStates.delete(id);
-    _nativeTimerIds.delete(id);
-    __obscuraPendingTimeoutDeadlines.delete(id);
-    if (state.cancelled) return;
-    try { f(...args); } catch(e) { console.error("Timer error:", e); }
-  });
+  const nativeId = _scheduleAfter(
+    scheduledDelay,
+    () => {
+      _timerStates.delete(id);
+      _nativeTimerIds.delete(id);
+      __obscuraPendingTimeoutDeadlines.delete(id);
+      if (state.cancelled) return;
+      _runTimerTask(taskNestingLevel, () => {
+        try { f(...args); } catch(e) { console.error("Timer error:", e); }
+      });
+    },
+  );
   if (nativeId !== undefined) {
     _timerStates.set(id, state);
     _nativeTimerIds.set(id, nativeId);
-    __obscuraPendingTimeoutDeadlines.set(id, performance.now() + normalizedDelay);
+    __obscuraPendingTimeoutDeadlines.set(id, performance.now() + scheduledDelay);
   }
   return id;
 };
@@ -904,15 +983,25 @@ globalThis.setInterval = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
   if (f === null) return ++_tid;
   const id = ++_tid;
+  const normalizedDelay = Math.max(0, Number(delay) || 0);
+  const parentNestingLevel = _timerTaskNestingLevel;
+  let taskNestingLevel = parentNestingLevel + 1;
   _intervals.add(id);
   const tick = () => {
     if (!_intervals.has(id)) return;
-    try { f(...args); } catch(e) { console.error("Interval error:", e); }
+    _runTimerTask(taskNestingLevel, () => {
+      try { f(...args); } catch(e) { console.error("Interval error:", e); }
+    });
     if (!_intervals.has(id)) return;
-    const nativeId = _scheduleAfter(delay, tick);
+    const nextDelay = _timerDelayForNesting(normalizedDelay, taskNestingLevel);
+    taskNestingLevel++;
+    const nativeId = _scheduleAfter(nextDelay, tick);
     if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
   };
-  const nativeId = _scheduleAfter(delay, tick);
+  const nativeId = _scheduleAfter(
+    _timerDelayForNesting(normalizedDelay, parentNestingLevel),
+    tick,
+  );
   if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
   return id;
 };
@@ -1025,39 +1114,66 @@ globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolv
 // Browser posted tasks need an event-loop boundary but no clock delay. Tokio's
 // timer wheel imposes roughly a one-millisecond floor even for delay zero,
 // which turns MessageChannel and scheduler chains into artificial latency.
-// Keep one shared priority/FIFO queue in JavaScript and use a yield-only async
-// op solely to wake one delivery. Scheduling the next wake after the callback
-// gives V8 a microtask checkpoint between every pair of posted tasks.
+// Keep one shared priority/FIFO queue in JavaScript and enqueue one callback on
+// deno_core's re-entrant-safe V8 task spawner. Scheduling the next wake after
+// the callback gives V8 a microtask checkpoint between every pair of tasks.
 const _browserPostedTaskQueues = Array.from({ length: 6 }, () => []);
 let _browserPostedTaskWakePending = false;
+const _invalidPostedTaskGeneration = -1;
+
+function _browserPostedTaskGeneration() {
+  return Deno.core.ops.op_posted_task_generation(_realmFrameId);
+}
+
+function _browserPostedTaskDiscardQueue(queue) {
+  const entries = queue.splice(0, queue.length);
+  for (const entry of entries) {
+    if (entry.discard) {
+      try { entry.discard(); } catch (_) {}
+    }
+  }
+}
 
 function _browserPostedTaskScheduleWake() {
   if (_browserPostedTaskWakePending) return;
   if (!Deno.core.ops.op_async_runtime_available()) return;
-  _browserPostedTaskWakePending = true;
-  Deno.core.ops.op_posted_task().then(
-    _browserPostedTaskRunOne,
-    () => {
-      _browserPostedTaskWakePending = false;
-      if (_browserPostedTaskQueues.some(queue => queue.length)) {
-        _scheduleAfter(0, _browserPostedTaskRunOne);
-      }
-    },
-  );
+  const generation = Deno.core.ops.op_posted_task(
+    _realmFrameId, _browserPostedTaskRunOne);
+  _browserPostedTaskWakePending = generation !== _invalidPostedTaskGeneration;
+  if (!_browserPostedTaskWakePending) {
+    for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
+  }
 }
 
-function _browserPostedTaskEnqueue(callback, priority) {
-  _browserPostedTaskQueues[priority].push(callback);
+function _browserPostedTaskEnqueue(
+  callback, priority, generation = _browserPostedTaskGeneration(), discard = null) {
+  _browserPostedTaskQueues[priority].push({ callback, generation, discard });
   _browserPostedTaskScheduleWake();
 }
 
-function _browserPostedTaskRunOne() {
+function _browserPostedTaskRunOne(currentGeneration = _invalidPostedTaskGeneration) {
+  // Document replacement and frame teardown are cancellation boundaries.
+  // Borrow contention is cancelled too: a browser task must not unwind through
+  // V8 or enter a realm whose native owner is unavailable.
   _browserPostedTaskWakePending = false;
+  if (currentGeneration === _invalidPostedTaskGeneration) {
+    for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
+    return;
+  }
   let callback = null;
   for (let priority = _browserPostedTaskQueues.length - 1; priority >= 0; priority--) {
     const queue = _browserPostedTaskQueues[priority];
+    let staleCount = 0;
+    while (staleCount < queue.length &&
+           queue[staleCount].generation !== currentGeneration) staleCount++;
+    const staleEntries = staleCount ? queue.splice(0, staleCount) : [];
+    for (const stale of staleEntries) {
+      if (stale.discard) {
+        try { stale.discard(); } catch (_) {}
+      }
+    }
     if (queue.length) {
-      callback = queue.shift();
+      callback = queue.shift().callback;
       break;
     }
   }
@@ -1089,7 +1205,11 @@ let _schedulerCurrentState = null;
 
 function _schedulerRemoveAbort(task) {
   if (task.signal && task.abortHandler) {
-    task.signal.removeEventListener("abort", task.abortHandler);
+    // Scheduler options accept only this realm's AbortSignal. Use its private
+    // listener store so page code cannot intercept teardown by overriding the
+    // public removeEventListener method.
+    const index = task.signal._listeners.indexOf(task.abortHandler);
+    if (index >= 0) task.signal._listeners.splice(index, 1);
     task.abortHandler = null;
   }
 }
@@ -1098,7 +1218,13 @@ function _schedulerEnqueue(task, continuation) {
   if (task.canceled) return;
   const effectivePriority = _schedulerPriorityRank[task.priority] * 2
     + (continuation ? 1 : 0);
-  _browserPostedTaskEnqueue(() => _schedulerRunTask(task), effectivePriority);
+  _browserPostedTaskEnqueue(
+    () => _schedulerRunTask(task), effectivePriority, task.documentGeneration,
+    () => {
+      task.canceled = true;
+      task.callback = null;
+      _schedulerRemoveAbort(task);
+    });
 }
 
 function _schedulerRunTask(task) {
@@ -1158,6 +1284,7 @@ function _schedulerNormalizeOptions(options) {
 function _schedulerCreateTask(callback, state, resolve, reject) {
   const task = {
     callback, state, resolve, reject,
+    documentGeneration: _browserPostedTaskGeneration(),
     priority: state.priority,
     signal: state.signal,
     abortHandler: null,
@@ -1174,7 +1301,8 @@ function _schedulerCreateTask(callback, state, resolve, reject) {
       _schedulerRemoveAbort(task);
       reject(task.signal.reason);
     };
-    task.signal.addEventListener("abort", task.abortHandler);
+    // See _schedulerRemoveAbort: the public method is intentionally bypassed.
+    task.signal._listeners.push(task.abortHandler);
   }
   return task;
 }
@@ -1286,6 +1414,7 @@ function _messagePortInstallEventHandler(port, type, callback) {
 function _messagePortScheduleDelivery(port) {
   const state = _messagePortStateFor(port);
   if (state.closed || !state.messageQueueEnabled || state.messageDeliveryPending || !state.messageQueue.length) return;
+  const deliveryGeneration = state.messageQueue[0].generation;
   state.messageDeliveryPending = true;
   // User-visible ordinary rank. Scheduler continuations at the same priority
   // remain immediately above this task; FIFO holds across all ordinary tasks.
@@ -1294,7 +1423,7 @@ function _messagePortScheduleDelivery(port) {
     if (!current) return;
     current.messageDeliveryPending = false;
     if (current.closed || !current.messageQueueEnabled || !current.messageQueue.length) return;
-    const data = current.messageQueue.shift();
+    const data = current.messageQueue.shift().data;
     const event = new MessageEvent("message", {
       data,
       origin: "",
@@ -1304,7 +1433,14 @@ function _messagePortScheduleDelivery(port) {
     });
     _eventTargetDispatch(port, event);
     _messagePortScheduleDelivery(port);
-  }, _schedulerPriorityRank["user-visible"] * 2);
+  }, _schedulerPriorityRank["user-visible"] * 2, deliveryGeneration, () => {
+    const current = _messagePortState.get(port);
+    if (!current) return;
+    current.messageDeliveryPending = false;
+    current.messageQueue = current.messageQueue.filter(
+      entry => entry.generation !== deliveryGeneration);
+    _messagePortScheduleDelivery(port);
+  });
 }
 class MessagePort {
   constructor(key) {
@@ -1335,7 +1471,10 @@ class MessagePort {
     const target = state.entangled;
     const targetState = target && _messagePortState.get(target);
     if (state.closed || !targetState || targetState.closed) return;
-    targetState.messageQueue.push(cloned);
+    targetState.messageQueue.push({
+      data: cloned,
+      generation: _browserPostedTaskGeneration(),
+    });
     _messagePortScheduleDelivery(target);
   }
   start() {
@@ -1921,20 +2060,7 @@ class Node {
   get ownerDocument() { return globalThis.document; }
   // https://dom.spec.whatwg.org/#dom-node-baseuri
   get baseURI() {
-    try {
-      const doc = globalThis.document;
-      const docUrl = (doc && doc.URL) || "";
-      const baseEl = (doc && doc.querySelector) ? doc.querySelector("base[href]") : null;
-      if (baseEl) {
-        const href = baseEl.getAttribute("href");
-        if (href) {
-          return docUrl ? new URL(href, docUrl).href : href;
-        }
-      }
-      return docUrl;
-    } catch (e) {
-      return "";
-    }
+    try { return _documentBase(); } catch (e) { return ""; }
   }
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
@@ -2493,10 +2619,25 @@ function _applyDocQueryEncoding(u) {
   return u;
 }
 
+// The base for relative URLs. <base href> overrides the document URL, so an app in a sub-path
+// requests "chunk-A.js" under its current route and gets 404.
+// https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url
+// Returns "" when there is no document, so each call site keeps its own fallback.
+function _documentBase() {
+  // history.pushState moves the document URL without reaching the Rust side. Then the base must
+  // be built here, or every relative URL resolves against the pre-routing address.
+  const virtual = globalThis.__virtualUrl;
+  if (virtual) {
+    const raw = _domParse("document_base_href");
+    if (!raw) return virtual;
+    try { return new URL(raw, virtual).href; } catch (e) { return virtual; }
+  }
+  return _domParse("document_base_url") || _domParse("document_url") || "";
+}
 // HTMLHyperlinkElementUtils helpers (the <a>/<area> URL-decomposition members).
 // The element's href attribute is parsed against the document base URL via the
 // WHATWG url op; component getters read it, setters rewrite the href attribute.
-function _anchorBase() { return _domParse("document_url") || "about:blank"; }
+function _anchorBase() { return _documentBase() || "about:blank"; }
 function _elemHrefURL(el) {
   const raw = el.getAttribute('href');
   if (raw === null || raw === undefined) return null;
@@ -2684,6 +2825,25 @@ function _isSubmitButton(el) {
   if (el.localName === "button") return type !== "reset" && type !== "button";
   if (el.localName === "input") return type === "submit" || type === "image";
   return false;
+}
+
+// The HTML labelable-elements list (hidden inputs excluded), shared by the
+// Element.labels and HTMLLabelElement.control getters.
+function _isLabelable(el) {
+  if (!el || typeof el.localName !== "string") return false;
+  switch (el.localName) {
+    case "button":
+    case "meter":
+    case "output":
+    case "progress":
+    case "select":
+    case "textarea":
+      return true;
+    case "input":
+      return (((el.getAttribute && el.getAttribute("type")) || "").toLowerCase()) !== "hidden";
+    default:
+      return false;
+  }
 }
 
 // Carry the context element's full qualified name into html5ever. Fragment
@@ -3309,6 +3469,11 @@ class Element extends Node {
       }
     }
     if (n === "style") this._style._replaceFromAttribute(value);
+    if (n === "onload" && _isWindowReflectingBodyElement(this)) {
+      _windowOnloadOverrideSet = false;
+      _windowOnloadOverride = null;
+      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
+    }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
     if (this.localName === "source"
@@ -3349,6 +3514,11 @@ class Element extends Node {
       _reconcileWindowNamedProperty(previousWindowName);
     }
     if (n === "style") this._style._replaceFromAttribute("");
+    if (n === "onload" && _isWindowReflectingBodyElement(this)) {
+      _windowOnloadOverrideSet = false;
+      _windowOnloadOverride = null;
+      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
+    }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
@@ -3556,9 +3726,10 @@ class Element extends Node {
     if (_isActuallyDisabled(this) && _tag !== 'LABEL') {
       return;
     }
-    let _oldChecked = false, _radioStates = null;
+    let _oldChecked = false, _oldIndeterminate = false, _radioStates = null;
     if (_checkable) {
       _oldChecked = !!this.checked;
+      _oldIndeterminate = !!this.indeterminate;
       if (_type === 'radio') {
         const _name = this.getAttribute('name') || '';
         if (_name) {
@@ -3574,7 +3745,12 @@ class Element extends Node {
         }
         this.checked = true;
       } else {
+        // Legacy-pre-activation behaviour (HTML spec): a checkbox toggles its
+        // checkedness *and* drops indeterminateness. Clearing it here, not on
+        // `change`, is what lets the cancelled-activation path put the old
+        // flag back instead of leaving it stuck off.
         this.checked = !_oldChecked;
+        this.indeterminate = false;
       }
     }
     const _clickEvent = new MouseEvent("click", {bubbles: true, cancelable: true});
@@ -3582,7 +3758,7 @@ class Element extends Node {
     const cancelled = !this.dispatchEvent(_clickEvent);
     if (cancelled) {
       if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _radioStates[i][0].checked = _radioStates[i][1]; }
-      else if (_checkable) this.checked = _oldChecked;
+      else if (_checkable) { this.checked = _oldChecked; this.indeterminate = _oldIndeterminate; }
       return;
     }
     if (_checkable && this.checked !== _oldChecked) {
@@ -3929,6 +4105,13 @@ class Element extends Node {
     return this.hasAttribute("checked");
   }
   set checked(v) { _formChecked[this._nid] = !!v; }
+  // `indeterminate` is IDL-only: it has no content attribute to reflect, so
+  // the property itself must exist on the prototype for `'indeterminate' in
+  // el` to be true on a freshly created element. It is node-keyed like
+  // `checked` because element wrappers are rebuilt on each lookup, so a
+  // per-instance field would not survive getElementById returning a new one.
+  get indeterminate() { return _formIndeterminate[this._nid] === true; }
+  set indeterminate(v) { _formIndeterminate[this._nid] = !!v; }
   get selected() {
     if (this._selected !== undefined) return this._selected;
     return this.hasAttribute("selected");
@@ -3979,6 +4162,8 @@ class Element extends Node {
   set name(v) { this.setAttribute("name", v); }
   get placeholder() { return this.getAttribute("placeholder") || ""; }
   set placeholder(v) { this.setAttribute("placeholder", v); }
+  get accept() { return this.getAttribute("accept") || ""; }
+  set accept(v) { this.setAttribute("accept", v); }
   // For <a>/<area>, href returns the resolved absolute URL (the spec behavior,
   // and what scrapers want). It uses op_url_resolve, which returns just the
   // resolved string, rather than the full-component op the decomposition
@@ -4001,6 +4186,15 @@ class Element extends Node {
       // Legacy-charset document: href must reflect the encoding-override query.
       if (!_docIsUtf8()) { const u = _elemHrefURL(this); return u ? u.href : raw; }
       const r = _urlResolveOp(raw, _anchorBase());
+      return r !== null ? r : raw;
+    }
+    if (ln === 'base') {
+      // https://html.spec.whatwg.org/multipage/semantics.html#dom-base-href
+      // Against the fallback base URL, not the document base URL: a base element is not affected
+      // by other base elements or itself. Applications read this to determine their own base.
+      const raw = this.getAttribute('href');
+      if (raw === null) return '';
+      const r = _urlResolveOp(raw, _domParse("document_url") || "about:blank");
       return r !== null ? r : raw;
     }
     return this.getAttribute("href") || "";
@@ -4050,7 +4244,7 @@ class Element extends Node {
     // value (issue #255). getAttribute("src") still returns the literal.
     const v = this.getAttribute("src");
     if (!v) return "";
-    try { return new URL(v, globalThis.location?.href || "about:blank").href; }
+    try { return new URL(v, _documentBase() || "about:blank").href; }
     catch (e) { return v; }
   }
   set src(v) {
@@ -4149,8 +4343,9 @@ class Element extends Node {
     return this._iframeWin;
   }
   get action() {
+    // A missing action falls back to the document URL, a present one resolves against the base.
     const action = this.getAttribute("action") || _domParse("document_url") || "";
-    try { return new URL(action, _domParse("document_url") || "about:blank").href; } catch(e) { return action; }
+    try { return new URL(action, _documentBase() || "about:blank").href; } catch(e) { return action; }
   }
   set action(v) { this.setAttribute("action", v); }
   get method() { return this.getAttribute("method") || "get"; }
@@ -4159,6 +4354,45 @@ class Element extends Node {
     let p = this.parentNode;
     while (p && p.localName !== 'form') p = p.parentNode;
     return p;
+  }
+  // Label association, per the HTML labelable-elements list. Playwright's
+  // getByLabel and its follow-label retargeting read these; without them a
+  // label-linked control is invisible to that engine.
+  get labels() {
+    if (!_isLabelable(this)) return _nodeList([]);
+    const doc = this.ownerDocument;
+    if (!doc || !doc.querySelectorAll) return _nodeList([]);
+    const out = [];
+    const id = this.getAttribute('id');
+    if (id) {
+      // Filter in JS rather than building a selector: an id containing a
+      // quote would break out of label[for="..."].
+      const all = doc.querySelectorAll('label');
+      for (let i = 0; i < all.length; i++) {
+        if (all[i].getAttribute('for') === id) out.push(all[i]);
+      }
+    }
+    let p = this.parentNode;
+    while (p) {
+      if (p.localName === 'label') out.push(p);
+      p = p.parentNode;
+    }
+    return _nodeList(out);
+  }
+  get control() {
+    if (this.localName !== 'label') return null;
+    const doc = this.ownerDocument;
+    const forId = this.getAttribute('for');
+    if (forId) {
+      if (!doc || !doc.getElementById) return null;
+      const target = doc.getElementById(forId);
+      return target && _isLabelable(target) ? target : null;
+    }
+    const candidates = this.querySelectorAll('button, input, meter, output, progress, select, textarea');
+    for (let i = 0; i < candidates.length; i++) {
+      if (_isLabelable(candidates[i])) return candidates[i];
+    }
+    return null;
   }
   get options() {
     if (this.localName !== 'select') return [];
@@ -6277,7 +6511,7 @@ function _resolveUrl(url) {
   url = String(url);
   if (!url) return url;
   if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('about:')) return url;
-  try { return new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) { return url; }
+  try { return new URL(url, _documentBase() || "about:blank").href; } catch(e) { return url; }
 }
 // `__virtualUrl` is set by `history.pushState`/`replaceState` (and cleared by
 // any real navigation). When set, `location.href` and friends read it instead
@@ -6352,6 +6586,48 @@ for (const _ev of [
     }
   }
 }
+
+let _windowOnloadOverrideSet = false;
+let _windowOnloadOverride = null;
+function _windowReflectingBodyElement() {
+  const document = globalThis.document;
+  return document && (document.body || document.querySelector('frameset'));
+}
+function _isWindowReflectingBodyElement(element) {
+  return element === _windowReflectingBodyElement();
+}
+Object.defineProperty(globalThis, 'onload', {
+  get() {
+    if (_windowOnloadOverrideSet) return _windowOnloadOverride;
+    const body = _windowReflectingBodyElement();
+    return body && body._resolveInlineHandler
+      ? body._resolveInlineHandler('onload')
+      : null;
+  },
+  set(value) {
+    _windowOnloadOverrideSet = true;
+    _windowOnloadOverride = typeof value === 'function' ? value : null;
+  },
+  configurable: true,
+  enumerable: true,
+});
+Object.defineProperty(Element.prototype, 'onload', {
+  get() {
+    if (_isWindowReflectingBodyElement(this)) {
+      return globalThis.onload;
+    }
+    return this.__onload || null;
+  },
+  set(value) {
+    if (_isWindowReflectingBodyElement(this)) {
+      globalThis.onload = value;
+      return;
+    }
+    this.__onload = typeof value === 'function' ? value : null;
+  },
+  configurable: true,
+  enumerable: false,
+});
 
 globalThis.Window = globalThis.Window || function Window() {};
 Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
@@ -6851,77 +7127,93 @@ function _formDataToMultipart(fd) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let bnd = '----WebKitFormBoundary';
   for (let i = 0; i < 16; i++) bnd += chars[Math.floor(Math.random() * chars.length)];
-  let out = '';
+  const encoder = new TextEncoder();
+  const chunks = [];
+  let length = 0;
+  const append = (chunk) => {
+    const bytes = typeof chunk === 'string' ? encoder.encode(chunk) : _bodyToUint8Array(chunk);
+    chunks.push(bytes);
+    length += bytes.byteLength;
+  };
   const entries = fd._d || [];
   for (let i = 0; i < entries.length; i++) {
     const k = entries[i][0], v = entries[i][1];
-    out += '--' + bnd + '\r\n';
+    append('--' + bnd + '\r\n');
     if (v != null && typeof v === 'object' && v._bytes != null) {
-      out += 'Content-Disposition: form-data; name="' + k + '"; filename="' + (v.name || 'blob') + '"\r\n';
-      out += 'Content-Type: ' + (v.type || 'application/octet-stream') + '\r\n\r\n';
-      try { out += new TextDecoder().decode(v._bytes); } catch (e) {}
-      out += '\r\n';
+      append('Content-Disposition: form-data; name="' + k + '"; filename="' + (v.name || 'blob') + '"\r\n');
+      append('Content-Type: ' + (v.type || 'application/octet-stream') + '\r\n\r\n');
+      append(v._bytes);
+      append('\r\n');
     } else {
-      out += 'Content-Disposition: form-data; name="' + k + '"\r\n\r\n' + String(v) + '\r\n';
+      append('Content-Disposition: form-data; name="' + k + '"\r\n\r\n' + String(v) + '\r\n');
     }
   }
-  out += '--' + bnd + '--\r\n';
+  append('--' + bnd + '--\r\n');
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
   return { boundary: bnd, body: out };
 }
 
-// Coerce a fetch()/XHR body into the string op_fetch_url expects, attaching a
+// Coerce a fetch()/XHR body into the bytes op_fetch_url expects, attaching a
 // Content-Type header for body types that need one (FormData, URLSearchParams).
-function _serializeBody(initBody, headers) {
-  if (initBody == null || initBody === '') return '';
+function _serializeBody(initBody, headers, synthesizeContentType = true) {
+  if (initBody == null || initBody === '') return new Uint8Array(0);
   if (initBody instanceof FormData) {
     const mp = _formDataToMultipart(initBody);
-    headers['Content-Type'] = 'multipart/form-data; boundary=' + mp.boundary;
+    if (synthesizeContentType) headers['Content-Type'] = 'multipart/form-data; boundary=' + mp.boundary;
     return mp.body;
   }
   if (initBody instanceof URLSearchParams) {
-    if (!Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+    if (synthesizeContentType && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
       headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
     }
-    return initBody.toString();
+    return new TextEncoder().encode(initBody.toString());
   }
   if (typeof Blob !== 'undefined' && initBody instanceof Blob) {
-    if (initBody.type && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+    if (synthesizeContentType && initBody.type && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
       headers['Content-Type'] = initBody.type;
     }
-    return _bytesToBinaryString(_bodyToUint8Array(initBody));
+    return _bodyToUint8Array(initBody);
   }
   if (typeof ArrayBuffer !== 'undefined' && initBody instanceof ArrayBuffer) {
-    const bytes = new Uint8Array(initBody);
-    let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-    return s;
+    return new Uint8Array(initBody);
   }
   if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(initBody) && initBody.buffer instanceof ArrayBuffer) {
-    const bytes = new Uint8Array(initBody.buffer, initBody.byteOffset, initBody.byteLength);
-    let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-    return s;
+    return new Uint8Array(initBody.buffer, initBody.byteOffset, initBody.byteLength);
   }
-  return typeof initBody === 'string' ? initBody : String(initBody);
+  return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
 globalThis.fetch = async (input, init = {}) => {
   init = init || {};
+  const request = input instanceof Request ? input : null;
   let url = typeof input === "string"
     ? input
-    : (input instanceof Request
-      ? input.url
+    : (request
+      ? request.url
       : ((typeof URL === 'function' && input instanceof URL) ? input.href : (input?.url || input?.href || String(input || ""))));
   // Always resolve: the URL parser, not a "://" substring search, decides
   // whether the input is absolute. _resolveUrl leaves absolute URLs
   // unchanged and keeps unparseable input as-is.
   url = _resolveUrl(url);
-  const method = init.method || (input instanceof Request ? input.method : "GET");
-  let _h = init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : (init.headers || {});
-  const body = _serializeBody(init.body, _h);
+  const method = init.method || (request ? request.method : "GET");
+  const headers = init.headers !== undefined ? init.headers : (request ? request.headers : undefined);
+  let _h = headers instanceof Headers ? Object.fromEntries(headers.entries()) : (headers || {});
+  const inheritsRequestBody = init.body === undefined && request !== null;
+  const initBody = init.body !== undefined
+    ? init.body
+    : (request ? request.body : undefined);
+  const body = _serializeBody(initBody, _h, !(inheritsRequestBody && init.headers !== undefined));
   const hdrs = JSON.stringify(_h);
-  const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
+  const fetchMode = init.mode || (request ? request.mode : "cors");
+  const fetchRedirect = init.redirect || (request ? request.redirect : "follow");
   const fetchCredentials = init.credentials !== undefined
     ? String(init.credentials)
-    : (input instanceof Request ? input.credentials : "same-origin");
+    : (request ? request.credentials : "same-origin");
   if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
@@ -6937,15 +7229,16 @@ globalThis.fetch = async (input, init = {}) => {
   if (parsed.corsBlocked) {
     throw new TypeError('Failed to fetch: ' + (parsed.corsError || 'CORS error'));
   }
-  const respType = parsed.status === 0 ? "opaque" : (fetchMode === "no-cors" ? "opaque" : "basic");
+  const respType = parsed.status === 0 || parsed.opaque ? "opaque" : "basic";
+  const exposeRedirectMetadata = respType !== "opaque" && fetchRedirect === "follow";
   const responseBody = parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || "");
   const response = new Response(responseBody, {
     status: parsed.status,
     statusText: "",
     headers: parsed.headers || {},
     type: respType,
-    url: parsed.url || url,
-    redirected: false,
+    url: exposeRedirectMetadata ? (parsed.url || url) : (respType === "opaque" ? "" : url),
+    redirected: exposeRedirectMetadata && !!parsed.redirected,
   });
   if (parsed.requestId) {
     Object.defineProperty(response, "__obscuraRequestId", {
@@ -7104,8 +7397,21 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
 
       xhr._setReadyState(2); // HEADERS_RECEIVED
 
-      const text = await resp.text();
+      // Read the body as bytes, ALWAYS. Going through resp.text() and then
+      // TextEncoder().encode() for the binary responseTypes is not a
+      // round-trip: the decode is lossy for anything that is not valid UTF-8,
+      // so bytes >= 0x80 come back re-encoded as the UTF-8 of whatever code
+      // point they decoded to, and the length changes with the content.
+      // Emscripten loaders fetch .wasm and data files this way, so they saw
+      // corrupted assets while fetch() was byte-correct.
+      const buffer = await resp.arrayBuffer();
       if (xhr._aborted) return;
+
+      const wantsText = xhr.responseType === '' || xhr.responseType === 'text'
+                     || xhr.responseType === 'json' || xhr.responseType === 'document';
+      // Decoding a multi-megabyte binary body into a string nobody reads is
+      // pure waste, and responseText is not defined for the binary types.
+      const text = wantsText ? new TextDecoder().decode(buffer) : '';
 
       xhr.responseText = text;
       xhr._setReadyState(3); // LOADING
@@ -7119,10 +7425,10 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
           xhr.response = text;
           break;
         case 'arraybuffer':
-          xhr.response = new TextEncoder().encode(text).buffer;
+          xhr.response = buffer;
           break;
         case 'blob':
-          xhr.response = new Blob([text]);
+          xhr.response = new Blob([buffer]);
           break;
         case 'document':
           xhr.response = text; // simplified
@@ -7379,11 +7685,49 @@ if (typeof Response === 'undefined') {
       this.ok = this.status >= 200 && this.status < 300;
       this.headers = new Headers(init.headers);
       this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;
+      // #818: body/bodyUsed. A null-body response (null or no body passed)
+      // has body === null; every other body is a one-chunk stream, created
+      // lazily so merely touching .body does not copy the bytes.
+      this._bodyNull = body === null || body === undefined;
+      this._bodyStream = null;
+      this._bodyUsed = false;
     }
-    async text() { return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
-    async json() { return JSON.parse(await this.text()); }
-    async arrayBuffer() { return _arrayBufferFromBytes(this._bodyBytes); }
-    async blob() { return new Blob([this._bodyBytes]); }
+    _consumeBody() {
+      if (this._bodyUsed) throw new TypeError("Body is already consumed");
+      this._bodyUsed = true;
+    }
+    get body() {
+      if (this._bodyNull) return null;
+      if (this._bodyUsed) throw new TypeError("Body is already consumed");
+      if (!this._bodyStream) {
+        this._bodyStream = new ReadableStream({
+          start: (controller) => {
+            if (this._bodyBytes.length) controller.enqueue(this._bodyBytes);
+            controller.close();
+          },
+        });
+        // bodyUsed flips the moment the stream is locked for reading
+        // (spec: the body becomes "disturbed"), which no state probe can
+        // observe on a native ReadableStream, so hook getReader instead.
+        const response = this;
+        const stream = this._bodyStream;
+        const getReader = stream.getReader.bind(stream);
+        stream.getReader = function () {
+          response._bodyUsed = true;
+          return getReader();
+        };
+        stream.releaseLock = function () {
+          response._bodyUsed = true;
+          stream.locked = false;
+        };
+      }
+      return this._bodyStream;
+    }
+    get bodyUsed() { return this._bodyUsed; }
+    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
+    async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._bodyBytes, this.headers)); }
+    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._bodyBytes); }
+    async blob() { this._consumeBody(); return new Blob([this._bodyBytes]); }
     clone() { return new Response(this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected }); }
     static error() { return new Response(null, { status: 0 }); }
     static redirect(url, status) { return new Response(null, { status: status || 302, headers: { Location: url } }); }
@@ -9014,6 +9358,11 @@ let _intersectionDeliveryTaskPending = false;
 
 function _scheduleIntersectionObserverDelivery(observer) {
   if (!observer._connected || !observer._records.length) return;
+  const documentGeneration = _browserPostedTaskGeneration();
+  if (observer._documentGeneration !== documentGeneration) {
+    observer._records.length = 0;
+    return;
+  }
   _intersectionDeliveryObservers.add(observer);
   if (_intersectionDeliveryTaskPending) return;
   _intersectionDeliveryTaskPending = true;
@@ -9031,7 +9380,17 @@ function _scheduleIntersectionObserverDelivery(observer) {
       const records = current.takeRecords();
       try { current._callback(records, current); } catch (e) {}
     }
-  }, _schedulerPriorityRank["user-visible"] * 2);
+  }, _schedulerPriorityRank["user-visible"] * 2, documentGeneration, () => {
+    _intersectionDeliveryTaskPending = false;
+    const currentGeneration = _browserPostedTaskGeneration();
+    const current = [];
+    for (const pending of _intersectionDeliveryObservers) {
+      if (pending._documentGeneration === currentGeneration) current.push(pending);
+      else pending._records.length = 0;
+    }
+    _intersectionDeliveryObservers.clear();
+    for (const pending of current) _scheduleIntersectionObserverDelivery(pending);
+  });
 }
 
 function _scheduleIntersectionRenderCheckpoint() {
@@ -9175,6 +9534,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     this._targets = new Set();
     this._previous = new Map();
     this._records = [];
+    this._documentGeneration = _browserPostedTaskGeneration();
     this._connected = true;
     globalThis.__intersectionObservers.push(this);
   }
@@ -9365,6 +9725,11 @@ globalThis.IntersectionObserver = class IntersectionObserver {
 })();
 globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
 globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
+// Feature detection reads this static before deciding to observe anything;
+// absent it, supportedEntryTypes.includes(...) throws and instrumentation
+// bails. Report only types the engine can actually emit records for.
+PerformanceObserver.supportedEntryTypes = ["mark", "measure", "navigation", "resource", "paint"];
+_markNative(PerformanceObserver);
 
 globalThis.DOMException = (function () {
   const NAME_TO_CODE = {
@@ -9621,6 +9986,31 @@ globalThis.PromiseRejectionEvent = class PromiseRejectionEvent extends Event {
 };
 _markNative(globalThis.PromiseRejectionEvent);
 
+Deno.core.setUnhandledPromiseRejectionHandler((promise, reason) => {
+  const event = new PromiseRejectionEvent("unhandledrejection", {
+    promise,
+    reason,
+    cancelable: true,
+  });
+  globalThis.dispatchEvent(event);
+  if (typeof globalThis.onunhandledrejection === "function") {
+    try { globalThis.onunhandledrejection.call(globalThis, event); }
+    catch (error) { console.error(error); }
+  }
+  // Browsers report an unhandled rejection without terminating the page's
+  // event loop. Returning true tells deno_core that the host delivered it.
+  return true;
+});
+
+Deno.core.setHandledPromiseRejectionHandler((promise, reason) => {
+  const event = new PromiseRejectionEvent("rejectionhandled", { promise, reason });
+  globalThis.dispatchEvent(event);
+  if (typeof globalThis.onrejectionhandled === "function") {
+    try { globalThis.onrejectionhandled.call(globalThis, event); }
+    catch (error) { console.error(error); }
+  }
+});
+
 globalThis.StorageEvent = class StorageEvent extends Event {
   constructor(type, init = {}) {
     super(type, init);
@@ -9780,7 +10170,52 @@ if (typeof File === "undefined") globalThis.File = class File extends Blob {
   }
   get [Symbol.toStringTag]() { return "File"; }
 };
-if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
+// A FormData value keeps Blob/File objects as-is (the multipart serializer reads
+// their bytes); every other value is coerced to a string per the Fetch spec.
+function _isFormBlob(v) {
+  return v != null && typeof v === "object" &&
+    (v._bytes !== undefined || (typeof Blob === "function" && v instanceof Blob));
+}
+if (typeof FormData === "undefined") globalThis.FormData = class FormData {
+  constructor(form) {
+    this._d = [];
+    // `new FormData(form)` reads the form's current successful controls (the
+    // spec's "constructing the entry list"): skip disabled controls, buttons,
+    // and unchecked checkboxes/radios; a checkbox with no value submits "on".
+    if (form === undefined || form === null) return;
+    const isForm = form.nodeType === 1 && String(form.tagName || "").toUpperCase() === "FORM";
+    if (!isForm) {
+      throw new TypeError("Failed to construct 'FormData': parameter 1 is not of type 'HTMLFormElement'.");
+    }
+    if (typeof form.querySelectorAll === "function") {
+      const controls = form.querySelectorAll("input,select,textarea");
+      for (let i = 0; i < controls.length; i++) {
+        const el = controls[i];
+        const name = el.getAttribute ? el.getAttribute("name") : el.name;
+        if (!name || el.disabled) continue;
+        const tag = (el.tagName || "").toLowerCase();
+        const type = (((el.getAttribute && el.getAttribute("type")) || el.type || "")).toLowerCase();
+        if (tag === "input" && (type === "checkbox" || type === "radio")) {
+          if (el.checked) this._d.push([name, el.value != null ? String(el.value) : "on"]);
+          continue;
+        }
+        if (type === "submit" || type === "reset" || type === "button" || type === "image" || type === "file") continue;
+        this._d.push([name, el.value != null ? String(el.value) : ""]);
+      }
+    }
+  }
+  append(k, v) { this._d.push([String(k), _isFormBlob(v) ? v : String(v)]); }
+  set(k, v) { k = String(k); this._d = this._d.filter(([a]) => a !== k); this._d.push([k, _isFormBlob(v) ? v : String(v)]); }
+  delete(k) { k = String(k); this._d = this._d.filter(([a]) => a !== k); }
+  get(k) { const e = this._d.find(([a]) => a === k); return e ? e[1] : null; }
+  getAll(k) { return this._d.filter(([a]) => a === k).map(([, v]) => v); }
+  has(k) { return this._d.some(([a]) => a === k); }
+  entries() { return this._d[Symbol.iterator](); }
+  keys() { return this._d.map(([k]) => k)[Symbol.iterator](); }
+  values() { return this._d.map(([, v]) => v)[Symbol.iterator](); }
+  forEach(cb) { this._d.forEach(([k, v]) => cb(v, k, this)); }
+  [Symbol.iterator]() { return this.entries(); }
+};
 // application/x-www-form-urlencoded serializer: like encodeURIComponent but
 // space -> '+' and also percent-encoding the chars encodeURIComponent leaves
 // bare ( ! ~ ' ( ) ), keeping the form-urlencoded safe set ( * - . _ ).
@@ -12073,7 +12508,23 @@ function _realmOrigin() {
   try { return new URL(_domParse('document_url')).origin; } catch (_) { return 'null'; }
 }
 
-function _sendRealmMessage(targetFrameId, data) {
+// Whether a postMessage restricted to `targetOrigin` may be delivered to a
+// realm whose current origin is `receiverOrigin`, given the sender's origin.
+// Mirrors the browser check done at delivery time: '*' (or an unspecified '')
+// allows any origin; '/' requires the receiver to be same-origin as the sender;
+// anything else must equal the receiver's own origin.
+function _targetOriginAllows(targetOrigin, receiverOrigin, senderOrigin) {
+  if (!targetOrigin || targetOrigin === '*') return true;
+  let expected;
+  if (targetOrigin === '/') {
+    expected = senderOrigin;
+  } else {
+    try { expected = new URL(targetOrigin).origin; } catch (_) { expected = targetOrigin; }
+  }
+  return receiverOrigin === expected;
+}
+
+function _sendRealmMessage(targetFrameId, data, targetOrigin) {
   let json;
   // Structured clone cannot cross realms here. JSON carries what postMessage is
   // actually used for; anything else throws the same DataCloneError a browser
@@ -12084,8 +12535,11 @@ function _sendRealmMessage(targetFrameId, data) {
     throw new DOMException('The object could not be cloned.', 'DataCloneError');
   }
   if (json === undefined) json = '{"v":null}';
+  // An unspecified targetOrigin stays permissive (empty string); the receiver
+  // enforces a specified one against its own origin in __obscura_deliverMessage.
+  const to = (targetOrigin === undefined || targetOrigin === null) ? '' : String(targetOrigin);
   Deno.core.ops.op_post_frame_message(
-    targetFrameId >>> 0, globalThis.__obscura_frameId >>> 0, _realmOrigin(), json);
+    targetFrameId >>> 0, globalThis.__obscura_frameId >>> 0, _realmOrigin(), to, json);
 }
 
 // The frame's own window and document, when this page is allowed to touch
@@ -12117,8 +12571,8 @@ function _frameWindowFor(frameId) {
   if (!real) return existing || null;
   if (existing && existing.__obscura_wrapsRealm) return existing;
 
-  const post = _markNative(function (data, _targetOrigin, _transfer) {
-    _sendRealmMessage(frameId, data);
+  const post = _markNative(function (data, targetOrigin, _transfer) {
+    _sendRealmMessage(frameId, data, targetOrigin);
   });
   const win = new Proxy(real, {
     get(target, prop) {
@@ -12137,7 +12591,11 @@ function _frameWindowFor(frameId) {
 }
 
 // The host calls this inside the target realm.
-globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId) {
+globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, targetOrigin) {
+  // Enforce postMessage's targetOrigin against THIS (the receiving) realm's
+  // origin, the same check a real browser does at delivery time. A mismatch
+  // drops the message silently.
+  if (!_targetOriginAllows(targetOrigin, _realmOrigin(), origin)) return;
   let data = null;
   try { data = JSON.parse(dataJson).v; } catch (_) {}
   // Who to reply to: the frame above, or one of the frames below.
@@ -12167,7 +12625,7 @@ class _RemoteWindow {
   constructor(frameId) {
     Object.defineProperty(this, '_frameId', { value: frameId, enumerable: false });
   }
-  postMessage(data, _targetOrigin, _transfer) { _sendRealmMessage(this._frameId, data); }
+  postMessage(data, targetOrigin, _transfer) { _sendRealmMessage(this._frameId, data, targetOrigin); }
   get self() { return this; }
   get window() { return this; }
   get frames() { return this; }
@@ -12256,13 +12714,13 @@ class _IframeWindow {
     return proxy;
   }
 
-  postMessage(data, _targetOrigin, _transfer) {
+  postMessage(data, targetOrigin, _transfer) {
     // Into the frame's own realm, through the host. This used to dispatch the
     // event on the *parent's* window, so a page could never actually talk to
     // the document inside its iframe. A frame that has not loaded yet has no
     // browsing context to receive anything.
     if (!this._frameId) return;
-    _sendRealmMessage(this._frameId, data);
+    _sendRealmMessage(this._frameId, data, targetOrigin);
   }
 
   setTimeout(fn, ms) { return globalThis.setTimeout(fn, ms); }
@@ -13053,6 +13511,8 @@ globalThis.Worker = class Worker {
     this.onerror = null;
     this._terminated = false;
     this._listeners = {};
+    this._scope = null;
+    this._pendingMessages = [];
     const worker = this;
 
     let resolvedUrl = url;
@@ -13079,8 +13539,8 @@ globalThis.Worker = class Worker {
   }
   _makeScope() {
     const worker = this;
-    // WorkerGlobalScope defined + no document property → IS_WORKER_SCOPE = true in creepjs
     const scope = {
+      onmessage: null,
       WorkerGlobalScope: function WorkerGlobalScope() {},
       DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
       postMessage: (msg) => {
@@ -13095,7 +13555,7 @@ globalThis.Worker = class Worker {
         if (!scope._ev[type]) scope._ev[type] = [];
         scope._ev[type].push(fn);
       },
-      close: () => { worker._terminated = true; },
+      close: () => { worker.terminate(); },
       crypto: globalThis.crypto,
       Crypto: globalThis.Crypto,
       TextEncoder: globalThis.TextEncoder,
@@ -13117,36 +13577,49 @@ globalThis.Worker = class Worker {
     return scope;
   }
   _autoRun() {
-    if (this._terminated || !this._code) return;
-    const worker = this;
-    const scope = worker._makeScope();
+    if (this._terminated || this._scope || this._code === undefined) return;
+    const scope = this._makeScope();
     try {
-      const fn = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
-      fn(scope, scope.postMessage, scope.addEventListener, scope.close);
+      // Direct eval preserves script directives and resolves bare handler names
+      // against the worker scope. Run once so message closures retain their state.
+      const fn = new Function('scope', 'source', 'with (scope) { eval(source); }');
+      fn.call(scope, scope, this._code);
     } catch(e) {
       console.error('Worker error:', e.message);
-      if (worker.onerror) worker.onerror(e);
+      if (this.onerror) this.onerror(e);
+    } finally {
+      if (!this._terminated) {
+        this._scope = scope;
+        for (const data of this._pendingMessages.splice(0)) this.postMessage(data);
+      }
     }
   }
   postMessage(data) {
     if (this._terminated) return;
+    if (!this._scope) {
+      this._pendingMessages.push(data);
+      return;
+    }
     const worker = this;
     setTimeout(() => {
-      if (worker._terminated || !worker._code) return;
-      const scope = worker._makeScope();
+      if (worker._terminated || !worker._scope) return;
+      const scope = worker._scope;
       try {
-        const fn = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
-        fn(scope, scope.postMessage, scope.addEventListener, scope.close);
+        const event = { data };
+        if (typeof scope.onmessage === 'function') scope.onmessage.call(scope, event);
         const evs = (scope._ev && scope._ev['message']) || [];
-        if (evs.length) { for (const h of evs) h({ data }); }
-        else if (scope.onmessage) scope.onmessage({ data });
+        for (const handler of evs.slice()) handler.call(scope, event);
       } catch(e) {
         console.error('Worker error:', e.message);
         if (worker.onerror) worker.onerror(e);
       }
     }, 0);
   }
-  terminate() { this._terminated = true; }
+  terminate() {
+    this._terminated = true;
+    this._pendingMessages.length = 0;
+    this._scope = null;
+  }
   addEventListener(type, fn) {
     if (!this._listeners[type]) this._listeners[type] = [];
     this._listeners[type].push(fn);
@@ -13158,8 +13631,36 @@ globalThis.Worker = class Worker {
 
 globalThis.__blobStore = globalThis.__blobStore || {};
 URL.createObjectURL = function(blob) {
-  if (blob) {
-    const id = 'blob:obscura/' + Math.random().toString(36).substring(2);
+  // Chrome mints blob:<document-origin>/<v4-uuid> (blob:null/<uuid> on an opaque
+  // origin) and throws a TypeError on missing/non-Blob input. The old code named
+  // the engine ("blob:obscura/") — a one-line anti-bot tell — used a base36 token
+  // no UUID parser accepts, and handed back a well-formed-looking string for
+  // invalid input so the caller only failed later at the fetch (issue #751).
+  if (arguments.length === 0) {
+    throw new TypeError("Failed to execute 'createObjectURL' on 'URL': 1 argument required, but only 0 present.");
+  }
+  // Only a real Blob/File (or obscura's Blob, which carries _bytes) is valid —
+  // Chrome throws for anything else. Duck-typing on `.text()` used to accept
+  // Response and other unrelated objects.
+  const isBlob = blob != null && typeof blob === 'object' &&
+    (blob._bytes !== undefined ||
+     (typeof Blob === 'function' && blob instanceof Blob));
+  if (!isBlob) {
+    throw new TypeError("Failed to execute 'createObjectURL' on 'URL': parameter 1 is not of type 'Blob'.");
+  }
+  {
+    let origin = 'null';
+    try { origin = new URL(location.href).origin || 'null'; } catch (e) {}
+    const uuid = (globalThis.crypto && typeof crypto.randomUUID === 'function')
+      ? crypto.randomUUID()
+      : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+          // CSPRNG, not Math.random() — blob IDs must not be predictable.
+          const b = new Uint8Array(1);
+          crypto.getRandomValues(b);
+          const r = b[0] & 0x0f;
+          return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+        });
+    const id = 'blob:' + origin + '/' + uuid;
     // Store synchronously so a Worker built from the blob URL in the same
     // tick sees its source. Blob-URL Worker construction is synchronous in
     // real browsers; the previous async blob.text().then() store raced the
@@ -13178,7 +13679,6 @@ URL.createObjectURL = function(blob) {
     }
     return id;
   }
-  return 'blob:obscura/fallback';
 };
 URL.revokeObjectURL = function(url) {
   delete globalThis.__blobStore[url];
@@ -13260,7 +13760,7 @@ globalThis.stop = function() {}; _markNative(globalThis.stop);
 // that posted to itself and waited for the `message` event waited forever.
 // Same realm, so this needs no host round trip; it is queued as a task because
 // postMessage never delivers synchronously.
-globalThis.postMessage = function(data, _targetOrigin, _transfer) {
+globalThis.postMessage = function(data, targetOrigin, _transfer) {
   let clone = data;
   // Match the cross-realm path: a value postMessage cannot carry is rejected
   // at the call, not delivered as something else.
@@ -13270,6 +13770,9 @@ globalThis.postMessage = function(data, _targetOrigin, _transfer) {
     throw new DOMException('The object could not be cloned.', 'DataCloneError');
   }
   const origin = _realmOrigin();
+  // A self-post honours targetOrigin too: sender and receiver are this realm,
+  // so a targetOrigin naming a different origin drops the message.
+  if (!_targetOriginAllows(targetOrigin, origin, origin)) return;
   setTimeout(() => {
     try {
       globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
@@ -14655,6 +15158,8 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 globalThis.__obscura_init = function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
+  _browserPostedTaskWakePending = false;
+  for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any

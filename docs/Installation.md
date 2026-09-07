@@ -60,6 +60,9 @@ Multi-stage build on a `rust:1-slim-bookworm` builder stage; the runtime layer
 is `debian:12-slim` with CA certificates taken from the distroless base image.
 The `cjk` feature is on, so CJK text renders out of the box
 (see [CJK and custom fonts](CJK-and-custom-fonts.md)).
+The container runs as uid 65532, not root. A mounted `--storage-dir` must be
+writable by that uid or the cookie jar silently fails to persist; see
+[Run in production at scale](Run-in-production-at-scale.md#the-container-does-not-run-as-root).
 
 The rendering release archives (`-cjk`, `-stealth`, and no suffix) and the
 Docker image include the rendering engine; the `-no-render` variants omit it.

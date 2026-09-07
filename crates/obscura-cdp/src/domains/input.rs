@@ -2,6 +2,14 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
+/// Embed a string as a JS string literal (double-quoted, with backslash,
+/// quotes, and control characters escaped) for interpolation into generated
+/// KeyboardEvent scripts. A plain `replace('\'', ...)` misses newline / NUL /
+/// U+2028-29, which terminate the literal and silently drop the event.
+fn js_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
 // Insert `text` at the caret, replacing any non-collapsed selection the way a
 // real browser does when you type over selected text (for example after a
 // triple-click select-all). selectionStart is null during ordinary typing, so
@@ -140,7 +148,7 @@ pub async fn handle(
                     page.evaluate(&code);
                 }
             } else if event_type == "mouseReleased" {
-                if let Some(page) = ctx.get_session_page_mut(session_id) {
+                let moved_frame = if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
@@ -160,6 +168,7 @@ pub async fn handle(
                             if (globalThis.__obscura_isDisabled(clickTarget)) return;\
                             var checkable = tag === 'INPUT' && (type === 'checkbox' || type === 'radio');\
                             var oldChecked = checkable ? !!clickTarget.checked : false;\
+                            var oldIndeterminate = checkable ? !!clickTarget.indeterminate : false;\
                             var radioStates = null;\
                             if (checkable && type === 'radio') {{\
                                 var radioName = clickTarget.getAttribute('name') || '';\
@@ -176,13 +185,14 @@ pub async fn handle(
                                 clickTarget.checked = true;\
                             }} else if (checkable) {{\
                                 clickTarget.checked = !oldChecked;\
+                                clickTarget.indeterminate = false;\
                             }}\
                             var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             var cancelled = !clickTarget.dispatchEvent(click);\
                             if (cancelled) {{\
                                 if (radioStates) {{\
                                     for (var rr = 0; rr < radioStates.length; rr++) radioStates[rr][0].checked = radioStates[rr][1];\
-                                }} else if (checkable) clickTarget.checked = oldChecked;\
+                                }} else if (checkable) {{ clickTarget.checked = oldChecked; clickTarget.indeterminate = oldIndeterminate; }}\
                                 return;\
                             }}\
                             if (checkable && clickTarget.checked !== oldChecked) {{\
@@ -233,22 +243,33 @@ pub async fn handle(
                     if moved {
                         let url = page.url_string();
                         let frame_id = page.frame_id.clone();
-                        ctx.pending_events.push(crate::types::CdpEvent {
-                            method: "Page.frameNavigated".into(),
-                            params: json!({
-                                "frame": {
-                                    "id": frame_id,
-                                    "url": url,
-                                    "domainAndRegistry": "",
-                                    "securityOrigin": "",
-                                    "mimeType": "text/html",
-                                    "adFrameStatus": { "adFrameType": "none" },
-                                },
-                                "type": "Navigation",
-                            }),
-                            session_id: Some(session_id.clone().unwrap_or_default()),
-                        });
+                        Some((page.id.clone(), frame_id, url))
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                };
+                if let Some((page_id, frame_id, url)) = moved_frame {
+                    let loader_id = ctx
+                        .current_loader_ids
+                        .get(&page_id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("loader-blank-{page_id}"));
+                    ctx.pending_events.push(crate::types::CdpEvent {
+                        method: "Page.frameNavigated".into(),
+                        params: json!({
+                            "frame": crate::domains::page::frame_value(
+                                &frame_id,
+                                None,
+                                &loader_id,
+                                &url,
+                                "text/html",
+                            ),
+                            "type": "Navigation",
+                        }),
+                        session_id: Some(session_id.clone().unwrap_or_default()),
+                    });
                 }
             } else if event_type == "mouseWheel" {
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -303,6 +324,15 @@ pub async fn handle(
 
             Ok(json!({}))
         }
+        // Chrome's Input.insertText: Playwright's fill() focuses the field in
+        // page and then types the whole value through this one call (#577).
+        "insertText" => {
+            let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
+                page.evaluate(&insert_text_js(text));
+            }
+            Ok(json!({}))
+        }
         "dispatchKeyEvent" => {
             let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
             let key = params.get("key").and_then(|v| v.as_str()).unwrap_or("");
@@ -315,15 +345,15 @@ pub async fn handle(
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:'{key}',code:'{code}'}}));\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code}}}));\
                                 target.dispatchEvent(evt);\
                             }})()",
                             // Escape backslash BEFORE single-quote (as the text
                             // path below does) so a key like "\" — Chrome's
                             // backslash key — doesn't escape the closing quote
                             // and produce a syntax error that drops the event.
-                            key = key.replace('\\', "\\\\").replace('\'', "\\'"),
-                            code = code.replace('\\', "\\\\").replace('\'', "\\'"),
+                            key = js_str(key),
+                            code = js_str(code),
                         );
                         page.evaluate(&js);
 
@@ -359,11 +389,11 @@ pub async fn handle(
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,key:'{key}',code:'{code}'}}));\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,key:{key},code:{code}}}));\
                                 target.dispatchEvent(evt);\
                             }})()",
-                            key = key.replace('\\', "\\\\").replace('\'', "\\'"),
-                            code = code.replace('\\', "\\\\").replace('\'', "\\'"),
+                            key = js_str(key),
+                            code = js_str(code),
                         );
                         page.evaluate(&js);
                     }
@@ -383,5 +413,26 @@ pub async fn handle(
         "dispatchTouchEvent" => Ok(json!({})),
         "setIgnoreInputEvents" => Ok(json!({})),
         _ => Err(format!("Unknown Input method: {}", method)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::js_str;
+
+    // SEC-501 / #819 — key/code are embedded via js_str; it must escape control
+    // characters (newline/CR/tab/NUL/U+2028-29), not just backslash and quote,
+    // so a control char cannot terminate the literal and drop the event.
+    #[test]
+    fn js_str_escapes_control_characters() {
+        let lit = js_str("a\nb\r\t'c\\d\"e");
+        assert!(
+            !lit.contains('\n') && !lit.contains('\r') && !lit.contains('\t'),
+            "control characters must be escaped, not left raw: {lit:?}"
+        );
+        // The result must be a valid JS/JSON string literal that round-trips.
+        let decoded: String =
+            serde_json::from_str(&lit).expect("the literal must be valid JSON");
+        assert_eq!(decoded, "a\nb\r\t'c\\d\"e");
     }
 }

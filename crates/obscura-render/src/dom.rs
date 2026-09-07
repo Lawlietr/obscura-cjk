@@ -2558,7 +2558,11 @@ fn apply_picture_source_hints(
 /// `matcher`'s ancestor filter as we descend so descendant-combinator rules
 /// fast-reject correctly. Non-element nodes (text, comments) are skipped but
 /// still walked through, since an element may be their descendant.
-fn cascade_walk(
+/// Per-node half of the style cascade: compute and record the style for
+/// one node and report the values its subtree inherits. Split out of
+/// `cascade_walk` so the traversal can run on an explicit work stack
+/// instead of one native frame per DOM level.
+fn cascade_node_style(
     tree: &DomTree,
     id: NodeId,
     sheet: &crate::css::Stylesheet,
@@ -2576,9 +2580,14 @@ fn cascade_walk(
     inherited_cell_padding: Option<f32>,
     inherited_color_scheme_dark: bool,
     fresh_styles: Option<&HashSet<NodeId>>,
-) {
+) -> Option<(
+    std::rc::Rc<HashMap<String, String>>,
+    Option<f32>,
+    bool,
+    bool,
+)> {
     let Some(node) = tree.get_node(id) else {
-        return;
+        return None;
     };
     let is_element = node.is_element();
     // The custom-property map in force for this node's subtree: the parent's,
@@ -2827,107 +2836,209 @@ fn cascade_walk(
         styles.insert(id, style);
     }
 
-    if is_element {
-        matcher.push_ancestor(tree, id);
+    Some((
+        this_props,
+        descendant_cell_padding,
+        descendant_color_scheme_dark,
+        is_element,
+    ))
+}
+
+/// Compute the UA + author style for every element in preorder, maintaining
+/// `matcher`'s ancestor filter as we descend so descendant-combinator rules
+/// fast-reject correctly. Non-element nodes (text, comments) are skipped but
+/// still walked through, since an element may be their descendant.
+///
+/// The traversal runs on an explicit work stack. It used to recurse once per
+/// DOM level, and the per-level frame is large (UA style, rule matching, and
+/// pseudo-style temporaries), so a page-controlled tree a few dozen levels
+/// deep overflowed the caller's thread stack and aborted the whole process.
+/// Stack usage is now independent of DOM depth.
+fn cascade_walk(
+    tree: &DomTree,
+    id: NodeId,
+    sheet: &crate::css::Stylesheet,
+    document_sheet: &crate::css::Stylesheet,
+    shadow_sheets: &HashMap<NodeId, std::sync::Arc<crate::css::Stylesheet>>,
+    matcher: &mut obscura_dom::selector::Matcher,
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+    custom_properties: &mut HashMap<NodeId, std::rc::Rc<HashMap<String, String>>>,
+    parent_props: &std::rc::Rc<HashMap<String, String>>,
+    container_evaluator: &mut Option<&mut crate::css::ContainerQueryEvaluator<'_>>,
+    quirks_mode: bool,
+    viewport: (f32, f32),
+    animation_sample: crate::AnimationSample,
+    animation_timeline: &mut crate::AnimationTimelineState,
+    inherited_cell_padding: Option<f32>,
+    inherited_color_scheme_dark: bool,
+    fresh_styles: Option<&HashSet<NodeId>>,
+) {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum MatcherBase {
+        // Push/pop on the matcher currently on top (the caller's matcher, or
+        // the enclosing subtree's), matching the recursive descent.
+        Incremental,
+        // Assigned (slotted) nodes match from a matcher pre-seeded with their
+        // light-DOM ancestors.
+        FreshFromAncestors,
+        // Shadow-root children match with an empty ancestor filter, so
+        // document rules stay out of the shadow tree.
+        FreshEmpty,
     }
-    let is_shadow_host = tree.shadow_root(id).is_some();
-    for cid in tree.children(id) {
-        // Assigned light children are cascaded from their flattened slot
-        // below. Unslotted children still need CSSOM-computed styles and stay
-        // on the ordinary host path.
-        if is_shadow_host && tree.assigned_slot(cid).is_some() {
-            continue;
-        }
-        cascade_walk(
-            tree,
-            cid,
-            sheet,
-            document_sheet,
-            shadow_sheets,
-            matcher,
-            styles,
-            custom_properties,
-            &this_props,
-            container_evaluator,
-            quirks_mode,
-            viewport,
-            animation_sample,
-            animation_timeline,
-            descendant_cell_padding,
-            descendant_color_scheme_dark,
-            fresh_styles,
-        );
+
+    struct Visit<'a> {
+        id: NodeId,
+        sheet: &'a crate::css::Stylesheet,
+        props: std::rc::Rc<HashMap<String, String>>,
+        cell_padding: Option<f32>,
+        color_scheme_dark: bool,
+        matcher_base: MatcherBase,
+        use_container_evaluator: bool,
     }
-    if let Some(assigned_nodes) = tree.assigned_nodes(id) {
-        for cid in assigned_nodes {
-            let assigned_sheet = tree
-                .containing_shadow_root(cid)
-                .and_then(|root| shadow_sheets.get(&root).map(|sheet| &**sheet))
-                .unwrap_or(document_sheet);
-            let mut assigned_matcher = tree.matcher();
-            for ancestor in tree.ancestors(cid).into_iter().rev() {
-                if tree
-                    .get_node(ancestor)
-                    .is_some_and(|node| node.is_element())
-                {
-                    assigned_matcher.push_ancestor(tree, ancestor);
+
+    enum Work<'a> {
+        Visit(Visit<'a>),
+        PopAncestor,
+        PopSubtreeMatcher,
+    }
+
+    let mut subtree_matchers: Vec<obscura_dom::selector::Matcher> = Vec::new();
+    let mut work: Vec<Work> = vec![Work::Visit(Visit {
+        id,
+        sheet,
+        props: parent_props.clone(),
+        cell_padding: inherited_cell_padding,
+        color_scheme_dark: inherited_color_scheme_dark,
+        matcher_base: MatcherBase::Incremental,
+        use_container_evaluator: true,
+    })];
+
+    while let Some(item) = work.pop() {
+        match item {
+            Work::PopAncestor => {
+                if let Some(top) = subtree_matchers.last_mut() {
+                    top.pop_ancestor();
+                } else {
+                    matcher.pop_ancestor();
                 }
             }
-            cascade_walk(
-                tree,
-                cid,
-                assigned_sheet,
-                document_sheet,
-                shadow_sheets,
-                &mut assigned_matcher,
-                styles,
-                custom_properties,
-                &this_props,
-                container_evaluator,
-                quirks_mode,
-                viewport,
-                animation_sample,
-                animation_timeline,
-                descendant_cell_padding,
-                descendant_color_scheme_dark,
-                fresh_styles,
-            );
-        }
-    }
-    if let Some(root) = tree.shadow_root(id) {
-        // Start matching with an empty ancestor filter at each tree-scope
-        // boundary. That keeps document rules out of the shadow tree and
-        // shadow rules out of the document/other roots by construction.
-        if let Some(shadow_sheet) = shadow_sheets.get(&root) {
-            let mut shadow_matcher = tree.matcher();
-            let mut no_container_evaluator = None;
-            for child in tree.children(root) {
-                cascade_walk(
+            Work::PopSubtreeMatcher => {
+                subtree_matchers.pop();
+            }
+            Work::Visit(visit) => {
+                if visit.matcher_base != MatcherBase::Incremental {
+                    let mut fresh = tree.matcher();
+                    if visit.matcher_base == MatcherBase::FreshFromAncestors {
+                        for ancestor in tree.ancestors(visit.id).into_iter().rev() {
+                            if tree
+                                .get_node(ancestor)
+                                .is_some_and(|node| node.is_element())
+                            {
+                                fresh.push_ancestor(tree, ancestor);
+                            }
+                        }
+                    }
+                    subtree_matchers.push(fresh);
+                    // Runs after the subtree's own PopAncestor markers.
+                    work.push(Work::PopSubtreeMatcher);
+                }
+                let current_matcher = subtree_matchers.last_mut().unwrap_or(&mut *matcher);
+                let mut no_container_evaluator = None;
+                let evaluator: &mut Option<&mut crate::css::ContainerQueryEvaluator<'_>> =
+                    if visit.use_container_evaluator {
+                        container_evaluator
+                    } else {
+                        &mut no_container_evaluator
+                    };
+                let Some((
+                    this_props,
+                    descendant_cell_padding,
+                    descendant_color_scheme_dark,
+                    is_element,
+                )) = cascade_node_style(
                     tree,
-                    child,
-                    shadow_sheet,
+                    visit.id,
+                    visit.sheet,
                     document_sheet,
                     shadow_sheets,
-                    &mut shadow_matcher,
+                    current_matcher,
                     styles,
                     custom_properties,
-                    &this_props,
-                    &mut no_container_evaluator,
+                    &visit.props,
+                    evaluator,
                     quirks_mode,
                     viewport,
                     animation_sample,
                     animation_timeline,
-                    None,
-                    descendant_color_scheme_dark,
+                    visit.cell_padding,
+                    visit.color_scheme_dark,
                     fresh_styles,
-                );
+                ) else {
+                    continue;
+                };
+
+                if is_element {
+                    current_matcher.push_ancestor(tree, visit.id);
+                    work.push(Work::PopAncestor);
+                }
+                // LIFO: push the later phases first so regular children run
+                // first, then assigned nodes, then the shadow subtree, all in
+                // document order.
+                if let Some(root) = tree.shadow_root(visit.id) {
+                    if let Some(shadow_sheet) = shadow_sheets.get(&root) {
+                        for child in tree.children(root).into_iter().rev() {
+                            work.push(Work::Visit(Visit {
+                                id: child,
+                                sheet: shadow_sheet,
+                                props: this_props.clone(),
+                                cell_padding: None,
+                                color_scheme_dark: descendant_color_scheme_dark,
+                                matcher_base: MatcherBase::FreshEmpty,
+                                use_container_evaluator: false,
+                            }));
+                        }
+                    }
+                }
+                if let Some(assigned_nodes) = tree.assigned_nodes(visit.id) {
+                    for cid in assigned_nodes.into_iter().rev() {
+                        let assigned_sheet = tree
+                            .containing_shadow_root(cid)
+                            .and_then(|root| shadow_sheets.get(&root).map(|sheet| &**sheet))
+                            .unwrap_or(document_sheet);
+                        work.push(Work::Visit(Visit {
+                            id: cid,
+                            sheet: assigned_sheet,
+                            props: this_props.clone(),
+                            cell_padding: descendant_cell_padding,
+                            color_scheme_dark: descendant_color_scheme_dark,
+                            matcher_base: MatcherBase::FreshFromAncestors,
+                            use_container_evaluator: true,
+                        }));
+                    }
+                }
+                let is_shadow_host = tree.shadow_root(visit.id).is_some();
+                for cid in tree.children(visit.id).into_iter().rev() {
+                    // Assigned light children are cascaded from their flattened
+                    // slot above. Unslotted children still need CSSOM-computed
+                    // styles and stay on the ordinary host path.
+                    if is_shadow_host && tree.assigned_slot(cid).is_some() {
+                        continue;
+                    }
+                    work.push(Work::Visit(Visit {
+                        id: cid,
+                        sheet: visit.sheet,
+                        props: this_props.clone(),
+                        cell_padding: descendant_cell_padding,
+                        color_scheme_dark: descendant_color_scheme_dark,
+                        matcher_base: MatcherBase::Incremental,
+                        use_container_evaluator: visit.use_container_evaluator,
+                    }));
+                }
             }
         }
     }
-    if is_element {
-        matcher.pop_ancestor();
-    }
 }
+
 
 #[derive(Default)]
 struct CssCounterState {
@@ -6198,10 +6309,59 @@ fn layout_dom_once(
                     }
                 }
             }
+            // CSS 2.1 10.1: the initial containing block is a rectangle with
+            // the dimensions of the VIEWPORT, and the root element is laid out
+            // inside it. Taffy resolves an out-of-flow box against its parent
+            // box, and out-of-flow boxes were parented to the root element,
+            // whose used height is the *document* height. So `position: fixed`
+            // and ICB-relative `position: absolute` resolved percentage insets,
+            // `bottom` and `right` against the document instead of the viewport
+            // (issue #675: on a 3020px document in a 720px viewport `top: 50%`
+            // landed at 1510 instead of 360, `bottom: 0` at 3000 instead of
+            // 700; issue #740 is the same bug seen through a centered dialog).
+            //
+            // Model the ICB explicitly: a viewport-sized box that owns the root
+            // element, and hang the out-of-flow boxes off it. It sits at the
+            // origin and the root element sits at (0, 0) inside it, so every
+            // descendant keeps the absolute coordinates it had before.
+            // The ICB is an out-of-flow, viewport-sized box anchored at the
+            // root element's origin. Out-of-flow, rather than a parent of the
+            // root: the root element establishes a block formatting context
+            // (CSS 2.1 9.4.1) and its margins do not collapse (8.3.1), so
+            // making it an ordinary in-flow child of a wrapper would collapse
+            // the body's margins out of it and shrink the document. As an
+            // absolutely positioned sibling box the ICB contributes nothing to
+            // the root's content size, and taffy still resolves the boxes
+            // parented to it against its viewport-sized rect.
+            let initial_containing_block = {
+                let style = taffy::Style {
+                    display: taffy::style::Display::Block,
+                    position: taffy::Position::Absolute,
+                    inset: taffy::Rect {
+                        top: taffy::style::LengthPercentageAuto::length(0.0),
+                        left: taffy::style::LengthPercentageAuto::length(0.0),
+                        right: taffy::style::LengthPercentageAuto::auto(),
+                        bottom: taffy::style::LengthPercentageAuto::auto(),
+                    },
+                    size: taffy::Size {
+                        width: taffy::Dimension::length(initial_cb_width),
+                        height: taffy::Dimension::length(viewport.1),
+                    },
+                    ..Default::default()
+                };
+                match taffy_tree.new_leaf(style) {
+                    Ok(node) => {
+                        let _ = taffy_tree.add_child(taffy_root, node);
+                        node
+                    }
+                    Err(_) => taffy_root,
+                }
+            };
+
             let static_position_candidates = reparent_inset_positioned_nodes(
                 tree,
                 &mut taffy_tree,
-                taffy_root,
+                initial_containing_block,
                 &id_map,
                 &styles,
             );
@@ -14702,6 +14862,44 @@ mod tests {
     }
 
     #[test]
+    fn out_of_flow_boxes_resolve_against_the_viewport_sized_initial_containing_block() {
+        // CSS 2.1 10.1: the initial containing block has the dimensions of the
+        // viewport. A `fixed` box always resolves against the viewport, and an
+        // `absolute` box with no positioned ancestor resolves against the ICB,
+        // so neither may follow the document height. Regression cover for the
+        // case where both followed the root element box instead: on a 3000px
+        // document `bottom: 0` landed at the end of the document and
+        // `top: 50%` at half of it.
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+                <div style="height:3000px"></div>
+                <div id="fixed-bottom" style="position:fixed;bottom:0;left:0;width:10px;height:20px"></div>
+                <div id="fixed-mid" style="position:fixed;top:50%;left:0;width:10px;height:20px"></div>
+                <div id="abs-bottom" style="position:absolute;bottom:0;left:0;width:10px;height:20px"></div>
+                <div id="rel" style="position:relative;height:400px;width:100px">
+                    <div id="abs-in-rel" style="position:absolute;top:50%;width:10px;height:10px"></div>
+                </div>
+            </body></html>"#,
+        );
+        let fixed_bottom = tree.get_element_by_id("fixed-bottom").unwrap();
+        let fixed_mid = tree.get_element_by_id("fixed-mid").unwrap();
+        let abs_bottom = tree.get_element_by_id("abs-bottom").unwrap();
+        let rel = tree.get_element_by_id("rel").unwrap();
+        let abs_in_rel = tree.get_element_by_id("abs-in-rel").unwrap();
+
+        let laid = layout_dom(&tree, (200.0, 200.0));
+
+        // Viewport is 200 tall and the boxes are 20 tall: `bottom: 0` sits at
+        // 180 and `top: 50%` at 100, however long the document is.
+        assert_eq!(laid.rects[&fixed_bottom].y, 180.0);
+        assert_eq!(laid.rects[&fixed_mid].y, 100.0);
+        assert_eq!(laid.rects[&abs_bottom].y, 180.0);
+        // An absolute box with a positioned ancestor keeps resolving against
+        // that ancestor, not the viewport.
+        assert_eq!(laid.rects[&abs_in_rel].y, laid.rects[&rel].y + 200.0);
+    }
+
+    #[test]
     fn root_scrolling_overflow_uses_composed_shadow_tree() {
         let tree = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
@@ -19678,6 +19876,13 @@ mod tests {
         );
     }
 
+    /// Gated on `paint`: without it `TextEngine::new_with_web_fonts` ignores
+    /// the fonts it is handed, so neither half of this test has anything to
+    /// observe. `word_ifc_items` does not exist to read, and the advance-width
+    /// comparison sees the same fallback face on both sides and finds the two
+    /// widths equal. Gating only the field access would leave an assertion
+    /// that compiles and then fails.
+    #[cfg(feature = "paint")]
     #[test]
     fn generated_pseudo_content_shapes_with_the_loaded_webfont() {
         let tree = parse_html(

@@ -37,6 +37,18 @@ Hard ceiling on a single navigation. Default 30000 (30 seconds). Applies to `Pag
 OBSCURA_NAV_TIMEOUT_MS=60000 obscura serve
 ```
 
+### `OBSCURA_NAV_CHAIN_LIMIT`
+
+How many documents a navigation chain may load, the first navigation included. Default 10, which allows the requested document and nine navigations the page itself triggers via `location` assignments or form submissions. Raise the value for an endpoint that chains longer for good reasons, such as an SSO handover across several providers. The low default is what stops a page that resets `location` on every load.
+
+A zero is raised to 1. This loads the requested document. If the page wants to chain further afterwards, the call reports an error, as at any other limit. A value the engine does not read as a number is replaced by the default. This also applies to a negative value and to a value with a trailing space.
+
+The time budget is not tied to this limit. A longer chain usually also needs a higher `OBSCURA_NAV_TIMEOUT_MS`, because its default of 30 seconds applies to the whole chain and not to the individual document.
+
+```bash
+OBSCURA_NAV_CHAIN_LIMIT=20 obscura serve
+```
+
 ### `OBSCURA_SCRIPT_DEADLINE_MS`
 
 Soft deadline for the complete page script-execution phase, including classic scripts and ES modules. Default 30000 (30 seconds). Raise it for a heavy SPA whose initial module is responsible for mounting an otherwise empty document. The engine also uses this value as a hard V8 watchdog budget, with a one-second grace period, so a synchronous script cannot run forever.
