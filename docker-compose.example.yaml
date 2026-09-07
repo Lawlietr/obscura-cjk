@@ -1,3 +1,6 @@
+# The container runs as uid/gid 65532 (non-root). If you mount a --storage-dir
+# volume, it must be writable by that uid (e.g. `chown 65532:65532 <dir>`),
+# or the cookie jar silently fails to persist.
 services:
   obscura:
     image: ghcr.io/lawlietr/obscura-cjk:latest

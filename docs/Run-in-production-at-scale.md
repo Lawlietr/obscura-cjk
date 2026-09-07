@@ -10,16 +10,16 @@ docker run -d \
   --restart unless-stopped \
   -p 127.0.0.1:9222:9222 \
   -v /srv/obscura/data:/data \
-  obscura-cjk \
-  serve --host 0.0.0.0 --storage-dir /data --stealth
+  ghcr.io/lawlietr/obscura-cjk:latest \
+  serve --host 0.0.0.0 --storage-dir /data
 ```
 
 The image runs `obscura serve` by default. Override with arguments after the image name.
 
 ### The container does not run as root
 
-The image is built on `gcr.io/distroless/cc-debian12:nonroot` and runs as
-uid/gid **65532**. Obscura executes untrusted page JavaScript in-process through
+The image runs as uid/gid **65532**, not root (the runtime layer is
+`debian:12-slim` with an explicit `USER 65532:65532`). Obscura executes untrusted page JavaScript in-process through
 V8, so a V8 exploit lands with the process's privileges — there is no reason for
 those to be root's.
 

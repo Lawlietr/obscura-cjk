@@ -12,7 +12,7 @@ anyhow = "1"
 The first build compiles V8 from source, so it is slow and needs the same build tools as [Build from source](Build-from-source.md). Pin a release tag for reproducible builds:
 
 ```toml
-obscura = { git = "https://github.com/Lawlietr/obscura-cjk", tag = "v0.1.0-cjk" }
+obscura = { git = "https://github.com/Lawlietr/obscura-cjk", tag = "v0.2.0-cjk" }
 ```
 
 ## Quickstart

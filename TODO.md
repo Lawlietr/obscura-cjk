@@ -2,6 +2,45 @@
 
 Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與重要事項。
 工作分支：`main`。首個 release：**`v0.1.0-cjk`**（2026-08-24 發佈成功）。
+`v0.1.1-cjk` 已發佈（上游 23 commits 小同步 + release 變體收斂為
+`cjk` / `cjk-stealth` + `docker-compose.yaml` 改為 example 檔）。
+下一個 release：**`v0.2.0-cjk`**（上游大合併，見下）。
+
+## Release：v0.2.0-cjk（2026-09-07，上游大合併）
+
+- [x] **上游 `upstream/main` 全量合併。** 自分叉點 `c1380190` 起 114 commits
+      （~40 PR，+9482/−1056 行，44 檔）；無 v8/deno ABI 變動。3 個衝突全數
+      按預先評估處理：Dockerfile（保留 `debian:12-slim`+TZ，加上游 #859
+      nonroot → `USER 65532:65532`）、README.md（整份保留 fork 版，丟上游
+      行銷區塊）、docs/Installation.md（吸收 nonroot 事實段落）。
+      重點內容：SSRF 封鎖補強（embedded-address / CGNAT / IANA
+      special-purpose）、fetch body 與 fetched_urls 上限、isolate teardown /
+      watchdog 健壯性、一批 CDP/Playwright 相容修復、ICU locale 釘死 en-US、
+      `--allow-private-network` 穿進 stealth client（#831）、Docker nonroot。
+- [x] **合併後本地回歸（2026-09-07）。** `render,cjk`：nextest
+      **1647/1647**（4 skipped；合併前 1487，新增 ~160 上游測試全過）、
+      release build 6m52s、svg filter 21/21、CJK fixture 截圖 55KB 無豆腐框、
+      障礙課程 **32/33**（已知 `observer-intersection`）。
+- [x] **本地容器換上合併版驗證。** 本機 build `obscura-cjk:merged-local`
+      （先清 `target/release/deps` 騰 5.3G）；nonroot（Uid/Gid 65532）、
+      compose hardening（read_only+tmpfs+cap_drop）相容、MCP initialize/
+      tools/list、真實站 navigate+eval、CJK 截圖全過；正式容器 `obscura`
+      已重建為該映像。
+- **tag 選 `v0.2.0-cjk`（非 0.1.2）的理由：** 容器 nonroot 屬部署行為變更
+      （掛載 storage dir 權限不符時 cookie jar 靜默不持久化），加 SSRF 封鎖
+      範圍擴大與 ICU locale pin，對 0.x 線達 MINOR 級；0.2.0 給使用者明確的
+      上游大合併分界點。workspace version 維持 `0.1.0` 慣例（tag 驅動）。
+- [ ] **push main + 打 tag `v0.2.0-cjk`**（觸發 release ~28min 五平台 ×
+      cjk/cjk-stealth 兩變體 + docker GHCR ~7min）。
+- [ ] release 跑完後：抽驗 cjk-stealth 變體 smoke test（#831 動了 wreq，
+      本機無 cmake 無法本地建置驗證）；本機 `docker-compose.yaml` 從
+      `obscura-cjk:merged-local` 切回 `ghcr.io/lawlietr/obscura-cjk:latest`。
+- [x] **文件同步（tag 前）。** `docs/Use-as-a-Rust-library.md` pin 改
+      `v0.2.0-cjk`；AGENTS.md（compose example 說明、nonroot 條目）；
+      `docs/Run-in-production-at-scale.md`（nonroot 段落改述本 fork 的
+      `debian:12-slim`+USER 65532、docker run 範例改 GHCR 映像、去上游
+      `--stealth` 旗標）；`docker-compose.example.yaml` 補 storage dir
+      權限註解。
 
 ## Release：GitHub Actions 二進位發布
 

@@ -14,10 +14,11 @@ capabilities. It targets web scraping and AI-agent automation.
 
 Release images are published to `ghcr.io/lawlietr/obscura-cjk` by GitHub
 Actions on every `v*` tag; `latest` tracks the newest release, and versioned
-tags remain available for rollback. The repo's `docker-compose.yaml` follows
-`latest` and is
-the canonical deployment (MCP mode with the recommended security hardening);
-`docker compose up -d` from the repo root is the default way to run it.
+tags remain available for rollback. The repo ships
+`docker-compose.example.yaml` (copied to a local, git-ignored
+`docker-compose.yaml`), which follows `latest` and is the canonical deployment
+(MCP mode with the recommended security hardening); `docker compose up -d`
+from the repo root is the default way to run it.
 For local development, build from the repo's `Dockerfile`
 (`docker build -t obscura-cjk .`). Standalone examples for reference:
 
@@ -79,6 +80,10 @@ Then connect clients at `ws://localhost:9222/devtools/browser`.
   non-recursive and covers `ttf`/`otf`/`ttc`/`woff`/`woff2`.
 - The default CMD binds to `0.0.0.0` inside the container for Docker port mapping.
 - Native binary defaults to `127.0.0.1` (loopback only).
+- The image runs as uid/gid 65532 (non-root), not root: Obscura executes
+  untrusted page JavaScript in-process through V8, so a V8 exploit lands with
+  the process's privileges. A mounted `--storage-dir` must be writable by that
+  uid, or the cookie jar silently fails to persist.
 
 ## Build
 
