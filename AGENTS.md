@@ -113,6 +113,9 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
   stderr warning. This is a deliberate escape hatch from the bundled-faces-only
   determinism: layout then varies with the directory contents. Use it for
   scripts the embedded faces lack (Korean Hangul, CJK weights, etc.).
+  This is the fork mechanism; it coexists with the upstream `--font-dir` flag
+  on `serve` (recursive, pure sfnt only, set before the first render). See
+  `docs/CJK-and-custom-fonts.md` ("Two font-directory mechanisms").
 - **Iterating on one crate? Scope it:** `cargo build -p obscura-cli`. A bare
   `cargo build` can re-link the whole workspace; the V8 compile is the cost, so
   avoid touching it when you don't need to.

@@ -66,3 +66,25 @@ obscura --fonts /path/to/fonts fetch https://example.com -s page.png
 # Or via the environment (applies to fetch, serve, scrape, and mcp)
 OBSCURA_FONTS_DIR=/path/to/fonts obscura fetch https://example.com -s page.png
 ```
+
+## Two font-directory mechanisms
+
+There are **two** separate ways to add fonts from a directory, and they are not
+interchangeable:
+
+| | `--fonts` / `OBSCURA_FONTS_DIR` | `--font-dir` |
+| --- | --- | --- |
+| Origin | fork | upstream |
+| Where it applies | Global flag; `fetch`, `serve`, `scrape`, `mcp` | `serve` subcommand only |
+| When it is read | Per request / per worker | Once, before the first render of the process |
+| Scan | Non-recursive, filename-sorted | Recursive (enters subdirectories), filename-sorted |
+| Accepted files | `ttf`/`otf`/`ttc`/`woff`/`woff2` | Pure sfnt only: `ttf`/`otf`/`ttc`/`otc` (woff/woff2 skipped) |
+| Symlinks | Included | Skipped |
+
+Both add fallback faces to the font database after the bundled set and are
+opt-in: layout then depends on the directory contents, breaking
+bundled-faces-only determinism. Use `--fonts`/`OBSCURA_FONTS_DIR` for quick
+per-request additions (including `scrape`/`mcp`). Use `--font-dir` when running
+`obscura serve` and you need a whole tree of fonts loaded once for the CDP
+session; pass it **before** the first page renders, or it refuses with
+"Font directories must be configured before the first render".

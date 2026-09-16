@@ -8,13 +8,18 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
 
 ### 上游合併 #2（2026-09-17，`694c8e1`，71 commits since `727cc46`）
 
-- [ ] 合併後回歸：`render,cjk` nextest + release build + 障礙課程 32/33。
+- [x] 合併後回歸（nextest）：`render,cjk` 九 crate 全量 **1691 passed /
+      4 skipped / 0 failed**（render 601/1、js+net 611/0、cdp+dom+cli+
+      browser+mcp 479/3），2026-09-17 重跑。
+- [ ] 合併後回歸（剩餘關卡）：release build（`render,cjk`）+ 障礙課程 32/33。
+      障礙課程自 2026-09-17 合併後尚未重跑。
 - [ ] CJK 抽檢：cjk fixture 截圖無豆腐框；確認 `extra_fallback_fonts`
       已注入新 `base_font_database` cache 架構（HTML + SVG 兩路徑）。
-- [ ] 文件同步：兩套字型目錄機制並存需寫清楚（fork `--fonts`/
+- [x] 文件同步：兩套字型目錄機制並存已寫清楚（fork `--fonts`/
       `OBSCURA_FONTS_DIR`：非遞迴、支援 woff/woff2；上游 `--font-dir`：
       serve 層可重複、遞迴、純 sfnt、須在首次 render 前設定）。
-      目標檔案：AGENTS.md、docs/CJK-and-custom-fonts.md、docs/CLI-reference.md。
+      2026-09-17 更新：AGENTS.md、docs/CJK-and-custom-fonts.md、
+      docs/Environment-variables.md；docs/CLI-reference.md 原本已兩套並存。
 
 ### 中-高優先級（2026-09-16 問題回報，Leaflet 1.9.4 + `obscura-cjk:merged-local` 實測）
 
@@ -97,6 +102,10 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
 > 首個 release 的 CI smoke test 已全數通過；完整本地回歸 2026-08-25
 > 補跑。
 
+- [x] **上游合併 #2 回歸（nextest，2026-09-17）。** `render,cjk` 九 crate
+      全量 **1691 passed / 4 skipped / 0 failed**（render 601/1、js+net
+      611/0、cdp+dom+cli+browser+mcp 479/3）。release build、障礙課程 32/33
+      與 CJK 截檢未隨本批執行（障礙課程留待後續）。
 - [x] **完整回歸（2026-08-25）。** `render,cjk` 1487/1487、`render`
       1486/1486（各 4 skipped）；建置 6m19s。
 - [x] **磁碟檢查（2026-08-25）。** 測試後 6.5G 可用（78%）；清
