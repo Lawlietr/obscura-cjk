@@ -116,6 +116,28 @@ impl Response {
     }
 }
 
+/// Fold one response header line into the collected header map.
+///
+/// A plain `HashMap` insert keeps only the *last* value when a response repeats
+/// a header name (`Link`, `Via`, `WWW-Authenticate`, ...), silently dropping the
+/// earlier lines. Per RFC 9110 §5.3 duplicate field lines of the same name may
+/// be combined into one comma-separated value without changing semantics.
+/// `Set-Cookie` is the exception (RFC 6265 forbids folding it): it is captured
+/// individually by the cookie jar via `get_all`, so the map keeps it only as a
+/// presence signal and last-wins there is fine.
+pub(crate) fn merge_response_header(map: &mut HashMap<String, String>, name: String, value: String) {
+    if name == "set-cookie" {
+        map.insert(name, value);
+        return;
+    }
+    map.entry(name)
+        .and_modify(|existing| {
+            existing.push_str(", ");
+            existing.push_str(&value);
+        })
+        .or_insert(value);
+}
+
 #[derive(Debug, Clone)]
 pub struct RequestInfo {
     pub url: Url,
@@ -1643,11 +1665,14 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let response_headers: HashMap<String, String> = resp
-                .headers()
-                .iter()
-                .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
-                .collect();
+            let mut response_headers: HashMap<String, String> = HashMap::new();
+            for (k, v) in resp.headers().iter() {
+                merge_response_header(
+                    &mut response_headers,
+                    k.as_str().to_lowercase(),
+                    v.to_str().unwrap_or("").to_string(),
+                );
+            }
 
             if status.is_redirection() {
                 if let Some(location) = resp.headers().get(reqwest::header::LOCATION) {
@@ -1748,7 +1773,7 @@ pub enum ObscuraNetError {
 #[cfg(test)]
 mod ssrf_tests {
     use super::{
-        is_forbidden_ip, request_fetch_site, request_referrer, validate_url,
+        is_forbidden_ip, merge_response_header, request_fetch_site, request_referrer, validate_url,
         CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestMode,
         ResourceRequest, ResourceType, SsrfGuardResolver,
     };
@@ -1764,6 +1789,34 @@ mod ssrf_tests {
 
     fn ip(s: &str) -> IpAddr {
         IpAddr::from_str(s).unwrap()
+    }
+
+    // A response that repeats a header name (Link, Via, WWW-Authenticate, ...)
+    // must not lose all but the last line. See #913.
+    #[test]
+    fn response_headers_preserve_duplicate_values() {
+        let mut headers = HashMap::new();
+        merge_response_header(&mut headers, "link".into(), "<a>; rel=preload".into());
+        merge_response_header(&mut headers, "link".into(), "<b>; rel=preconnect".into());
+        assert_eq!(
+            headers.get("link").map(String::as_str),
+            Some("<a>; rel=preload, <b>; rel=preconnect"),
+            "duplicate header lines must be combined per RFC 9110, not dropped"
+        );
+    }
+
+    // Set-Cookie must not be comma-folded (RFC 6265); the cookie jar captures
+    // each line via get_all, so the map keeps it only as a presence signal.
+    #[test]
+    fn response_headers_do_not_fold_set_cookie() {
+        let mut headers = HashMap::new();
+        merge_response_header(&mut headers, "set-cookie".into(), "a=1".into());
+        merge_response_header(&mut headers, "set-cookie".into(), "b=2".into());
+        assert_eq!(
+            headers.get("set-cookie").map(String::as_str),
+            Some("b=2"),
+            "Set-Cookie must stay a single (last) value, never comma-folded"
+        );
     }
 
     #[test]

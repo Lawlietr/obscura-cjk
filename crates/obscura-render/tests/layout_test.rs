@@ -4496,3 +4496,29 @@ fn deeply_nested_wrappers_cascade_without_stack_overflow() {
         "the descendant rule must match at depth 400, got {rect:?}"
     );
 }
+
+#[test]
+fn float_ending_at_rounded_segment_boundary_does_not_panic() {
+    use taffy::{compute::FloatContext, Clear, FloatDirection, Size};
+
+    fn place(
+        context: &mut FloatContext,
+        height: f32,
+        direction: FloatDirection,
+    ) -> taffy::Point<f32> {
+        context.place_floated_box(
+            Size { width: 100.0, height },
+            1859.0,
+            [0.0, 0.0],
+            direction,
+            Clear::None,
+        )
+    }
+
+    let mut context = FloatContext::new();
+    context.set_width(1000.0);
+    place(&mut context, 421.3333, FloatDirection::Left);
+    place(&mut context, 400.3333, FloatDirection::Right);
+
+    assert_eq!(place(&mut context, 400.3333, FloatDirection::Left).y, 1859.0);
+}

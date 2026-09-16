@@ -1730,8 +1730,6 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             });
         }
         "text-decoration" | "text-decoration-line" => {
-            // Shorthand can carry color/style/thickness; we only model the
-            // underline line (the dominant case, and the UA default for links).
             let toks: Vec<String> = value
                 .split_whitespace()
                 .map(|t| t.to_ascii_lowercase())
@@ -1739,6 +1737,8 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             let underline = toks.iter().any(|t| t == "underline");
             let none = toks.iter().any(|t| t == "none");
             style.underline = Some(underline && !none);
+            style.overline = Some(!none && toks.iter().any(|token| token == "overline"));
+            style.line_through = Some(!none && toks.iter().any(|token| token == "line-through"));
         }
         "gap" | "grid-gap" => {
             let values = split_ws_paren(value);
@@ -3036,7 +3036,7 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
         ),
         "text-decoration" | "text-decoration-line" => lower
             .split_whitespace()
-            .all(|token| matches!(token, "none" | "underline")),
+            .all(|token| matches!(token, "none" | "underline" | "overline" | "line-through")),
         "line-height" => lower == "normal" || finite_number(value) || dimension(value, false),
         "gap" | "grid-gap" => dimensions(value, false, 2),
         "row-gap" | "grid-row-gap" | "column-gap" | "grid-column-gap" | "-webkit-column-gap" => {

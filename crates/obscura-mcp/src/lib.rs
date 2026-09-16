@@ -100,7 +100,9 @@ impl BrowserState {
         if self.active_tab.is_none() {
             self.tab_counter += 1;
             let id = format!("tab-{}", self.tab_counter);
-            self.tabs.insert(id.clone(), Page::new("mcp-page".to_string(), self.context.clone()));
+            let page = Page::new("mcp-page".to_string(), self.context.clone());
+            page.set_console_messages_enabled(true);
+            self.tabs.insert(id.clone(), page);
             self.active_tab = Some(id);
         }
         let id = self.active_tab.as_ref().unwrap().clone();
@@ -111,7 +113,9 @@ impl BrowserState {
     fn new_tab(&mut self) -> String {
         self.tab_counter += 1;
         let id = format!("tab-{}", self.tab_counter);
-        self.tabs.insert(id.clone(), Page::new(format!("mcp-{id}"), self.context.clone()));
+        let page = Page::new(format!("mcp-{id}"), self.context.clone());
+        page.set_console_messages_enabled(true);
+        self.tabs.insert(id.clone(), page);
         self.active_tab = Some(id.clone());
         self.interactive_refs.clear();
         id
@@ -1164,6 +1168,7 @@ async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String,
 
 fn tool_network_requests(state: &mut BrowserState) -> Result<String, String> {
     let page = state.page_mut();
+    page.sync_js_network_events();
     let events = &page.network_events;
 
     if events.is_empty() {
@@ -1177,7 +1182,13 @@ fn tool_network_requests(state: &mut BrowserState) -> Result<String, String> {
     Ok(lines.join("\n"))
 }
 
-fn tool_console_messages(state: &BrowserState) -> Result<String, String> {
+fn tool_console_messages(state: &mut BrowserState) -> Result<String, String> {
+    let messages = state.page_mut().take_pending_console_messages();
+    state.console_messages.extend(messages);
+    if state.console_messages.len() > 1_024 {
+        let overflow = state.console_messages.len() - 1_024;
+        state.console_messages.drain(..overflow);
+    }
     if state.console_messages.is_empty() {
         Ok("No console messages.".to_string())
     } else {
@@ -2167,6 +2178,38 @@ mod tests {
         assert_eq!(invalid_pdf["isError"], true);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn console_tool_returns_page_messages() {
+        const PAGE: &str = "data:text/html,<button id=log>Log</button><script>\
+            console.error('mcp-console-inline');\
+            document.getElementById('log').onclick=()=>{\
+                console.error('mcp-console-click');\
+                setTimeout(()=>{console.error('mcp-console-async');document.body.id='done'},25)\
+            }</script>";
+        let mut state = BrowserState::new(None, None, false);
+        state
+            .page_mut()
+            .navigate(PAGE)
+            .await
+            .expect("console test page should navigate");
+
+        let inline = tool_console_messages(&mut state).expect("console tool should succeed");
+        assert!(
+            inline.contains("mcp-console-inline"),
+            "inline console message missing from MCP output: {inline}"
+        );
+
+        tool_click(&json!({ "selector": "#log" }), &mut state)
+            .await
+            .expect("console test button should be clickable");
+        tool_wait_for(&json!({ "selector": "#done", "timeout": 2 }), &mut state)
+            .await
+            .expect("asynchronous console callback should complete");
+        let later = tool_console_messages(&mut state).expect("console tool should succeed");
+        assert!(later.contains("mcp-console-click"), "{later}");
+        assert!(later.contains("mcp-console-async"), "{later}");
+    }
+
     /// Records the method, path and body of every request it serves, so a test
     /// can assert what actually left the process rather than what the page
     /// believes happened. Serves the issue's form at `/` and 200s everything
@@ -2249,6 +2292,43 @@ mod tests {
         assert!(
             submitted.contains("q=hello"),
             "the submitted body must carry the filled field, got {submitted}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_tool_includes_completed_script_fetches() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (base, requests) = spawn_form_recording_server();
+        let mut state = BrowserState::new(None, None, false);
+        state
+            .page_mut()
+            .navigate(&base)
+            .await
+            .expect("test page should navigate");
+        requests
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the test page itself must be fetched");
+
+        let fetch_url = serde_json::to_string(&format!("{base}/script-request"))
+            .expect("fetch URL should serialize");
+        state.page_mut().evaluate(&format!(
+            "fetch({fetch_url}).then(() => document.body.id = 'fetch-complete')"
+        ));
+        tool_wait_for(
+            &json!({ "selector": "#fetch-complete", "timeout": 2 }),
+            &mut state,
+        )
+        .await
+        .expect("script fetch should complete");
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the script fetch must reach the server");
+        assert!(request.starts_with("GET /script-request"), "got {request}");
+
+        let output = tool_network_requests(&mut state).expect("network tool should succeed");
+        assert!(
+            output.contains("/script-request"),
+            "completed script fetch missing from network history: {output}"
         );
     }
 

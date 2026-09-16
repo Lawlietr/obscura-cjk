@@ -371,7 +371,13 @@ pub async fn handle(
                                 if (!target) return;\
                                 target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter'})));\
                                 if (target.localName === 'textarea') {\
-                                    globalThis.__obscura_setFieldValue(target, 'value', (target.value || '') + '\\n');\
+                                    var value = target.value || '';\
+                                    var start = target.selectionStart, end = target.selectionEnd;\
+                                    start = start == null ? value.length : Math.max(0, Math.min(start, value.length));\
+                                    end = end == null ? start : Math.max(0, Math.min(end, value.length));\
+                                    var lower = Math.min(start, end), upper = Math.max(start, end);\
+                                    globalThis.__obscura_setFieldValue(target, 'value', value.slice(0, lower) + '\\n' + value.slice(upper));\
+                                    target.setSelectionRange(lower + 1, lower + 1);\
                                     target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
                                 } else {\
                                     var form = target.form || (target.closest && target.closest('form'));\

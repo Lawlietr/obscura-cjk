@@ -390,11 +390,14 @@ impl StealthHttpClient {
                 }
             }
 
-            let response_headers: HashMap<String, String> = resp
-                .headers()
-                .iter()
-                .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
-                .collect();
+            let mut response_headers: HashMap<String, String> = HashMap::new();
+            for (k, v) in resp.headers().iter() {
+                crate::client::merge_response_header(
+                    &mut response_headers,
+                    k.as_str().to_lowercase(),
+                    v.to_str().unwrap_or("").to_string(),
+                );
+            }
 
             if status.is_redirection() {
                 if let Some(location) = resp.headers().get("location") {

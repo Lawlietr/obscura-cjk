@@ -1473,34 +1473,48 @@ pub async fn handle(
         }
         "navigateToHistoryEntry" => {
             let entry_id = params.get("entryId").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let target_url = {
+            // Snapshot history and the current cursor BEFORE moving it, so a
+            // navigation that fails can roll back to where the page actually is
+            // instead of leaving currentIndex on an entry it never reached (#920).
+            let (target_url, saved_history, prev_index) = {
                 let page = ctx
                     .get_session_page_mut(session_id)
                     .ok_or("No page for session")?;
                 let url = page.history.get(entry_id).cloned();
+                let snapshot = (page.history.clone(), page.history_index);
                 if url.is_some() {
                     page.set_history_index(entry_id);
                 }
-                url
+                (url, snapshot.0, snapshot.1)
             };
             if let Some(url) = target_url {
-                // Stash + restore history so push_history doesn't clobber
-                // the cursor we just moved.
-                let stash = {
-                    let page = ctx
-                        .get_session_page_mut(session_id)
-                        .ok_or("No page for session")?;
-                    (page.history.clone(), page.history_index)
-                };
-                let (frame_id, page_id, network_events, page_url, reached_idle) = {
+                let nav_result = {
                     let page = ctx
                         .get_session_page_mut(session_id)
                         .ok_or("No page for session")?;
                     page.navigate_with_wait(&url, WaitUntil::DomContentLoaded)
                         .await
-                        .map_err(|e| e.to_string())?;
-                    page.history = stash.0;
-                    page.history_index = stash.1;
+                };
+                // navigate_with_wait's push_history rewrote history during the
+                // load, so restore the snapshot either way. On failure the page
+                // never moved — put the cursor back where it was (#920).
+                if let Err(e) = nav_result {
+                    if let Some(page) = ctx.get_session_page_mut(session_id) {
+                        page.history = saved_history;
+                        page.history_index = prev_index;
+                    }
+                    return Err(e.to_string());
+                }
+                let (frame_id, page_id, network_events, page_url, reached_idle) = {
+                    let page = ctx
+                        .get_session_page_mut(session_id)
+                        .ok_or("No page for session")?;
+                    page.history = saved_history;
+                    page.history_index = entry_id;
+                    // Flush script-initiated network events before draining,
+                    // matching do_navigate — otherwise fetch/XHR requests the
+                    // navigated page starts are dropped from CDP events (#920).
+                    page.sync_js_network_events();
                     (
                         page.frame_id.clone(),
                         page.id.clone(),
@@ -1746,6 +1760,76 @@ fn timestamp() -> f64 {
 mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
+
+    // #920: a history navigation that fails to load must not move the recorded
+    // currentIndex — the page never actually went anywhere, so a later
+    // getNavigationHistory must still report where it really is.
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_history_navigation_leaves_current_index_unchanged() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        {
+            let page = ctx.get_session_page_mut(&session).unwrap();
+            page.history = vec![
+                "data:text/html,<p>ok</p>".to_string(),
+                "not-a-url".to_string(),
+            ];
+            page.history_index = 0;
+        }
+
+        let res = handle(
+            "navigateToHistoryEntry",
+            &json!({ "entryId": 1 }),
+            &mut ctx,
+            &session,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "navigating to an invalid entry URL must fail, got {res:?}"
+        );
+
+        let index = ctx.get_session_page(&session).unwrap().history_index;
+        assert_eq!(
+            index, 0,
+            "a failed history navigation must leave currentIndex where the page actually is"
+        );
+    }
+
+    // Guard the success path (there was no coverage): a valid back-navigation
+    // moves currentIndex to the target entry and preserves the history list.
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_navigation_moves_current_index_on_success() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        {
+            let page = ctx.get_session_page_mut(&session).unwrap();
+            page.history = vec![
+                "data:text/html,<title>a</title>".to_string(),
+                "data:text/html,<title>b</title>".to_string(),
+            ];
+            page.history_index = 1;
+        }
+
+        handle(
+            "navigateToHistoryEntry",
+            &json!({ "entryId": 0 }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigating back to a valid entry must succeed");
+
+        let page = ctx.get_session_page(&session).unwrap();
+        assert_eq!(page.history_index, 0, "currentIndex must move to the target entry");
+        assert_eq!(page.history.len(), 2, "history must be preserved across the navigation");
+    }
 
     // #833: chromiumoxide's new_page waits for the initial target's "load"
     // lifecycle event before returning. Page.enable on a freshly created

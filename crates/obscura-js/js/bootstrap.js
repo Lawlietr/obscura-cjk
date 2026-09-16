@@ -52,6 +52,7 @@
     // Pre-declaring them non-enumerable here is enough -- per the note above,
     // the later `globalThis.X = X` assignments only update the value.
     'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType',
+    'Navigator', 'PluginArray', 'Plugin', 'MimeType', 'MimeTypeArray',
     'Animation', 'KeyframeEffect', 'DocumentTimeline',
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
     'CSSStyleDeclaration', 'DOMStringMap', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
@@ -705,6 +706,17 @@ const _formValues = globalThis._formValues;
 const _formChecked = globalThis._formChecked;
 const _formIndeterminate = globalThis._formIndeterminate;
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
+const _formStateLoaded = new Set();
+function _loadFormState(nid) {
+  if (_formStateLoaded.has(nid)) return;
+  const state = _domParse("get_form_state", nid);
+  if (state) {
+    if (state.value !== null) _formValues[nid] = state.value;
+    if (state.checked !== null) _formChecked[nid] = state.checked;
+    if (state.indeterminate) _formIndeterminate[nid] = true;
+  }
+  _formStateLoaded.add(nid);
+}
 
 // HTML "ASCII whitespace": U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
 // Class token splitting (classList, getElementsByClassName) uses exactly this set.
@@ -2126,6 +2138,12 @@ class Node {
   }
   appendChild(c) {
     if (!c) return c;
+    if (this instanceof CharacterData) {
+      throw new DOMException(
+        "Failed to execute 'appendChild' on 'Node': This node type cannot have children.",
+        "HierarchyRequestError",
+      );
+    }
     if (c instanceof DocumentFragment) {
       const children = Array.from(c.childNodes);
       for (const child of children) this.appendChild(child);
@@ -2263,7 +2281,10 @@ class Node {
     }
     return n;
   }
-  contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
+  contains(o) {
+    if (o === this) return true;
+    return o ? _dom("contains", this._nid, o._nid) === "true" : false;
+  }
   hasChildNodes() { return _dom("has_child_nodes", this._nid) === "true"; }
   cloneNode(deep) {
     const t = this.nodeType;
@@ -2372,7 +2393,7 @@ class Node {
     }
     return true;
   }
-  isSameNode(other) { return other && this._nid === other._nid; }
+  isSameNode(other) { return !!other && this._nid === other._nid; }
   addEventListener(type, callback, options) {
     _eventTargetAdd(this, type, callback, options);
   }
@@ -2389,27 +2410,46 @@ class CharacterData extends Node {
   }
   set data(v) {
     const oldValue = _domParse("text_content", this._nid) ?? "";
-    _dom("set_text_content", this._nid, String(v ?? ""));
+    _dom("set_text_content", this._nid, v === null ? "" : String(v));
     if (globalThis.__mutationObservers?.length) {
       globalThis.__notifyMutation('characterData', this._nid, [], [], null, oldValue);
     }
   }
   get length() { return this.data.length; }
   substringData(offset, count) {
-    return this.data.substring(offset, offset + count);
-  }
-  appendData(s) { this.data += s; }
-  insertData(offset, s) {
+    if (arguments.length < 2) throw new TypeError("CharacterData.substringData requires 2 arguments");
     const d = this.data;
-    this.data = d.slice(0, offset) + s + d.slice(offset);
+    offset = offset >>> 0;
+    count = count >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
+    return d.slice(offset, offset + count);
+  }
+  appendData(s) {
+    if (arguments.length < 1) throw new TypeError("CharacterData.appendData requires 1 argument");
+    this.data = this.data + String(s);
+  }
+  insertData(offset, s) {
+    if (arguments.length < 2) throw new TypeError("CharacterData.insertData requires 2 arguments");
+    const d = this.data;
+    offset = offset >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
+    this.data = d.slice(0, offset) + String(s) + d.slice(offset);
   }
   deleteData(offset, count) {
+    if (arguments.length < 2) throw new TypeError("CharacterData.deleteData requires 2 arguments");
     const d = this.data;
+    offset = offset >>> 0;
+    count = count >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
     this.data = d.slice(0, offset) + d.slice(offset + count);
   }
   replaceData(offset, count, s) {
+    if (arguments.length < 3) throw new TypeError("CharacterData.replaceData requires 3 arguments");
     const d = this.data;
-    this.data = d.slice(0, offset) + s + d.slice(offset + count);
+    offset = offset >>> 0;
+    count = count >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
+    this.data = d.slice(0, offset) + String(s) + d.slice(offset + count);
   }
 }
 
@@ -2419,8 +2459,10 @@ class Text extends CharacterData {
   get wholeText() { return this.data; }
   splitText(offset) {
     const d = this.data;
-    const tail = d.substring(offset);
-    this.data = d.substring(0, offset);
+    offset = offset >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
+    const tail = d.slice(offset);
+    this.data = d.slice(0, offset);
     const newNid = +_dom("create_text_node", tail);
     const parent = this.parentNode;
     if (parent) {
@@ -3972,6 +4014,7 @@ class Element extends Node {
       if (opts.length) return opts[0].getAttribute('value') !== null ? opts[0].getAttribute('value') : opts[0].textContent;
       return '';
     }
+    if (_formValues[this._nid] === undefined) _loadFormState(this._nid);
     if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
     if (tag === 'textarea') return this.textContent;
     if (tag === 'option') {
@@ -4023,9 +4066,11 @@ class Element extends Node {
       }
       return;
     }
-    _formValues[this._nid] = String(v);
+    const value = String(v);
+    _formValues[this._nid] = value;
+    _dom("set_form_value", this._nid, value);
     if (tag === 'textarea') {
-      this.textContent = String(v);
+      this.textContent = value;
     }
   }
   get min() { return this.getAttribute('min') || ''; }
@@ -4101,17 +4146,28 @@ class Element extends Node {
     this.value = _inputFormatNumber(t, value);
   }
   get checked() {
+    if (_formChecked[this._nid] === undefined) _loadFormState(this._nid);
     if (_formChecked[this._nid] !== undefined) return _formChecked[this._nid];
     return this.hasAttribute("checked");
   }
-  set checked(v) { _formChecked[this._nid] = !!v; }
+  set checked(v) {
+    const checked = !!v;
+    _formChecked[this._nid] = checked;
+    _dom("set_form_checked", this._nid, String(checked));
+  }
   // `indeterminate` is IDL-only: it has no content attribute to reflect, so
   // the property itself must exist on the prototype for `'indeterminate' in
-  // el` to be true on a freshly created element. It is node-keyed like
-  // `checked` because element wrappers are rebuilt on each lookup, so a
-  // per-instance field would not survive getElementById returning a new one.
-  get indeterminate() { return _formIndeterminate[this._nid] === true; }
-  set indeterminate(v) { _formIndeterminate[this._nid] = !!v; }
+  // el` to be true on a freshly created element. Native node-keyed state
+  // keeps IDL access and rendering consistent without changing attributes.
+  get indeterminate() {
+    if (_formIndeterminate[this._nid] === undefined) _loadFormState(this._nid);
+    return _formIndeterminate[this._nid] === true;
+  }
+  set indeterminate(v) {
+    const indeterminate = !!v;
+    _formIndeterminate[this._nid] = indeterminate;
+    _dom("set_form_indeterminate", this._nid, String(indeterminate));
+  }
   get selected() {
     if (this._selected !== undefined) return this._selected;
     return this.hasAttribute("selected");
@@ -5324,7 +5380,10 @@ class Document extends Node {
   }
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
-  getElementById(id) { return _wrapEl(+_dom("get_element_by_id", id)); }
+  getElementById(id) {
+    const needle = String(id);
+    return needle === "" ? null : _wrapEl(+_dom("get_element_by_id", needle));
+  }
   querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
   querySelectorAll(s) {
     const ids = _domParse("query_selector_all", s) || [];
@@ -6453,6 +6512,12 @@ function _elementClassFor(nid) {
   }
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
   if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
+  // Only HTML slots take part in slot assignment; a foreign-namespace "SLOT"
+  // (createElementNS + cloneNode lands here) stays a plain Element.
+  if (tag === "SLOT" && globalThis.HTMLSlotElement
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+    return globalThis.HTMLSlotElement;
+  }
   if (tag === "IMG") return HTMLImageElement;
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
   if (tag === "AUDIO") return HTMLAudioElement;
@@ -6473,6 +6538,7 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     const tag = localName.toUpperCase();
     if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
     if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
+    if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
     if (tag === "IMG") return HTMLImageElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
     if (tag === "AUDIO") return HTMLAudioElement;
@@ -6745,6 +6811,12 @@ Object.defineProperty(MimeTypeArray.prototype, Symbol.toStringTag, {value: 'Mime
 _markNative(MimeTypeArray);
 _markNative(MimeTypeArray.prototype.item);
 _markNative(MimeTypeArray.prototype.namedItem);
+
+globalThis.Navigator = Navigator;
+globalThis.PluginArray = PluginArray;
+globalThis.Plugin = Plugin;
+globalThis.MimeType = MimeType;
+globalThis.MimeTypeArray = MimeTypeArray;
 
 class NetworkInformation {
   constructor() { this._listeners = Object.create(null); }
@@ -7200,7 +7272,11 @@ globalThis.fetch = async (input, init = {}) => {
   // whether the input is absolute. _resolveUrl leaves absolute URLs
   // unchanged and keeps unparseable input as-is.
   url = _resolveUrl(url);
-  const method = init.method || (request ? request.method : "GET");
+  // Normalize the method to uppercase, matching the Request constructor, so
+  // fetch(url, {method:"delete"}) and new Request(url, {method:"delete"}) agree
+  // and lowercase standard methods are not rejected by the case-sensitive CORS
+  // checks (#969).
+  const method = String(init.method || (request ? request.method : "GET")).toUpperCase();
   const headers = init.headers !== undefined ? init.headers : (request ? request.headers : undefined);
   let _h = headers instanceof Headers ? Object.fromEntries(headers.entries()) : (headers || {});
   const inheritsRequestBody = init.body === undefined && request !== null;
@@ -10399,35 +10475,46 @@ function _xmlWellFormed(src) {
   return stack.length === 0 && rootsClosed === 1;
 }
 
+// The parsererror detail quotes tag names taken from the input, and it is
+// written through innerHTML, so `<` and `&` have to stop being markup.
+const _escapeXmlErrorText = (text) =>
+  String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
 globalThis.DOMParser = class DOMParser {
   parseFromString(source, mimeType) {
     const html = String(source ?? "");
     const isXml = typeof mimeType === "string" && /xml/i.test(mimeType);
     const root = document.createElement("html");
 
-    // For XML mime types, check well-formedness first (conservative: only
-    // clear errors like tag mismatch / extra root are flagged).  If the
-    // check fires, build a <parsererror> root so callers doing
-    // doc.querySelector('parsererror') get the same signal as in Chrome.
+    // For XML mime types, surface a <parsererror> on clearly-malformed input so
+    // error-detection code (doc.querySelector('parsererror')) works, matching
+    // Chrome. obscura has no XML parser, so the tree stays HTML-parsed.
+    //
+    // Two checks, one decision. `_xmlWellFormed` is the stricter of the pair --
+    // it also rejects input with no root element at all, and an unterminated
+    // comment/CDATA/PI -- so it decides whether this is an error. What it cannot
+    // do is say why: it returns a bool. `_checkXmlWellFormed` names the fault,
+    // so its message fills the <div> when it has one.
+    //
+    // These used to run as two independent blocks, the second overwriting the
+    // first. Since the stricter check flags everything the descriptive one
+    // flags, the description never reached a caller.
     const xmlError = isXml ? _checkXmlWellFormed(html) : null;
-    const isParserError = xmlError && !xmlError.wellFormed;
+    const isParserError = isXml && (!_xmlWellFormed(html) || !xmlError.wellFormed);
     if (isParserError) {
-      root.innerHTML = '<parsererror>' + xmlError.error + '</parsererror>';
+      const detail = (xmlError && xmlError.error) || 'error while parsing XML';
+      try {
+        root.innerHTML =
+          '<parsererror xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:<div>' +
+          _escapeXmlErrorText(detail) +
+          '</div></parsererror>';
+      } catch (e) { /* ignore */ }
     } else {
       // innerHTML parses children via html5ever fragment-parsing rules. Most
       // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
       // fragment parser strips the outer `<html>` and emits its head+body
       // children, which is what callers want.
       try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
-    }
-
-    // For XML mime types, surface a <parsererror> on clearly-malformed input so
-    // error-detection code (doc.querySelector('parsererror')) works, matching
-    // Chrome. obscura has no XML parser, so the tree stays HTML-parsed.
-    if (isXml && !_xmlWellFormed(html)) {
-      try {
-        root.innerHTML = '<parsererror xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:<div>error while parsing XML</div></parsererror>';
-      } catch (e) { /* ignore */ }
     }
 
     // Helper: depth-first walk to find an element by predicate.
@@ -11615,7 +11702,22 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
   get length() { return this.elements.length; }
   // Inherit submit() from Element.prototype: it dispatches the cancelable
   // 'submit' event and (if not prevented) builds form data and navigates.
-  reset() { for (const f of this.elements) { if ('value' in f) f.value = ''; } }
+  reset() {
+    if (!this.dispatchEvent(new Event('reset', { bubbles: true, cancelable: true }))) return;
+    for (const f of this.elements) {
+      if (f.localName === 'input') {
+        const type = (f.getAttribute('type') || 'text').toLowerCase();
+        if (type === 'checkbox' || type === 'radio') {
+          f.checked = f.hasAttribute('checked');
+          f.indeterminate = false;
+        } else {
+          f.value = f.getAttribute('value') || '';
+        }
+      } else if ('value' in f) {
+        f.value = '';
+      }
+    }
+  }
 };
 globalThis.HTMLSelectElement = Element;
 globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
@@ -11655,7 +11757,54 @@ globalThis.HTMLLIElement = Element;
 globalThis.HTMLPreElement = Element;
 globalThis.HTMLHeadingElement = Element;
 globalThis.HTMLTemplateElement = Element;
-globalThis.HTMLSlotElement = Element;
+// <slot> needs its own brand: with `HTMLSlotElement = Element` every element
+// was an instance, but assignedElements() did not exist, so the common
+// `el instanceof HTMLSlotElement && el.assignedElements()` guard (Swiper's
+// getChildren helper, seen on idealo's search result slider) threw a
+// TypeError on a plain <div>.
+//
+// Direct assignment comes from the native DomTree::assigned_nodes (the same
+// named-slot algorithm the renderer uses: only HTML slots inside a shadow
+// tree, first same-name slot in tree order wins, elements match on their
+// `slot` attribute, text nodes go to the default slot). `flatten` walks
+// nested slots with a work list and falls back to a slot's own slottable
+// children. Limits: manual slot assignment (`slotAssignment: "manual"`,
+// `slot.assign()`) assigns nothing (fallback only); no `slotchange` events.
+function _slotDirectAssigned(slot) {
+  const ids = _domParse("assigned_nodes", slot._nid);
+  if (ids === null || ids === undefined) return null; // not an HTML slot in a shadow tree
+  const root = slot.getRootNode();
+  if (root instanceof ShadowRoot && root.slotAssignment === 'manual') return [];
+  return ids.map(_wrap).filter(Boolean);
+}
+function _slotFallbackChildren(slot) {
+  const out = [];
+  for (let child = slot.firstChild; child; child = child.nextSibling) {
+    if (child.nodeType === 1 || child.nodeType === 3) out.push(child);
+  }
+  return out;
+}
+function _slotAssignedNodes(slot, flatten) {
+  const assigned = _slotDirectAssigned(slot);
+  if (assigned === null) return [];
+  if (!flatten) return assigned;
+  const out = [];
+  const work = (assigned.length ? assigned : _slotFallbackChildren(slot)).reverse();
+  while (work.length) {
+    const node = work.pop();
+    const nested = node.nodeType === 1 ? _slotDirectAssigned(node) : null;
+    if (nested === null) { out.push(node); continue; }
+    const inner = nested.length ? nested : _slotFallbackChildren(node);
+    for (let i = inner.length - 1; i >= 0; i--) work.push(inner[i]);
+  }
+  return out;
+}
+globalThis.HTMLSlotElement = class HTMLSlotElement extends Element {
+  get name() { return this.getAttribute('name') || ''; }
+  set name(v) { this.setAttribute('name', String(v)); }
+  assignedNodes(options) { return _slotAssignedNodes(this, !!(options && options.flatten)); }
+  assignedElements(options) { return this.assignedNodes(options).filter(n => n.nodeType === 1); }
+};
 globalThis.HTMLOptionElement = Element;
 globalThis.HTMLDataListElement = Element;
 globalThis.HTMLFieldSetElement = Element;

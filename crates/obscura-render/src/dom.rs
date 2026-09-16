@@ -3232,7 +3232,7 @@ pub fn layout_dom_with_resources(
     let fonts: Vec<_> = fonts
         .iter()
         .map(|data| crate::inline::WebFont {
-            data: data.clone(),
+            data: std::sync::Arc::new(data.clone()),
             family: None,
             weight: None,
             italic: None,
@@ -4074,6 +4074,59 @@ fn retained_style_plan(
         dirty,
         has_animation_damage,
     }
+}
+
+/// A selector-only `tabindex` mutation cannot change layout or paint when the
+/// current stylesheet has no dependency on it. Keep this deliberately narrow:
+/// other zero-dirty attributes can still affect native geometry.
+pub(crate) fn can_retain_layout_for_tabindex(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    cache: &mut crate::css::StylesheetCache,
+    mutations: &[RetainedStyleMutation],
+) -> bool {
+    if mutations.is_empty()
+        || !mutations.iter().all(|mutation| {
+            matches!(mutation, RetainedStyleMutation::Attribute(attribute)
+                if attribute.name.eq_ignore_ascii_case("tabindex")
+                    && retained_attribute_mutation_kind(tree, attribute.node, &attribute.name)
+                        == RetainedAttributeMutationKind::Selector)
+        })
+    {
+        return false;
+    }
+
+    let nodes = tree.descendants(tree.document());
+    if nodes.iter().any(|node| tree.shadow_root(*node).is_some()) {
+        return false;
+    }
+    let sources = nodes
+        .into_iter()
+        .filter_map(|id| {
+            let node = tree.get_node(id)?;
+            let element = node.as_element()?;
+            (element.local.as_ref() == "style"
+                && node.get_attribute("media").is_none_or(|media| {
+                    media.trim().is_empty()
+                        || crate::css::media_query_applies_for_viewport_and_type(
+                            media,
+                            viewport,
+                            crate::CssMediaType::Screen,
+                        )
+                }))
+            .then(|| tree.text_content(id))
+        })
+        .collect::<Vec<_>>();
+    let (sheet, cache_hit) =
+        cache.get_or_parse(tree, &sources, viewport, crate::CssMediaType::Screen);
+    cache_hit
+        && matches!(
+            retained_style_plan(tree, &sheet, mutations),
+            RetainedStylePlan::Reuse {
+                dirty,
+                has_animation_damage: false,
+            } if dirty.is_empty()
+        )
 }
 
 pub(crate) fn layout_dom_with_web_fonts(
@@ -16867,6 +16920,72 @@ mod tests {
     }
 
     #[test]
+    fn unreferenced_tabindex_can_retain_layout_but_css_dependencies_cannot() {
+        for (css, reusable) in [
+            ("#target { width: 80px }", true),
+            ("[tabindex] { width: 160px }", false),
+            ("p::before { content: attr(tabindex) }", false),
+            ("section:has([tabindex]) p { height: 50px }", false),
+        ] {
+            let tree = parse_html(&format!(
+                "<style>{css}</style><section><p id=target>text</p></section>"
+            ));
+            let target = tree.get_element_by_id("target").unwrap();
+            let viewport = (500.0, 300.0);
+            let mut cache = crate::css::StylesheetCache::default();
+            let _ = layout_dom_with_web_fonts_and_stylesheet_cache(
+                &tree,
+                viewport,
+                &HashMap::new(),
+                &[],
+                &mut cache,
+            );
+            let mutation = |name: &str| {
+                RetainedStyleMutation::Attribute(AttributeStyleMutation {
+                    node: target,
+                    name: name.into(),
+                    old_value: None,
+                    new_value: Some("0".into()),
+                })
+            };
+
+            assert_eq!(
+                can_retain_layout_for_tabindex(
+                    &tree,
+                    viewport,
+                    &mut cache,
+                    &[mutation("tabindex")],
+                ),
+                reusable,
+                "{css}"
+            );
+            for name in ["data-sized", "style", "hidden", "open"] {
+                assert!(
+                    !can_retain_layout_for_tabindex(
+                        &tree,
+                        viewport,
+                        &mut cache,
+                        &[mutation(name)],
+                    ),
+                    "{name}"
+                );
+            }
+            assert!(!can_retain_layout_for_tabindex(
+                &tree,
+                viewport,
+                &mut cache,
+                &[RetainedStyleMutation::Resource],
+            ));
+            assert!(!can_retain_layout_for_tabindex(
+                &tree,
+                (600.0, 300.0),
+                &mut cache,
+                &[mutation("tabindex")],
+            ));
+        }
+    }
+
+    #[test]
     fn retained_nested_universal_container_reset_is_bounded_and_matches_full() {
         let mut queried = String::new();
         let mut clean = String::new();
@@ -19853,7 +19972,9 @@ mod tests {
             (500.0, 150.0),
             &HashMap::new(),
             &[crate::inline::WebFont {
-                data: include_bytes!("../assets/liberation-serif.ttf").to_vec(),
+                data: std::sync::Arc::new(
+                    include_bytes!("../assets/liberation-serif.ttf").to_vec(),
+                ),
                 family: Some("Fixture".to_string()),
                 weight: Some((400, 400)),
                 italic: Some(false),
@@ -19904,7 +20025,9 @@ mod tests {
             (500.0, 150.0),
             &HashMap::new(),
             &[crate::inline::WebFont {
-                data: include_bytes!("../assets/liberation-serif.ttf").to_vec(),
+                data: std::sync::Arc::new(
+                    include_bytes!("../assets/liberation-serif.ttf").to_vec(),
+                ),
                 family: Some("Fixture".to_string()),
                 weight: Some((400, 400)),
                 italic: Some(false),

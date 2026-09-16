@@ -43,7 +43,14 @@ pub enum InterceptResolution {
     Fulfill {
         status: u16,
         headers: HashMap<String, String>,
+        /// Lossy UTF-8 view of the fulfilled body, for text consumers.
         body: String,
+        /// The exact fulfilled body as standard base64. CDP delivers the
+        /// fulfillRequest body base64-encoded; carrying it through unchanged
+        /// lets the bootstrap fetch layer reconstruct the exact bytes
+        /// (`_base64ToUint8Array`) instead of a `from_utf8_lossy` corruption
+        /// of any non-UTF-8 payload (image, font, protobuf). See #912.
+        body_base64: String,
     },
     Fail {
         reason: String,
@@ -133,6 +140,8 @@ pub struct ObscuraState {
     // The CDP layer drains this after commands and autonomous event-loop turns.
     pub pending_runtime_events: VecDeque<RuntimeEvent>,
     pub runtime_events_enabled: bool,
+    pub pending_console_messages: VecDeque<String>,
+    pub console_messages_enabled: bool,
     pub runtime_exception_counter: u64,
     pub network_response_bodies: HashMap<String, StoredNetworkResponseBody>,
     pub network_response_body_order: VecDeque<String>,
@@ -218,6 +227,40 @@ pub struct ObscuraState {
     #[cfg(feature = "render")]
     pub render_image_in_flight:
         HashMap<(u64, String, ImageRequestProfile), Vec<tokio::sync::oneshot::Sender<()>>>,
+    /// Page-transport loads for resources that cache-only layout or paint
+    /// missed. The owning page fetches them and sends the outcome here; the
+    /// runtime applies results at its own event-loop turns and at every
+    /// promise wait, so a script polling geometry sees them. `document_generation`
+    /// in each result fences a previous document's late answer.
+    #[cfg(feature = "render")]
+    pub render_resource_tx: tokio::sync::mpsc::UnboundedSender<RenderResourceLoad>,
+    #[cfg(feature = "render")]
+    pub render_resource_rx: tokio::sync::mpsc::UnboundedReceiver<RenderResourceLoad>,
+    /// Resources currently loading through the page transport, so repeated
+    /// misses never duplicate a request.
+    #[cfg(feature = "render")]
+    pub render_resource_in_flight:
+        std::collections::HashSet<(String, Option<ImageRequestProfile>, bool)>,
+    /// Applied transport responses the page still has to report as
+    /// Network events (recording needs the page, not the runtime).
+    #[cfg(feature = "render")]
+    pub render_resource_events: Vec<RenderResourceEvent>,
+    /// `Fetch.enable` URL patterns mirrored from the owning page, so the
+    /// renderer's resource loads follow the same interception policy as the
+    /// page's own subresource fetches (a matching URL is not fetched here).
+    #[cfg(feature = "render")]
+    pub intercept_block_patterns: Vec<String>,
+    /// Background transport tasks of this document, one page-wide
+    /// concurrency limit shared by all of them, a wake-up for waiters, and
+    /// requests that could not be started outside a Tokio context.
+    #[cfg(feature = "render")]
+    pub render_resource_tasks: Vec<tokio::task::JoinHandle<()>>,
+    #[cfg(feature = "render")]
+    pub render_resource_limiter: Arc<tokio::sync::Semaphore>,
+    #[cfg(feature = "render")]
+    pub render_resource_notify: Arc<tokio::sync::Notify>,
+    #[cfg(feature = "render")]
+    pub render_resource_backlog: Vec<(String, Option<ImageRequestProfile>, bool)>,
     /// One exact-key compiled author stylesheet for this document. Connected
     /// mutations still discard `prepared_render`; the next prepare reuses only
     /// parsing/indexing when ordered CSS source and viewport remain identical.
@@ -294,6 +337,8 @@ pub struct PendingFrameMessage {
 
 impl ObscuraState {
     pub fn new() -> Self {
+        #[cfg(feature = "render")]
+        let (render_resource_tx, render_resource_rx) = tokio::sync::mpsc::unbounded_channel();
         ObscuraState {
             dom: None,
             url: "about:blank".to_string(),
@@ -313,6 +358,8 @@ impl ObscuraState {
             pending_binding_calls: Vec::new(),
             pending_runtime_events: VecDeque::new(),
             runtime_events_enabled: false,
+            pending_console_messages: VecDeque::new(),
+            console_messages_enabled: false,
             runtime_exception_counter: 0,
             network_response_bodies: HashMap::new(),
             network_response_body_order: VecDeque::new(),
@@ -349,6 +396,26 @@ impl ObscuraState {
             render_resources: obscura_render::RenderResourceCache::default(),
             #[cfg(feature = "render")]
             render_image_in_flight: HashMap::new(),
+            #[cfg(feature = "render")]
+            render_resource_tx,
+            #[cfg(feature = "render")]
+            render_resource_rx,
+            #[cfg(feature = "render")]
+            render_resource_in_flight: std::collections::HashSet::new(),
+            #[cfg(feature = "render")]
+            render_resource_events: Vec::new(),
+            #[cfg(feature = "render")]
+            intercept_block_patterns: Vec::new(),
+            #[cfg(feature = "render")]
+            render_resource_tasks: Vec::new(),
+            #[cfg(feature = "render")]
+            render_resource_limiter: Arc::new(tokio::sync::Semaphore::new(
+                RENDER_RESOURCE_CONCURRENCY,
+            )),
+            #[cfg(feature = "render")]
+            render_resource_notify: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(feature = "render")]
+            render_resource_backlog: Vec::new(),
             #[cfg(feature = "render")]
             stylesheet_cache: obscura_render::StylesheetCache::default(),
             #[cfg(feature = "render")]
@@ -682,6 +749,19 @@ fn render_mutation_impact(
 ) -> RenderMutationImpact {
     let node = |value: &str| value.parse::<u32>().ok().map(NodeId::new);
     match cmd {
+        "set_form_value" | "set_form_checked" | "set_form_indeterminate" => {
+            let Some(target) = node(arg1) else {
+                return RenderMutationImpact::default();
+            };
+            let actual_change = match cmd {
+                "set_form_value" => !dom.form_control_value_matches(target, arg2),
+                "set_form_checked" => {
+                    dom.form_control_checked(target) != Some(arg2 == "true")
+                }
+                _ => dom.form_control_indeterminate(target) != (arg2 == "true"),
+            };
+            RenderMutationImpact { connected: node_is_connected(dom, target), actual_change }
+        }
         "set_attribute" => {
             let Some(target) = node(arg1) else {
                 return RenderMutationImpact::default();
@@ -1028,6 +1108,73 @@ pub(crate) fn queue_retained_style_mutation(
     true
 }
 
+/// Page-wide limit on concurrent background render-resource requests: the
+/// bound the navigation warmup stream always had, now shared by every load
+/// of the document however many scans or layout misses queue them.
+#[cfg(feature = "render")]
+pub const RENDER_RESOURCE_CONCURRENCY: usize = 16;
+
+/// One finished page-transport load for the renderer cache.
+#[cfg(feature = "render")]
+#[derive(Debug)]
+pub struct RenderResourceLoad {
+    /// `document_generation` the request was made for.
+    pub generation: u64,
+    pub url: String,
+    pub profile: Option<ImageRequestProfile>,
+    pub is_font: bool,
+    /// Final URL, status, headers and body of the response; `None` when the
+    /// request failed or was blocked.
+    pub response: Option<RenderResourceResponse>,
+}
+
+#[cfg(feature = "render")]
+#[derive(Debug)]
+pub struct RenderResourceResponse {
+    pub url: String,
+    pub status: u16,
+    pub headers: std::collections::HashMap<String, String>,
+    pub body: Arc<[u8]>,
+}
+
+/// A transport response the runtime applied; the page turns it into the
+/// Network events a client expects for a subresource.
+#[cfg(feature = "render")]
+#[derive(Debug)]
+pub struct RenderResourceEvent {
+    pub is_font: bool,
+    pub response: RenderResourceResponse,
+}
+
+/// Whether this runtime is owned by a page with an asynchronous transport.
+#[cfg(feature = "render")]
+pub(crate) fn has_page_transport(state: &ObscuraState) -> bool {
+    #[cfg(feature = "stealth")]
+    {
+        state.http_client.is_some() || state.stealth_client.is_some()
+    }
+    #[cfg(not(feature = "stealth"))]
+    {
+        state.http_client.is_some()
+    }
+}
+
+/// Build the renderer resource cache for this runtime. A runtime owned by a
+/// page must never let layout or paint open their own synchronous HTTP
+/// requests: the compatibility loader bypasses the page's proxy, cookies,
+/// interception and URL blocking, and it pins V8 for the full network
+/// latency of every unknown asset (retries included). Such runtimes start
+/// cache-only and are fed through the page transport; standalone render
+/// runtimes without a transport keep the compatibility loader.
+#[cfg(feature = "render")]
+pub(crate) fn fresh_render_resources(state: &ObscuraState) -> obscura_render::RenderResourceCache {
+    let mut cache = obscura_render::RenderResourceCache::default();
+    if has_page_transport(state) {
+        cache.set_sync_loading_enabled(false);
+    }
+    cache
+}
+
 /// Rebuild resource-dependent geometry while retaining the previous computed
 /// style graph. Image intrinsic sizes and font metrics can reflow the whole
 /// document, but neither changes selector matching or computed declarations.
@@ -1058,6 +1205,9 @@ fn is_render_mutation_command(cmd: &str) -> bool {
     matches!(
         cmd,
         "set_attribute"
+            | "set_form_value"
+            | "set_form_checked"
+            | "set_form_indeterminate"
             | "remove_attribute"
             | "set_attribute_ns"
             | "remove_attribute_ns"
@@ -1380,6 +1530,28 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
     };
 
     match cmd.as_str() {
+        "get_form_state" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            dom.form_control_state(nid)
+                .map(|control| {
+                    serde_json::json!({
+                        "value": control.value,
+                        "checked": control.checked,
+                        "indeterminate": control.indeterminate,
+                    })
+                    .to_string()
+                })
+                .unwrap_or_else(|| "null".to_string())
+        }
+        "set_form_value" | "set_form_checked" | "set_form_indeterminate" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            dom.update_form_control_state(nid, |control| match cmd.as_str() {
+                "set_form_value" => control.value = Some(arg2.clone()),
+                "set_form_checked" => control.checked = Some(arg2 == "true"),
+                _ => control.indeterminate = arg2 == "true",
+            });
+            "null".to_string()
+        }
         "document_node_id" => dom.document().index().to_string(),
         "document_title" => {
             // The DOM is authoritative after parsing. In particular, script
@@ -1586,6 +1758,20 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .map(|id| id.index() as i32)
                 .collect();
             serde_json::to_string(&ids).unwrap_or("[]".into())
+        }
+        // Nodes directly assigned to an HTML <slot> (named slot assignment; the
+        // first same-name slot in the shadow tree wins). `null` when the node is
+        // not an HTML slot inside a shadow tree, so JS can tell "no slot" from
+        // "slot without assignments" and fall back to the slot's own children.
+        "assigned_nodes" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            match dom.assigned_nodes(NodeId::new(nid)) {
+                Some(ids) => {
+                    let ids: Vec<i32> = ids.iter().map(|id| id.index() as i32).collect();
+                    serde_json::to_string(&ids).unwrap_or("[]".into())
+                }
+                None => "null".into(),
+            }
         }
         "tag_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -2147,6 +2333,13 @@ fn op_console_msg(
 
     let page = state.borrow::<SharedState>().clone();
     let mut page = page.borrow_mut();
+    if page.console_messages_enabled {
+        if page.pending_console_messages.len() >= 1_024 {
+            page.pending_console_messages.pop_front();
+        }
+        page.pending_console_messages
+            .push_back(format!("[{level}] {msg}"));
+    }
     if !page.runtime_events_enabled {
         return;
     }
@@ -2287,6 +2480,39 @@ fn request_origin(request_url: &str) -> Option<String> {
         .map(|url| url.origin().ascii_serialization())
 }
 
+/// Strip headers that must not survive a redirect. On a redirect that changes
+/// origin, credential headers (`Authorization`, `Proxy-Authorization`, an
+/// explicit `Cookie`) are removed so they are not forwarded to a different
+/// origin — matching browsers and the Fetch spec (a cross-origin redirect must
+/// not leak the caller's credentials). When a 301/302/303 downgrades the method
+/// to GET, the request-body headers are removed since the body is dropped.
+fn sanitize_redirect_headers(
+    headers: &mut HashMap<String, String>,
+    crosses_origin: bool,
+    downgraded_to_get: bool,
+) {
+    if crosses_origin {
+        headers.retain(|name, _| {
+            !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "authorization" | "proxy-authorization" | "cookie"
+            )
+        });
+    }
+    if downgraded_to_get {
+        headers.retain(|name, _| {
+            !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "content-type"
+                    | "content-length"
+                    | "content-encoding"
+                    | "content-language"
+                    | "content-location"
+            )
+        });
+    }
+}
+
 fn cors_response_allows(
     credentials: FetchCredentials,
     page_origin: &str,
@@ -2298,6 +2524,184 @@ fn cors_response_allows(
     } else {
         allowed_origin == "*" || allowed_origin == page_origin
     }
+}
+
+fn is_cors_safelisted_method(method: &reqwest::Method) -> bool {
+    matches!(method.as_str(), "GET" | "HEAD" | "POST")
+}
+
+fn is_cors_unsafe_request_header_byte(byte: u8) -> bool {
+    (byte < 0x20 && byte != b'\t')
+        || matches!(
+            byte,
+            b'"' | b'(' | b')' | b':' | b'<' | b'>' | b'?' | b'@' | b'[' | b'\\'
+                | b']' | b'{' | b'}' | 0x7f
+        )
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+                | b'^' | b'_' | b'`' | b'|' | b'~'
+        )
+}
+
+fn is_cors_safelisted_content_type(value: &str) -> bool {
+    if value.bytes().any(is_cors_unsafe_request_header_byte) {
+        return false;
+    }
+
+    // A MIME type must have a valid type/subtype before its parameters. This
+    // is deliberately narrower than merely splitting at ';': malformed values
+    // must not turn an application/json request into a simple request.
+    let essence = value
+        .split_once(';')
+        .map_or(value, |(essence, _)| essence)
+        .trim_matches([' ', '\t']);
+    let Some((type_, subtype)) = essence.split_once('/') else {
+        return false;
+    };
+    if type_.is_empty()
+        || subtype.is_empty()
+        || !type_.bytes().all(is_http_token_byte)
+        || !subtype.bytes().all(is_http_token_byte)
+    {
+        return false;
+    }
+
+    essence.eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        || essence.eq_ignore_ascii_case("multipart/form-data")
+        || essence.eq_ignore_ascii_case("text/plain")
+}
+
+fn decimal_is_at_most(left: &str, right: &str) -> bool {
+    let left = left.trim_start_matches('0');
+    let right = right.trim_start_matches('0');
+    left.len() < right.len() || (left.len() == right.len() && left <= right)
+}
+
+fn is_cors_safelisted_range(value: &str) -> bool {
+    let Some(range) = value.strip_prefix("bytes=") else {
+        return false;
+    };
+    let Some((start, end)) = range.split_once('-') else {
+        return false;
+    };
+    if start.is_empty()
+        || !start.bytes().all(|byte| byte.is_ascii_digit())
+        || !end.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    end.is_empty() || decimal_is_at_most(start, end)
+}
+
+fn is_cors_safelisted_request_header(name: &str, value: &str) -> bool {
+    if value.len() > 128 {
+        return false;
+    }
+    if name.eq_ignore_ascii_case("accept") {
+        return !value.bytes().any(is_cors_unsafe_request_header_byte);
+    }
+    if name.eq_ignore_ascii_case("accept-language")
+        || name.eq_ignore_ascii_case("content-language")
+    {
+        return value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'*' | b',' | b'-' | b'.' | b';' | b'=')
+        });
+    }
+    if name.eq_ignore_ascii_case("content-type") {
+        return is_cors_safelisted_content_type(value);
+    }
+    if name.eq_ignore_ascii_case("range") {
+        return is_cors_safelisted_range(value);
+    }
+    false
+}
+
+/// Return the sorted, lowercase header names that must be authorized by a
+/// CORS preflight. The aggregate safelist cap is observable only on unusual
+/// requests and does not add work to same-origin requests.
+fn cors_unsafe_request_header_names(headers: &HashMap<String, String>) -> Vec<String> {
+    let mut unsafe_names = Vec::new();
+    let mut safelist_value_size = 0usize;
+
+    for (name, value) in headers {
+        if is_cors_safelisted_request_header(name, value) {
+            safelist_value_size = safelist_value_size.saturating_add(value.len());
+        } else {
+            unsafe_names.push(name.to_ascii_lowercase());
+        }
+    }
+    if safelist_value_size > 1024 {
+        unsafe_names.extend(
+            headers
+                .iter()
+                .filter(|(name, value)| is_cors_safelisted_request_header(name, value))
+                .map(|(name, _)| name.to_ascii_lowercase()),
+        );
+    }
+    unsafe_names.sort_unstable();
+    unsafe_names.dedup();
+    unsafe_names
+}
+
+fn parse_cors_header_list<'a>(
+    headers: &'a reqwest::header::HeaderMap,
+    name: &'static str,
+) -> Option<Vec<&'a str>> {
+    let mut items = Vec::new();
+    for value in headers.get_all(name).iter() {
+        let value = value.to_str().ok()?;
+        for item in value.split(',') {
+            let item = item.trim_matches([' ', '\t']);
+            if item.is_empty() || !item.bytes().all(is_http_token_byte) {
+                return None;
+            }
+            items.push(item);
+        }
+    }
+    Some(items)
+}
+
+fn preflight_allows_method(method: &reqwest::Method, allowed: &[&str], credentialed: bool) -> bool {
+    is_cors_safelisted_method(method)
+        || allowed.iter().any(|allowed| {
+            *allowed == method.as_str() || (*allowed == "*" && !credentialed)
+        })
+}
+
+fn preflight_allows_header(name: &str, allowed: &[&str], credentialed: bool) -> bool {
+    allowed
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(name))
+        || (!name.eq_ignore_ascii_case("authorization")
+            && !credentialed
+            && allowed.contains(&"*"))
+}
+
+/// Build the JS-facing result for an intercepted request a CDP client chose to
+/// fulfill (`Fetch.fulfillRequest`). Mirrors the normal fetch result contract:
+/// `body` is a lossy text view and `bodyBase64` carries the exact bytes, which
+/// the bootstrap fetch layer prefers (`_base64ToUint8Array`) so a binary
+/// fulfilled body is delivered intact rather than `from_utf8_lossy`-corrupted.
+/// See #912.
+fn intercept_fulfill_response(
+    status: u16,
+    headers: HashMap<String, String>,
+    body: &str,
+    body_base64: &str,
+    url: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": status,
+        "body": body,
+        "bodyBase64": body_base64,
+        "url": url,
+        "headers": headers,
+    })
 }
 
 #[op2(async)]
@@ -2425,15 +2829,9 @@ async fn op_fetch_url(
                     status,
                     headers: h,
                     body: b,
+                    body_base64: bb,
                 }) => {
-                    let resp_headers: HashMap<String, String> = h;
-                    return Ok(serde_json::json!({
-                        "status": status,
-                        "body": b,
-                        "url": url,
-                        "headers": resp_headers,
-                    })
-                    .to_string());
+                    return Ok(intercept_fulfill_response(status, h, &b, &bb, &url).to_string());
                 }
                 Ok(InterceptResolution::Fail { reason }) => {
                     return Ok(serde_json::json!({
@@ -2533,38 +2931,42 @@ async fn op_fetch_url(
         }
     }
 
+    let unsafe_header_names = if is_cross_origin && mode == "cors" {
+        cors_unsafe_request_header_names(&custom_headers)
+    } else {
+        Vec::new()
+    };
     let needs_preflight = is_cross_origin
         && mode == "cors"
-        && (req_method != reqwest::Method::GET
-            && req_method != reqwest::Method::HEAD
-            && req_method != reqwest::Method::POST
-            || custom_headers.keys().any(|k| {
-                let kl = k.to_lowercase();
-                kl != "accept"
-                    && kl != "accept-language"
-                    && kl != "content-language"
-                    && kl != "content-type"
-            }));
+        && (!is_cors_safelisted_method(&req_method) || !unsafe_header_names.is_empty());
 
     if needs_preflight {
-        let preflight = client
+        let mut preflight_request = client
             .request(reqwest::Method::OPTIONS, &url)
             .timeout(fetch_timeout())
             .header("Origin", &page_origin)
-            .header("Access-Control-Request-Method", method.as_str())
-            .header(
+            .header("Access-Control-Request-Method", method.as_str());
+        if !unsafe_header_names.is_empty() {
+            preflight_request = preflight_request.header(
                 "Access-Control-Request-Headers",
-                custom_headers
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )
+                unsafe_header_names.join(","),
+            );
+        }
+        let preflight = preflight_request
             .send()
             .await
             .map_err(|e| {
                 deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
             })?;
+
+        // Fetch spec: the preflight response's status must be an ok status
+        // before its CORS headers are consulted (#973).
+        if !preflight.status().is_success() {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "CORS preflight returned HTTP {}",
+                preflight.status()
+            )));
+        }
 
         let allowed_origin = preflight
             .headers()
@@ -2581,6 +2983,41 @@ async fn op_fetch_url(
             return Err(deno_error::JsErrorBox::generic(format!(
                 "CORS preflight: Origin '{}' not allowed by Access-Control-Allow-Origin '{}'",
                 page_origin, allowed_origin
+            )));
+        }
+
+        let allowed_methods = parse_cors_header_list(
+            preflight.headers(),
+            "access-control-allow-methods",
+        )
+        .ok_or_else(|| {
+            deno_error::JsErrorBox::generic(
+                "CORS preflight returned an invalid Access-Control-Allow-Methods value",
+            )
+        })?;
+        let allowed_headers = parse_cors_header_list(
+            preflight.headers(),
+            "access-control-allow-headers",
+        )
+        .ok_or_else(|| {
+            deno_error::JsErrorBox::generic(
+                "CORS preflight returned an invalid Access-Control-Allow-Headers value",
+            )
+        })?;
+        let credentialed = credentials == FetchCredentials::Include;
+        if !preflight_allows_method(&req_method, &allowed_methods, credentialed) {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "CORS preflight did not allow method '{}'",
+                req_method
+            )));
+        }
+        if let Some(name) = unsafe_header_names
+            .iter()
+            .find(|name| !preflight_allows_header(name, &allowed_headers, credentialed))
+        {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "CORS preflight did not allow request header '{}'",
+                name
             )));
         }
     }
@@ -2620,6 +3057,9 @@ async fn op_fetch_url(
     let mut current_url = url.clone();
     let mut current_method = req_method;
     let mut current_body = body;
+    // A mutable copy applied per hop: credential headers are dropped when a
+    // redirect crosses origin, and body headers when the method downgrades.
+    let mut current_headers = custom_headers.clone();
     let mut redirects_followed: usize = 0;
     let mut redirected_from = Vec::new();
     let mut crossed_origin = is_cross_origin;
@@ -2651,7 +3091,7 @@ async fn op_fetch_url(
         // Send a default User-Agent on fetch()/XHR requests (the navigation path
         // sets one, but this op did not, so scripted requests went out with no UA
         // and UA-gated servers rejected them). Honor an explicit override.
-        if !custom_headers
+        if !current_headers
             .keys()
             .any(|k| k.eq_ignore_ascii_case("user-agent"))
         {
@@ -2661,7 +3101,7 @@ async fn op_fetch_url(
             );
         }
 
-        for (k, v) in &custom_headers {
+        for (k, v) in &current_headers {
             req = req.header(k.as_str(), v.as_str());
         }
 
@@ -2698,6 +3138,33 @@ async fn op_fetch_url(
 
         if !resp.status().is_redirection() {
             break resp;
+        }
+
+        // Fetch spec: the CORS check applies to every response in cors mode,
+        // not only the final one. A cross-origin redirect response must be
+        // authorized before it is followed (#973).
+        if mode == "cors" && current_is_cross_origin {
+            let allowed = resp
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let allow_credentials = resp
+                .headers()
+                .get("access-control-allow-credentials")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
+                return Ok(serde_json::json!({
+                    "status": 0, "body": "", "url": current_url, "headers": {},
+                    "corsBlocked": true,
+                    "corsError": format!(
+                        "CORS error: cross-origin redirect from '{}' not allowed by Access-Control-Allow-Origin '{}'",
+                        current_url, allowed
+                    ),
+                })
+                .to_string());
+            }
         }
 
         let location_header = resp
@@ -2748,10 +3215,17 @@ async fn op_fetch_url(
         // Browser semantics: 301/302/303 downgrade to GET with no body.
         // 307/308 preserve method and body.
         let status_code = resp.status().as_u16();
-        if status_code == 301 || status_code == 302 || status_code == 303 {
+        let downgraded_to_get =
+            status_code == 301 || status_code == 302 || status_code == 303;
+        if downgraded_to_get {
             current_method = reqwest::Method::GET;
             current_body.clear();
         }
+
+        // Do not forward the caller's credentials to a different origin, and
+        // drop the body headers once the body is gone (#967).
+        let crosses_origin = base.origin() != next_url.origin();
+        sanitize_redirect_headers(&mut current_headers, crosses_origin, downgraded_to_get);
 
         redirected_from.push(base);
         current_url = next_url.to_string();
@@ -2929,6 +3403,9 @@ async fn stealth_fetch_all(
     let mut current_url = url.clone();
     let mut current_method = method;
     let mut current_body = body;
+    // Applied per hop; credential headers are dropped on a cross-origin
+    // redirect and body headers on a GET downgrade (#967).
+    let mut current_headers = custom_headers.clone();
     let mut redirects_followed: usize = 0;
     let mut redirected_from = Vec::new();
     let mut crossed_origin = request_origin(&current_url)
@@ -2952,7 +3429,7 @@ async fn stealth_fetch_all(
         if current_is_cross_origin {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
-        for (k, v) in &custom_headers {
+        for (k, v) in &current_headers {
             req_headers.insert(k.to_lowercase(), v.clone());
         }
 
@@ -2971,6 +3448,31 @@ async fn stealth_fetch_all(
 
         if !(300..400).contains(&r.status) {
             break (r.status, r.headers, r.body);
+        }
+        // Cross-origin redirect responses must pass the CORS check too, before
+        // the redirect is followed (#973).
+        if mode == "cors" && current_is_cross_origin {
+            let allowed = r
+                .headers
+                .get("access-control-allow-origin")
+                .map(String::as_str)
+                .unwrap_or("");
+            let allow_credentials = r
+                .headers
+                .get("access-control-allow-credentials")
+                .map(String::as_str)
+                .unwrap_or("");
+            if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
+                return Ok(serde_json::json!({
+                    "status": 0, "body": "", "url": current_url, "headers": {},
+                    "corsBlocked": true,
+                    "corsError": format!(
+                        "CORS error: cross-origin redirect from '{}' not allowed by Access-Control-Allow-Origin '{}'",
+                        current_url, allowed
+                    ),
+                })
+                .to_string());
+            }
         }
         let Some(location) = r.headers.get("location").cloned() else {
             break (r.status, r.headers, r.body);
@@ -2999,10 +3501,14 @@ async fn stealth_fetch_all(
             .to_string());
         }
         // Browser semantics: 301/302/303 downgrade to GET with no body.
-        if r.status == 301 || r.status == 302 || r.status == 303 {
+        let downgraded_to_get = r.status == 301 || r.status == 302 || r.status == 303;
+        if downgraded_to_get {
             current_method = "GET".to_string();
             current_body.clear();
         }
+        // Do not forward credentials to a different origin (#967).
+        let crosses_origin = parsed_current.origin() != next_url.origin();
+        sanitize_redirect_headers(&mut current_headers, crosses_origin, downgraded_to_get);
         redirected_from.push(parsed_current);
         current_url = next_url.to_string();
     };
@@ -3072,7 +3578,7 @@ async fn stealth_fetch_all(
     .to_string())
 }
 
-fn glob_match(pattern: &str, url: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, url: &str) -> bool {
     if pattern == "*" {
         return true;
     }
@@ -3102,11 +3608,49 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        cors_response_allows, glob_match, validate_fetch_url, FetchCredentials, ObscuraState,
+        cors_response_allows, cors_unsafe_request_header_names, glob_match,
+        is_cors_safelisted_content_type, is_cors_safelisted_request_header,
+        parse_cors_header_list, preflight_allows_header, preflight_allows_method,
+        sanitize_redirect_headers, validate_fetch_url, FetchCredentials, ObscuraState,
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+
+    // #967 — a redirect must not forward the caller's credentials to a
+    // different origin, and a 301/302/303 GET downgrade drops the body headers.
+    #[test]
+    fn redirect_strips_credentials_cross_origin_and_body_headers_on_get() {
+        let base = || {
+            let mut h = std::collections::HashMap::new();
+            h.insert("Authorization".to_string(), "Bearer secret".to_string());
+            h.insert("Cookie".to_string(), "sid=1".to_string());
+            h.insert("Content-Type".to_string(), "application/json".to_string());
+            h.insert("X-Keep".to_string(), "yes".to_string());
+            h
+        };
+
+        // Cross-origin redirect, method preserved: drop credential headers,
+        // keep the body header and any custom header.
+        let mut cross = base();
+        sanitize_redirect_headers(&mut cross, true, false);
+        assert!(!cross.contains_key("Authorization"), "Authorization must be stripped cross-origin");
+        assert!(!cross.contains_key("Cookie"), "explicit Cookie must be stripped cross-origin");
+        assert!(cross.contains_key("Content-Type"));
+        assert!(cross.contains_key("X-Keep"));
+
+        // Same-origin 301/302/303 GET downgrade: keep credentials, drop body headers.
+        let mut downgrade = base();
+        sanitize_redirect_headers(&mut downgrade, false, true);
+        assert!(downgrade.contains_key("Authorization"), "Authorization kept on same-origin redirect");
+        assert!(!downgrade.contains_key("Content-Type"), "Content-Type dropped on GET downgrade");
+
+        // Same-origin, method preserved: nothing stripped.
+        let mut same = base();
+        sanitize_redirect_headers(&mut same, false, false);
+        assert_eq!(same.len(), 4, "nothing stripped when same-origin and method preserved");
+    }
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::rc::Rc;
 
     #[cfg(feature = "render")]
@@ -3120,6 +3664,164 @@ mod tests {
 
     use super::read_body_capped;
     use super::{pbkdf2_derive, push_capped, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
+    use super::intercept_fulfill_response;
+    use base64::{engine::general_purpose::STANDARD as FULFILL_BASE64, Engine as _};
+
+    #[test]
+    fn cors_request_header_safelist_checks_values() {
+        assert!(is_cors_safelisted_content_type(
+            "application/x-www-form-urlencoded;charset=UTF-8"
+        ));
+        assert!(is_cors_safelisted_content_type(
+            "multipart/form-data; boundary=test"
+        ));
+        assert!(is_cors_safelisted_content_type("text/plain"));
+        assert!(!is_cors_safelisted_content_type("application/json"));
+        assert!(!is_cors_safelisted_content_type("text /plain"));
+
+        assert!(is_cors_safelisted_request_header(
+            "Accept-Language",
+            "en-US, en;q=0.9"
+        ));
+        assert!(!is_cors_safelisted_request_header(
+            "Accept-Language",
+            "en_US"
+        ));
+        assert!(!is_cors_safelisted_request_header(
+            "Accept",
+            &"a".repeat(129)
+        ));
+        assert!(is_cors_safelisted_request_header("Range", "bytes=0-499"));
+        assert!(is_cors_safelisted_request_header("Range", "bytes=500-"));
+        assert!(!is_cors_safelisted_request_header("Range", "bytes=-500"));
+        assert!(!is_cors_safelisted_request_header("Range", "bytes=500-499"));
+        assert!(!is_cors_safelisted_request_header(
+            "Range",
+            "bytes=0-1,4-5"
+        ));
+    }
+
+    #[test]
+    fn cors_unsafe_header_names_are_lowercase_sorted_and_only_include_unsafe_headers() {
+        let headers = HashMap::from([
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("X-Trace".to_string(), "1".to_string()),
+            ("Accept".to_string(), "text/html".to_string()),
+            ("Range".to_string(), "bytes=0-99".to_string()),
+        ]);
+        assert_eq!(
+            cors_unsafe_request_header_names(&headers),
+            vec!["content-type", "x-trace"]
+        );
+    }
+
+    #[test]
+    fn cors_safelist_aggregate_cap_forces_preflight() {
+        let mut headers = HashMap::new();
+        for bits in 0..9u8 {
+            let name = "accept"
+                .bytes()
+                .enumerate()
+                .map(|(index, byte)| {
+                    if bits & (1 << index) == 0 {
+                        byte as char
+                    } else {
+                        (byte as char).to_ascii_uppercase()
+                    }
+                })
+                .collect::<String>();
+            headers.insert(name, "a".repeat(128));
+        }
+        assert_eq!(cors_unsafe_request_header_names(&headers), vec!["accept"]);
+    }
+
+    #[test]
+    fn cors_preflight_permissions_follow_credentials_and_authorization_rules() {
+        assert!(preflight_allows_method(
+            &reqwest::Method::POST,
+            &[],
+            true
+        ));
+        assert!(preflight_allows_method(
+            &reqwest::Method::DELETE,
+            &["DELETE"],
+            true
+        ));
+        assert!(!preflight_allows_method(
+            &reqwest::Method::DELETE,
+            &["delete"],
+            false
+        ));
+        assert!(preflight_allows_method(
+            &reqwest::Method::DELETE,
+            &["*"],
+            false
+        ));
+        assert!(!preflight_allows_method(
+            &reqwest::Method::DELETE,
+            &["*"],
+            true
+        ));
+
+        assert!(preflight_allows_header(
+            "Authorization",
+            &["authorization"],
+            true
+        ));
+        assert!(!preflight_allows_header(
+            "Authorization",
+            &["*"],
+            false
+        ));
+        assert!(preflight_allows_header("X-Trace", &["*"], false));
+        assert!(!preflight_allows_header("X-Trace", &["*"], true));
+    }
+
+    #[test]
+    fn cors_preflight_rejects_malformed_permission_lists() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append(
+            "access-control-allow-methods",
+            "GET, DELETE".parse().unwrap(),
+        );
+        headers.append(
+            "access-control-allow-methods",
+            "PATCH".parse().unwrap(),
+        );
+        assert_eq!(
+            parse_cors_header_list(&headers, "access-control-allow-methods"),
+            Some(vec!["GET", "DELETE", "PATCH"])
+        );
+
+        headers.append(
+            "access-control-allow-methods",
+            "@invalid".parse().unwrap(),
+        );
+        assert!(parse_cors_header_list(&headers, "access-control-allow-methods").is_none());
+    }
+
+    // #912 — a fulfilled binary body (non-UTF-8) must survive as exact bytes via
+    // `bodyBase64`, not be silently corrupted by the lossy `body` text view.
+    #[test]
+    fn intercept_fulfill_carries_binary_body_as_base64() {
+        let raw = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFE, 0x00];
+        let b64 = FULFILL_BASE64.encode(raw);
+        let lossy = String::from_utf8_lossy(&raw).to_string();
+        let result = intercept_fulfill_response(
+            200,
+            std::collections::HashMap::new(),
+            &lossy,
+            &b64,
+            "https://example.test/",
+        );
+        let out_b64 = result["bodyBase64"]
+            .as_str()
+            .expect("fulfill result must carry bodyBase64");
+        let decoded = FULFILL_BASE64
+            .decode(out_b64)
+            .expect("bodyBase64 must be valid base64");
+        assert_eq!(decoded, raw, "the exact bytes must survive via bodyBase64");
+    }
 
     // SEC-002 / #705 — fetched_urls (and the like) must not grow without bound.
     #[test]
@@ -3166,6 +3868,45 @@ mod tests {
         let dk = pbkdf2_derive("SHA-256", b"password", b"salt", 1_000, 32)
             .expect("ordinary parameters must derive successfully");
         assert_eq!(dk.len(), 32, "derived key must have the requested length");
+    }
+
+    // HKDF and the CSPRNG draw share the same DoS shape: both size an output
+    // buffer straight from an untrusted u32 length. Each must reject a length
+    // above its fixed maximum before allocating, and still work for ordinary
+    // inputs. See #910.
+    use super::{hkdf_derive, random_bytes, HKDF_MAX_OUTPUT_BYTES, RANDOM_BYTES_MAX};
+
+    #[test]
+    fn hkdf_rejects_excessive_output_length() {
+        let err = hkdf_derive("SHA-256", b"ikm", b"salt", b"info", HKDF_MAX_OUTPUT_BYTES + 1)
+            .expect_err("output length above the cap must be rejected");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "error should name the length cap: {err}"
+        );
+    }
+
+    #[test]
+    fn hkdf_derives_within_limits() {
+        let okm = hkdf_derive("SHA-256", b"ikm", b"salt", b"info", 32)
+            .expect("ordinary parameters must derive successfully");
+        assert_eq!(okm.len(), 32, "derived key must have the requested length");
+    }
+
+    #[test]
+    fn random_bytes_rejects_excessive_length() {
+        let err = random_bytes(RANDOM_BYTES_MAX + 1)
+            .expect_err("a draw above the cap must be rejected");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "error should name the length cap: {err}"
+        );
+    }
+
+    #[test]
+    fn random_bytes_within_limits() {
+        let buf = random_bytes(32).expect("an ordinary draw must succeed");
+        assert_eq!(buf.len(), 32, "draw must return the requested length");
     }
 
 
@@ -3935,7 +4676,11 @@ fn op_navigate(
 ) {
     let gs = realm_state(scope, state);
     let mut gs = gs.borrow_mut();
-    gs.url = url.to_string();
+    // Only queue the navigation — do NOT change the realm URL here. The URL is
+    // updated on commit via `set_url` once the navigation is actually performed.
+    // Moving it early let synchronous JS run between two navigations read and
+    // write another origin's cookies through document.cookie, whose ops derive
+    // the cookie domain from this URL (SOP bypass, #940).
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
 }
 
@@ -4414,18 +5159,26 @@ fn op_subtle_pbkdf2(
     pbkdf2_derive(hash, password, salt, iterations, length)
 }
 
-/// HKDF key derivation. `length` is the output length in bytes. An empty salt
-/// behaves as RFC 5869 specifies (HMAC zero-pads it to the block size, which is
-/// what browsers do).
-#[op2]
-#[buffer]
-fn op_subtle_hkdf(
-    #[string] hash: &str,
-    #[buffer] ikm: &[u8],
-    #[buffer] salt: &[u8],
-    #[buffer] info: &[u8],
+/// Generous DoS backstop on HKDF output length. HKDF itself rejects output
+/// above 255*HashLen, but only after the buffer is allocated, so an enormous
+/// `length` forces a multi-GB `vec![0u8; length]` first. This bound sits far
+/// above any legitimate derived key and mirrors `PBKDF2_MAX_OUTPUT_BYTES`.
+const HKDF_MAX_OUTPUT_BYTES: u32 = 1024 * 1024;
+
+/// HKDF derivation with a DoS guard. Split out from the op so the bound is
+/// unit-testable without the `#[op2]` wrapper.
+fn hkdf_derive(
+    hash: &str,
+    ikm: &[u8],
+    salt: &[u8],
+    info: &[u8],
     length: u32,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    if length > HKDF_MAX_OUTPUT_BYTES {
+        return Err(crypto_err(format!(
+            "HKDF output length {length} bytes exceeds the supported maximum of {HKDF_MAX_OUTPUT_BYTES}"
+        )));
+    }
     use hkdf::Hkdf;
     let mut okm = vec![0u8; length as usize];
     macro_rules! run {
@@ -4445,6 +5198,40 @@ fn op_subtle_hkdf(
     Ok(okm)
 }
 
+/// HKDF key derivation. `length` is the output length in bytes. An empty salt
+/// behaves as RFC 5869 specifies (HMAC zero-pads it to the block size, which is
+/// what browsers do).
+#[op2]
+#[buffer]
+fn op_subtle_hkdf(
+    #[string] hash: &str,
+    #[buffer] ikm: &[u8],
+    #[buffer] salt: &[u8],
+    #[buffer] info: &[u8],
+    length: u32,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    hkdf_derive(hash, ikm, salt, info, length)
+}
+
+/// Generous DoS backstop on a single CSPRNG draw. `getRandomValues` already
+/// enforces the WebCrypto 65536-byte limit in JS; this guards the native op
+/// against other callers (notably HMAC `generateKey`, whose `length` is
+/// attacker-controllable) forcing a multi-GB allocation plus CSPRNG read.
+const RANDOM_BYTES_MAX: u32 = 1024 * 1024;
+
+/// Draw `len` bytes from the OS CSPRNG, with a DoS guard. Split out from the op
+/// so the bound is unit-testable without the `#[op2]` wrapper.
+fn random_bytes(len: u32) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    if len > RANDOM_BYTES_MAX {
+        return Err(crypto_err(format!(
+            "random byte request of {len} bytes exceeds the supported maximum of {RANDOM_BYTES_MAX}"
+        )));
+    }
+    let mut buf = vec![0u8; len as usize];
+    getrandom::getrandom(&mut buf).map_err(|e| crypto_err(format!("getrandom failed: {e}")))?;
+    Ok(buf)
+}
+
 /// Fill `len` bytes from the OS CSPRNG. Backs `crypto.getRandomValues`,
 /// `crypto.randomUUID`, and `generateKey`, replacing the old Math.random shim
 /// (which was neither uniform across typed-array widths nor cryptographically
@@ -4452,9 +5239,7 @@ fn op_subtle_hkdf(
 #[op2]
 #[buffer]
 fn op_random_bytes(len: u32) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    let mut buf = vec![0u8; len as usize];
-    getrandom::getrandom(&mut buf).map_err(|e| crypto_err(format!("getrandom failed: {e}")))?;
-    Ok(buf)
+    random_bytes(len)
 }
 
 /// Serialize a parsed URL into the WHATWG IDL component shape consumed by the
@@ -5505,8 +6290,9 @@ fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
 
 /// Compatibility path for standalone render runtimes which deliberately
 /// install an in-memory `RenderResourceLoader` but have no owning page
-/// transport. Browser pages always install `ObscuraHttpClient` before page
-/// script runs and never enter this synchronous loader.
+/// transport. Browser pages install their transport before page script runs;
+/// their caches are cache-only (`fresh_render_resources`), so neither this
+/// path nor layout/paint can open a synchronous request for them.
 #[cfg(feature = "render")]
 fn load_image_metadata_without_page_transport(gs: &mut ObscuraState, node_id: NodeId) -> String {
     let base_url = document_base_url(&gs);

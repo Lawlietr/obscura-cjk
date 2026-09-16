@@ -8,6 +8,8 @@ use std::task::{Context, Poll};
 
 use deno_core::{JsRuntime, RuntimeOptions};
 use obscura_dom::{DomTree, NodeId};
+#[cfg(feature = "render")]
+use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
 
 /// Re-exported so other crates (obscura-browser, obscura-cdp) can name the V8
 /// isolate handle without taking a direct dependency on deno_core.
@@ -59,6 +61,21 @@ static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const DEFAULT_CDP_AWAIT_TIMEOUT_MS: u64 = 30_000;
 const HEAP_LIMIT_RECOVERY_HEADROOM_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(feature = "render")]
+const MAX_PENDING_RENDER_RESOURCES: usize = 128;
+
+#[cfg(feature = "render")]
+fn page_render_resource_url_allowed(document_url: &str, resource_url: &str) -> bool {
+    url::Url::parse(resource_url)
+        .map(|resource| match resource.scheme() {
+            "http" | "https" => true,
+            "file" => url::Url::parse(document_url)
+                .map(|document| document.scheme() == "file")
+                .unwrap_or(false),
+            _ => false,
+        })
+        .unwrap_or(false)
+}
 
 #[derive(Default)]
 struct HeapLimitState {
@@ -445,6 +462,13 @@ impl Drop for EnteredRuntime<'_> {
 
 impl Drop for ObscuraJsRuntime {
     fn drop(&mut self) {
+        // Background render-resource loads belong to this runtime's document;
+        // a dropped JoinHandle would only detach them (the page also calls
+        // `abandon_render_resources`, a directly embedded runtime may not).
+        #[cfg(feature = "render")]
+        for task in self.state.borrow_mut().render_resource_tasks.drain(..) {
+            task.abort();
+        }
         // Teardown needs the isolate current as much as any other V8 work:
         // deno_core's context cleanup clears the context's embedder slots, and
         // rusty_v8's `OwnedIsolate::drop` asserts it before disposing. Both run
@@ -867,6 +891,14 @@ impl ObscuraJsRuntime {
         {
             frame.stealth_client = parent.stealth_client.clone();
         }
+        // A frame realm shares the page transport, so its renderer cache must
+        // not open synchronous requests either. Frame geometry currently
+        // resolves against the main document's renderer state, so frame-scoped
+        // background loading is not wired up here.
+        #[cfg(feature = "render")]
+        if crate::ops::has_page_transport(&parent) {
+            frame.render_resources.set_sync_loading_enabled(false);
+        }
     }
 
     /// The origin of the document this runtime is running, or `"null"` for a
@@ -1063,7 +1095,12 @@ impl ObscuraJsRuntime {
     }
 
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
-        self.state.borrow_mut().http_client = Some(client);
+        let mut state = self.state.borrow_mut();
+        state.http_client = Some(client);
+        // A page transport makes the renderer cache-only; see
+        // `ops::fresh_render_resources` for why layout must not fetch itself.
+        #[cfg(feature = "render")]
+        state.render_resources.set_sync_loading_enabled(false);
     }
 
     /// Install the owning page's passive on_request/on_response callback
@@ -1076,7 +1113,10 @@ impl ObscuraJsRuntime {
     /// through it in stealth mode (see op_fetch_url / stealth_fetch_all).
     #[cfg(feature = "stealth")]
     pub fn set_stealth_client(&self, client: std::sync::Arc<obscura_net::StealthHttpClient>) {
-        self.state.borrow_mut().stealth_client = Some(client);
+        let mut state = self.state.borrow_mut();
+        state.stealth_client = Some(client);
+        #[cfg(feature = "render")]
+        state.render_resources.set_sync_loading_enabled(false);
     }
 
     pub fn set_dom(&self, dom: DomTree) {
@@ -1096,8 +1136,21 @@ impl ObscuraJsRuntime {
             gs.animation_task_generation = 0;
             gs.animation_sampled_task_generation = 0;
             gs.pending_style_mutations.clear();
-            gs.render_resources = obscura_render::RenderResourceCache::default();
+            let render_resources = crate::ops::fresh_render_resources(&gs);
+            gs.render_resources = render_resources;
             gs.render_image_in_flight.clear();
+            for task in gs.render_resource_tasks.drain(..) {
+                task.abort();
+            }
+            gs.render_resource_in_flight.clear();
+            gs.render_resource_backlog.clear();
+            gs.render_resource_events.clear();
+            // A fresh channel: a load of the old document that is still
+            // finishing (abort is not a join) delivers into a dropped
+            // receiver, never into this document's results.
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            gs.render_resource_tx = tx;
+            gs.render_resource_rx = rx;
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
             gs.canvas_surfaces.clear();
@@ -1192,6 +1245,18 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().runtime_events_enabled = enabled;
     }
 
+    pub fn set_console_messages_enabled(&self, enabled: bool) {
+        self.state.borrow_mut().console_messages_enabled = enabled;
+    }
+
+    pub fn take_pending_console_messages(&self) -> Vec<String> {
+        self.state
+            .borrow_mut()
+            .pending_console_messages
+            .drain(..)
+            .collect()
+    }
+
     fn record_uncaught_exception(&self, error: &deno_core::error::JsError, fallback_url: &str) {
         let mut state = self.state.borrow_mut();
         if !state.runtime_events_enabled {
@@ -1280,6 +1345,13 @@ impl ObscuraJsRuntime {
     pub fn set_intercept_enabled(&self, enabled: bool) {
         let mut state = self.state.borrow_mut();
         state.intercept_enabled = enabled;
+    }
+
+    /// `Fetch.enable` URL patterns of the owning page. Renderer resource
+    /// loads honour them like the page's own subresource fetches do.
+    #[cfg(feature = "render")]
+    pub fn set_intercept_block_patterns(&self, patterns: Vec<String>) {
+        self.state.borrow_mut().intercept_block_patterns = patterns;
     }
 
     pub fn set_user_agent(&mut self, ua: &str) {
@@ -1771,10 +1843,19 @@ impl ObscuraJsRuntime {
     /// retained layout/scroll.
     #[cfg(feature = "render")]
     pub fn seed_render_resource(&mut self, url: String, bytes: Option<Vec<u8>>) {
+        self.seed_shared_render_resource(url, bytes.map(std::sync::Arc::from));
+    }
+
+    #[cfg(feature = "render")]
+    fn seed_shared_render_resource(
+        &mut self,
+        url: String,
+        bytes: Option<std::sync::Arc<[u8]>>,
+    ) {
         let mut state = self.state.borrow_mut();
         match bytes {
             Some(bytes) => {
-                state.render_resources.seed(url, bytes);
+                state.render_resources.seed_shared(url, bytes);
                 crate::ops::invalidate_render_resource_geometry(&mut state);
             }
             None => state.render_resources.seed_missing(url),
@@ -1788,6 +1869,16 @@ impl ObscuraJsRuntime {
         profile: crate::ops::ImageRequestProfile,
         bytes: Option<Vec<u8>>,
     ) {
+        self.seed_shared_render_image_resource(url, profile, bytes.map(std::sync::Arc::from));
+    }
+
+    #[cfg(feature = "render")]
+    fn seed_shared_render_image_resource(
+        &mut self,
+        url: String,
+        profile: crate::ops::ImageRequestProfile,
+        bytes: Option<std::sync::Arc<[u8]>>,
+    ) {
         let mut state = self.state.borrow_mut();
         match bytes {
             Some(bytes) if obscura_render::image_intrinsic_dimensions(&bytes).is_some() => {
@@ -1797,7 +1888,9 @@ impl ObscuraJsRuntime {
                     }
                     _ => true,
                 };
-                state.render_resources.seed_image(url, profile, bytes);
+                state
+                    .render_resources
+                    .seed_image_shared(url, profile, bytes);
                 state.activity_generation = state.activity_generation.wrapping_add(1);
                 if needs_geometry {
                     crate::ops::invalidate_render_resource_geometry(&mut state);
@@ -1810,6 +1903,367 @@ impl ObscuraJsRuntime {
     #[cfg(feature = "render")]
     pub fn render_resource_is_known(&self, url: &str) -> bool {
         self.state.borrow().render_resources.has_live_outcome(url)
+    }
+
+    /// Whether layout and paint may still open synchronous compatibility
+    /// requests. False for every runtime owned by a page transport.
+    #[cfg(feature = "render")]
+    pub fn render_resource_sync_loading_enabled(&self) -> bool {
+        self.state.borrow().render_resources.sync_loading_enabled()
+    }
+
+    #[cfg(test)]
+    fn document_generation(&self) -> u64 {
+        self.state.borrow().document_generation
+    }
+
+    /// Resources cache-only layout or paint asked for and did not have, ready
+    /// for the page transport: blocked URLs are remembered as missing instead
+    /// of returned, URLs already loading are skipped, the rest are marked in
+    /// flight. Cheap when nothing was missed.
+    #[cfg(feature = "render")]
+    pub fn take_render_resource_requests(
+        &self,
+    ) -> Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)> {
+        let mut state = self.state.borrow_mut();
+        if !state.render_resources.has_sync_misses() {
+            return Vec::new();
+        }
+        let misses = state.render_resources.take_sync_misses();
+        let mut requests = Vec::new();
+        for (url, profile, is_font) in misses {
+            // Same policy as `Page::should_block_url`: `Network.setBlockedURLs`
+            // patterns, and while `Fetch.enable` is active also its patterns
+            // (an intercepted subresource is not fetched behind the client's
+            // back). The matcher is the page's CDP pattern matcher.
+            let blocked = state
+                .blocked_urls
+                .iter()
+                .any(|pattern| crate::ops::glob_match(pattern, &url))
+                || (state.intercept_enabled
+                    && state
+                        .intercept_block_patterns
+                        .iter()
+                        .any(|pattern| crate::ops::glob_match(pattern, &url)));
+            let allowed = page_render_resource_url_allowed(&state.url, &url);
+            if blocked || !allowed {
+                match profile {
+                    Some(profile) => state.render_resources.seed_image_missing(url, profile),
+                    None => state.render_resources.seed_missing(url),
+                }
+                continue;
+            }
+            if state.render_resource_in_flight.len() >= MAX_PENDING_RENDER_RESOURCES {
+                continue;
+            }
+            if state
+                .render_resource_in_flight
+                .insert((url.clone(), profile, is_font))
+            {
+                requests.push((url, profile, is_font));
+            }
+        }
+        requests
+    }
+
+    /// Mark resources the page discovered itself (navigation warmup scan) as
+    /// loading, returning the ones that were not already in flight.
+    #[cfg(feature = "render")]
+    pub fn mark_render_resources_in_flight(
+        &self,
+        candidates: Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)>,
+    ) -> Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)> {
+        let mut state = self.state.borrow_mut();
+        let available = MAX_PENDING_RENDER_RESOURCES
+            .saturating_sub(state.render_resource_in_flight.len());
+        candidates
+            .into_iter()
+            .filter(|(url, profile, is_font)| {
+                state
+                    .render_resource_in_flight
+                    .insert((url.clone(), *profile, *is_font))
+            })
+            .take(available)
+            .collect()
+    }
+
+    /// Abort every background load of this document and discard results
+    /// that already arrived. The page calls this when the document goes away
+    /// (navigation, blank reset, suspension, teardown); `set_dom` and
+    /// `take_dom` do the same. Aborting drops the in-progress HTTP requests;
+    /// a load that is past the point of no return delivers into the old,
+    /// dropped channel.
+    #[cfg(feature = "render")]
+    pub fn abandon_render_resources(&self) {
+        let mut state = self.state.borrow_mut();
+        for task in state.render_resource_tasks.drain(..) {
+            task.abort();
+        }
+        state.render_resource_in_flight.clear();
+        state.render_resource_backlog.clear();
+        state.render_resource_events.clear();
+        // A fresh channel fences results that are still on their way (abort
+        // is not a join) even when this runtime survives, as after a failed
+        // navigation.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        state.render_resource_tx = tx;
+        state.render_resource_rx = rx;
+    }
+
+    /// Whether a page transport (plain or stealth client) is installed.
+    #[cfg(feature = "render")]
+    pub fn has_page_transport(&self) -> bool {
+        crate::ops::has_page_transport(&self.state.borrow())
+    }
+
+    /// Wake-up shared with the background loads: notified after every
+    /// finished load. Waiters must create and enable their `Notified`
+    /// before checking `has_pending_render_resources`, or a load finishing
+    /// in between is missed.
+    #[cfg(feature = "render")]
+    pub fn render_resource_notify(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.state.borrow().render_resource_notify.clone()
+    }
+
+    /// Start page-transport loads for `requests` (already marked in flight).
+    /// Requests keep cookies, proxy policy, callbacks, CORS and response
+    /// limits of the page transport, share the page-wide concurrency limit,
+    /// run to completion in the background and deliver into this runtime's
+    /// result channel. Outside a Tokio context the requests are kept in a
+    /// backlog and started at the next event-loop turn. Returns the number
+    /// of requests started now.
+    #[cfg(feature = "render")]
+    pub fn start_render_resource_loads(
+        &self,
+        requests: Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)>,
+    ) -> usize {
+        if requests.is_empty() {
+            return 0;
+        }
+        let mut state = self.state.borrow_mut();
+        if tokio::runtime::Handle::try_current().is_err() {
+            state.render_resource_backlog.extend(requests);
+            return 0;
+        }
+        // The page transport is the plain client or, when installed, the
+        // stealth client; either one on its own is enough (`has_page_transport`).
+        let http_client = state.http_client.clone();
+        #[cfg(feature = "stealth")]
+        let stealth_client = state.stealth_client.clone();
+        let initiator = url::Url::parse(&state.url).ok();
+        if !crate::ops::has_page_transport(&state) || initiator.is_none() {
+            // No transport or no document URL: nothing can be loaded; forget
+            // the in-flight marks so a later scan may retry.
+            for request in &requests {
+                state.render_resource_in_flight.remove(request);
+            }
+            return 0;
+        }
+        let initiator = initiator.expect("checked above");
+        let callbacks = state.callbacks.clone();
+        let generation = state.document_generation;
+        let tx = state.render_resource_tx.clone();
+        let limiter = state.render_resource_limiter.clone();
+        let notify = state.render_resource_notify.clone();
+        let started = requests.len();
+        let task = tokio::spawn(async move {
+            use deno_core::futures::StreamExt as _;
+            let loads = deno_core::futures::stream::iter(requests.into_iter().map(|(raw, profile, is_font)| {
+                let http_client = http_client.clone();
+                #[cfg(feature = "stealth")]
+                let stealth_client = stealth_client.clone();
+                let callbacks = callbacks.clone();
+                let initiator = initiator.clone();
+                let limiter = limiter.clone();
+                let fallback = (raw.clone(), profile, is_font);
+                let load = async move {
+                    // Every load of this page waits for the same permits, so
+                    // repeated scans cannot multiply the request rate.
+                    let _permit = limiter.acquire_owned().await.ok();
+                    let parsed = match url::Url::parse(&raw) {
+                        Ok(parsed) => parsed,
+                        Err(_) => {
+                            return crate::ops::RenderResourceLoad {
+                                generation,
+                                url: raw,
+                                profile,
+                                is_font,
+                                response: None,
+                            }
+                        }
+                    };
+                    let kind = if is_font {
+                        obscura_net::ResourceType::Font
+                    } else {
+                        obscura_net::ResourceType::Image
+                    };
+                    let mut request = ResourceRequest::subresource(kind, &initiator);
+                    match profile {
+                        Some(crate::ops::ImageRequestProfile::CorsSameOrigin) => {
+                            request.mode = RequestMode::Cors;
+                            request.credentials = RequestCredentials::SameOrigin;
+                        }
+                        Some(crate::ops::ImageRequestProfile::CorsInclude) => {
+                            request.mode = RequestMode::Cors;
+                            request.credentials = RequestCredentials::Include;
+                        }
+                        _ => {}
+                    }
+                    #[cfg(feature = "stealth")]
+                    let response = match (stealth_client, http_client) {
+                        (Some(stealth_client), _) => stealth_client
+                            .fetch_resource_with_callbacks(&parsed, request, callbacks.as_deref())
+                            .await
+                            .ok(),
+                        (None, Some(http_client)) => http_client
+                            .fetch_resource_with_callbacks(&parsed, request, callbacks.as_deref())
+                            .await
+                            .ok(),
+                        (None, None) => None,
+                    };
+                    #[cfg(not(feature = "stealth"))]
+                    let response = match http_client {
+                        Some(http_client) => http_client
+                            .fetch_resource_with_callbacks(&parsed, request, callbacks.as_deref())
+                            .await
+                            .ok(),
+                        None => None,
+                    };
+                    crate::ops::RenderResourceLoad {
+                        generation,
+                        url: raw,
+                        profile,
+                        is_font,
+                        response: response.map(|response| crate::ops::RenderResourceResponse {
+                            url: response.url.to_string(),
+                            status: response.status,
+                            headers: response.headers,
+                            body: std::sync::Arc::from(response.body),
+                        }),
+                    }
+                };
+                // One failing load must not strand the rest of the batch: an
+                // in-flight entry without a result would keep waiters waiting.
+                use deno_core::futures::FutureExt as _;
+                std::panic::AssertUnwindSafe(load)
+                    .catch_unwind()
+                    .map(move |outcome| {
+                        outcome.unwrap_or_else(|_| crate::ops::RenderResourceLoad {
+                            generation,
+                            url: fallback.0,
+                            profile: fallback.1,
+                            is_font: fallback.2,
+                            response: None,
+                        })
+                    })
+            }))
+            .buffer_unordered(crate::ops::RENDER_RESOURCE_CONCURRENCY);
+            deno_core::futures::pin_mut!(loads);
+            while let Some(load) = loads.next().await {
+                tracing::debug!(
+                    url = %load.url,
+                    ok = load.response.is_some(),
+                    "render resource load finished"
+                );
+                if tx.send(load).is_err() {
+                    break;
+                }
+                notify.notify_waiters();
+            }
+            notify.notify_waiters();
+        });
+        state.render_resource_tasks.retain(|task| !task.is_finished());
+        state.render_resource_tasks.push(task);
+        tracing::debug!(started, generation, "started background render resource loads");
+        started
+    }
+
+    /// One service step for the renderer's resources: apply every finished
+    /// load, then start loads for everything layout or paint missed since
+    /// the last step. Runs at every event-loop turn and promise wait of this
+    /// runtime, so a script that creates a miss while a command is waiting
+    /// still gets its bytes without a further protocol round trip. Returns
+    /// the number of loads that stored usable bytes.
+    #[cfg(feature = "render")]
+    pub fn service_render_resources(&mut self) -> usize {
+        {
+            let state = self.state.borrow();
+            if state.render_resource_rx.is_empty()
+                && state.render_resource_backlog.is_empty()
+                && !state.render_resources.has_sync_misses()
+            {
+                return 0;
+            }
+        }
+        let loaded = self.apply_render_resource_results();
+        let mut requests = std::mem::take(&mut self.state.borrow_mut().render_resource_backlog);
+        requests.extend(self.take_render_resource_requests());
+        self.start_render_resource_loads(requests);
+        loaded
+    }
+
+    /// Whether page-transport loads are still running for this document.
+    #[cfg(feature = "render")]
+    pub fn has_pending_render_resources(&self) -> bool {
+        !self.state.borrow().render_resource_in_flight.is_empty()
+    }
+
+    /// Apply every finished page-transport load without waiting. Called at
+    /// the runtime's own event-loop turns and promise waits and by the page
+    /// around protocol commands, so late bytes reach layout, paint and the
+    /// lifecycle getters wherever the runtime is being driven. Returns the
+    /// number of loads that stored usable bytes.
+    #[cfg(feature = "render")]
+    pub fn apply_render_resource_results(&mut self) -> usize {
+        let loads = {
+            let mut state = self.state.borrow_mut();
+            let mut loads = Vec::new();
+            while let Ok(load) = state.render_resource_rx.try_recv() {
+                loads.push(load);
+            }
+            loads
+        };
+        let mut loaded = 0;
+        for load in loads {
+            let generation = self.state.borrow().document_generation;
+            if load.generation != generation {
+                // A previous document's response: no seed, no event, and it
+                // must not clear a same-URL request of the current document.
+                tracing::debug!(url = %load.url, "discarded render resource load of a retired document");
+                continue;
+            }
+            self.state
+                .borrow_mut()
+                .render_resource_in_flight
+                .remove(&(load.url.clone(), load.profile, load.is_font));
+            let is_font = load.is_font;
+            let bytes = match &load.response {
+                Some(response) if (200..300).contains(&response.status) => {
+                    loaded += 1;
+                    Some(std::sync::Arc::clone(&response.body))
+                }
+                _ => None,
+            };
+            tracing::debug!(url = %load.url, loaded = bytes.is_some(), "applied render resource load");
+            match load.profile {
+                Some(profile) => self.seed_shared_render_image_resource(load.url, profile, bytes),
+                None => self.seed_shared_render_resource(load.url, bytes),
+            }
+            if let Some(response) = load.response {
+                self.state
+                    .borrow_mut()
+                    .render_resource_events
+                    .push(crate::ops::RenderResourceEvent { is_font, response });
+            }
+        }
+        loaded
+    }
+
+    /// Applied transport responses the page has not reported as Network
+    /// events yet.
+    #[cfg(feature = "render")]
+    pub fn take_render_resource_events(&self) -> Vec<crate::ops::RenderResourceEvent> {
+        std::mem::take(&mut self.state.borrow_mut().render_resource_events)
     }
 
     #[cfg(feature = "render")]
@@ -1847,6 +2301,8 @@ impl ObscuraJsRuntime {
     }
 
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
+        #[cfg(feature = "render")]
+        self.service_render_resources();
         self.begin_javascript_task();
         let wrapped = Self::wrap_expression(expression);
         let result = self
@@ -2039,8 +2495,7 @@ impl ObscuraJsRuntime {
                     format!("globalThis.__obscura_objects['{}']", oid),
                 )
                 .map_err(|e| format!("JS error: {}", e))?;
-            let json_val = self.v8_to_json(read)?;
-            return Ok(Self::info_from_json(&json_val));
+            return self.v8_to_cdp_value(read);
         }
 
         Ok(Self::info_from_meta(&meta_json, Some(oid)))
@@ -2173,8 +2628,7 @@ impl ObscuraJsRuntime {
                         format!("globalThis.__obscura_objects['{}']", oid),
                     )
                     .map_err(|e| format!("JS error: {}", e))?;
-                let json_val = self.v8_to_json(read)?;
-                return Ok(Self::info_from_json(&json_val));
+                return self.v8_to_cdp_value(read);
             }
 
             let meta_result = self
@@ -2209,8 +2663,7 @@ impl ObscuraJsRuntime {
             let result = self
                 .execute_runtime_script("<callFnByValue>", code)
                 .map_err(|e| format!("JS error: {}", e))?;
-            let json_val = self.v8_to_json(result)?;
-            return Ok(Self::info_from_json(&json_val));
+            return self.v8_to_cdp_value(result);
         }
 
         let code = format!(
@@ -2882,6 +3335,8 @@ impl ObscuraJsRuntime {
     /// the watchdog terminates it. A well-behaved page returns as soon as the
     /// loop goes idle.
     pub async fn run_event_loop_bounded(&mut self, budget_ms: u64) -> Result<(), String> {
+        #[cfg(feature = "render")]
+        self.service_render_resources();
         if budget_ms == 0 {
             return self.run_event_loop().await;
         }
@@ -2906,6 +3361,10 @@ impl ObscuraJsRuntime {
             if tokio::time::Instant::now() >= deadline {
                 break Ok(());
             }
+            // Timer-driven page script observes resources that landed during
+            // the interval, and misses it creates start loading right away.
+            #[cfg(feature = "render")]
+            self.service_render_resources();
 
             match tokio::time::timeout_at(deadline, self.run_cooperative_event_loop_tick()).await {
                 Ok(Ok(true)) => break Ok(()),
@@ -3009,6 +3468,8 @@ impl ObscuraJsRuntime {
         const AUTONOMOUS_TASK_WATCHDOG_MS: u64 =
             SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
 
+        #[cfg(feature = "render")]
+        self.service_render_resources();
         self.begin_javascript_task();
 
         let checkpoint_watchdog = crate::cdp_watchdog::arm(
@@ -3073,6 +3534,8 @@ impl ObscuraJsRuntime {
     /// boolean is true only when deno_core reached full idle.
     #[doc(hidden)]
     pub async fn run_load_delaying_event_loop_tick(&mut self) -> Result<bool, String> {
+        #[cfg(feature = "render")]
+        self.service_render_resources();
         self.run_cooperative_event_loop_tick().await
     }
 
@@ -3118,6 +3581,8 @@ impl ObscuraJsRuntime {
         let mut generation = self.activity_generation();
         let mut quiet_since: Option<tokio::time::Instant> = None;
         let result = loop {
+            #[cfg(feature = "render")]
+            self.service_render_resources();
             let now = tokio::time::Instant::now();
             let Some(_remaining) = deadline.checked_duration_since(now) else {
                 break Ok(());
@@ -3274,6 +3739,8 @@ impl ObscuraJsRuntime {
             tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_total_ms);
         let mut tick_ms: u64 = 1;
         loop {
+            #[cfg(feature = "render")]
+            self.service_render_resources();
             self.begin_javascript_task();
             if done_check(self) {
                 return true;
@@ -3307,7 +3774,17 @@ impl ObscuraJsRuntime {
         {
             state.prepared_render = None;
             state.pending_style_mutations.clear();
-            state.render_resources = obscura_render::RenderResourceCache::default();
+            let render_resources = crate::ops::fresh_render_resources(&state);
+            state.render_resources = render_resources;
+            for task in state.render_resource_tasks.drain(..) {
+                task.abort();
+            }
+            state.render_resource_in_flight.clear();
+            state.render_resource_backlog.clear();
+            state.render_resource_events.clear();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            state.render_resource_tx = tx;
+            state.render_resource_rx = rx;
             state.stylesheet_cache = obscura_render::StylesheetCache::default();
             state.dynamic_fonts.clear();
             state.element_scroll_offsets.clear();
@@ -3569,6 +4046,31 @@ impl ObscuraJsRuntime {
         Ok(serde_json::Value::String(s))
     }
 
+    fn v8_to_cdp_value(
+        &mut self,
+        result: deno_core::v8::Global<deno_core::v8::Value>,
+    ) -> Result<RemoteObjectInfo, String> {
+        // JSON collapses undefined into null. Classify it before serialization.
+        let is_undefined = {
+            let mut entered = self.runtime();
+            let scope = &mut entered.handle_scope();
+            deno_core::v8::Local::new(scope, &result).is_undefined()
+        };
+        if is_undefined {
+            return Ok(RemoteObjectInfo {
+                thrown: false,
+                js_type: "undefined".into(),
+                subtype: None,
+                class_name: String::new(),
+                description: String::new(),
+                object_id: None,
+                value: None,
+            });
+        }
+        let value = self.v8_to_json(result)?;
+        Ok(Self::info_from_json(&value))
+    }
+
     fn info_from_json(value: &serde_json::Value) -> RemoteObjectInfo {
         match value {
             serde_json::Value::Null => RemoteObjectInfo {
@@ -3715,6 +4217,204 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn page_transport_keeps_render_resources_cache_only_across_document_resets() {
+        let standalone = ObscuraJsRuntime::new();
+        assert!(
+            standalone.render_resource_sync_loading_enabled(),
+            "standalone render runtimes keep the compatibility loader"
+        );
+        standalone.set_dom(parse_html("<html><body></body></html>"));
+        assert!(standalone.render_resource_sync_loading_enabled());
+
+        let rt = ObscuraJsRuntime::new();
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
+        assert!(
+            !rt.render_resource_sync_loading_enabled(),
+            "installing a page transport must switch the cache to cache-only"
+        );
+        rt.set_dom(parse_html(
+            "<html><body><img src=\"https://example.test/a.png\"></body></html>",
+        ));
+        assert!(
+            !rt.render_resource_sync_loading_enabled(),
+            "set_dom rebuilds the cache and must keep it cache-only"
+        );
+        assert!(rt.take_dom().is_some());
+        assert!(
+            !rt.render_resource_sync_loading_enabled(),
+            "take_dom rebuilds the cache and must keep it cache-only"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn renderer_resource_transport_preserves_file_subresource_policy() {
+        let file = "file:///tmp/obscura-render-resource.svg";
+        assert!(page_render_resource_url_allowed(
+            "file:///tmp/obscura-page.html",
+            file
+        ));
+        assert!(!page_render_resource_url_allowed(
+            "https://example.test/page",
+            file
+        ));
+        assert!(page_render_resource_url_allowed(
+            "https://example.test/page",
+            "https://assets.test/image.svg"
+        ));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn render_resource_in_flight_set_has_a_page_wide_bound() {
+        let rt = ObscuraJsRuntime::new();
+        let requests = (0..(MAX_PENDING_RENDER_RESOURCES + 4))
+            .map(|index| (format!("https://assets.test/{index}.png"), None, false))
+            .collect();
+
+        assert_eq!(
+            rt.mark_render_resources_in_flight(requests).len(),
+            MAX_PENDING_RENDER_RESOURCES
+        );
+        assert!(rt
+            .mark_render_resources_in_flight(vec![(
+                "https://assets.test/extra.png".to_string(),
+                None,
+                false,
+            )])
+            .is_empty());
+    }
+
+    /// A load that answers after the document was retired (abort is not a
+    /// join) must neither seed the surviving runtime nor clear a same-URL
+    /// request of the document that replaced it.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_channel_answer_of_a_retired_document_is_discarded() {
+        let url = "https://example.test/a.svg".to_string();
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
+        rt.set_dom(parse_html(&format!("<html><body><img src=\"{url}\"></body></html>")));
+        rt.set_url("https://example.test/page");
+        let body = std::sync::Arc::<[u8]>::from(
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"></svg>"##.as_slice(),
+        );
+        let answer = |generation, tx: &tokio::sync::mpsc::UnboundedSender<_>| {
+            tx.send(crate::ops::RenderResourceLoad {
+                generation,
+                url: url.clone(),
+                profile: None,
+                is_font: false,
+                response: Some(crate::ops::RenderResourceResponse {
+                    url: url.clone(),
+                    status: 200,
+                    headers: Default::default(),
+                    body: body.clone(),
+                }),
+            })
+        };
+        // The old document's load holds the sender it was started with.
+        let old_tx = rt.state.borrow().render_resource_tx.clone();
+        let generation = rt.document_generation();
+        rt.mark_render_resources_in_flight(vec![(url.clone(), None, false)]);
+        rt.abandon_render_resources();
+        assert!(!rt.has_pending_render_resources());
+        assert!(answer(generation, &old_tx).is_err(), "retired channel is closed");
+        assert_eq!(rt.apply_render_resource_results(), 0);
+        assert!(!rt.render_resource_is_known(&url), "late bytes must not seed the runtime");
+
+        // The same runtime requests the URL again; a stale-generation answer
+        // that somehow reaches the live channel is fenced too.
+        let requests = rt.mark_render_resources_in_flight(vec![(url.clone(), None, false)]);
+        assert_eq!(requests.len(), 1);
+        let live_tx = rt.state.borrow().render_resource_tx.clone();
+        assert!(answer(generation.wrapping_sub(1), &live_tx).is_ok());
+        assert_eq!(rt.apply_render_resource_results(), 0);
+        assert!(rt.has_pending_render_resources(), "stale answer must not clear the live request");
+        assert!(!rt.render_resource_is_known(&url));
+        assert!(answer(generation, &live_tx).is_ok());
+        assert_eq!(rt.apply_render_resource_results(), 1);
+        assert!(!rt.has_pending_render_resources());
+        assert!(rt.render_resource_is_known(&url));
+    }
+
+    /// A runtime with only the stealth client installed has a page transport
+    /// (`has_page_transport`, cache-only renderer) and must load through it.
+    #[cfg(all(feature = "render", feature = "stealth"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_only_transport_starts_render_resource_loads() {
+        let url = "http://127.0.0.1:9/a.svg".to_string();
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+            std::sync::Arc::new(obscura_net::CookieJar::new()),
+            None,
+            true,
+        )));
+        assert!(rt.has_page_transport());
+        assert!(!rt.render_resource_sync_loading_enabled());
+        rt.set_dom(parse_html(&format!("<html><body><img src=\"{url}\"></body></html>")));
+        rt.set_url("http://127.0.0.1:9/page");
+        let requests = rt.mark_render_resources_in_flight(vec![(url.clone(), None, false)]);
+        assert_eq!(rt.start_render_resource_loads(requests), 1, "stealth client is a transport");
+        assert!(rt.has_pending_render_resources());
+        // The unreachable origin answers with a failed load, which settles it.
+        for _ in 0..200 {
+            if rt.apply_render_resource_results() > 0 || !rt.has_pending_render_resources() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(!rt.has_pending_render_resources(), "the load must finish through the stealth client");
+        assert!(rt.render_resource_is_known(&url));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn live_form_values_paint_without_mutating_content_attributes() {
+        let mut rt = setup_runtime("<!doctype html><html><body><input id=field value=initial><input id=box type=checkbox></body></html>");
+        rt.set_viewport(320.0, 120.0);
+        let before = rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap();
+        rt.evaluate("document.getElementById('field').value = 'changed'").unwrap();
+        let changed_value = rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap();
+        assert_ne!(before, changed_value, "live text value must affect pixels");
+        rt.evaluate("document.getElementById('box').checked = true").unwrap();
+        let after = rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap();
+        assert_ne!(changed_value, after, "checked state must affect pixels");
+        assert_eq!(rt.evaluate("[document.getElementById('field').value, document.getElementById('field').getAttribute('value'), document.getElementById('box').getAttribute('checked'), document.querySelectorAll(':checked').length]").unwrap(), serde_json::json!(["changed", "initial", null, 1]));
+        rt.evaluate("(document.getElementById('field').value = 'initial', document.getElementById('box').checked = false)").unwrap();
+        assert_eq!(before, rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap());
+        rt.evaluate("document.getElementById('field').value = ''").unwrap();
+        assert_eq!(rt.evaluate("document.getElementById('field').value").unwrap(), serde_json::json!(""));
+        assert_ne!(before, rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap(), "empty current value must override a nonempty default");
+    }
+
+    #[test]
+    fn cloned_controls_keep_current_value_and_checked_state() {
+        let mut rt = setup_runtime("<html><body><div id=group><input id=field value=default><input id=box type=checkbox></div></body></html>");
+        let result = rt.evaluate("(() => {const field=document.getElementById('field'), box=document.getElementById('box');field.value='current';box.checked=true;box.indeterminate=true;const clone=document.getElementById('group').cloneNode(true);return [clone.children[0].value,clone.children[0].getAttribute('value'),clone.children[1].checked,clone.children[1].indeterminate];})()").unwrap();
+        assert_eq!(result, serde_json::json!(["current", "default", true, false]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn form_reset_restores_default_input_state_and_pixels() {
+        let mut rt = setup_runtime(
+            "<html><body><form id=form><input id=field value=default><input id=box type=checkbox checked></form></body></html>",
+        );
+        rt.set_viewport(320.0, 120.0);
+        let before = rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap();
+        rt.evaluate("const field=document.getElementById('field'),box=document.getElementById('box');field.value='typed';box.checked=false;box.indeterminate=true").unwrap();
+        assert_ne!(before, rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap());
+        rt.evaluate("document.getElementById('form').reset()").unwrap();
+        assert_eq!(
+            rt.evaluate("[field.value,field.getAttribute('value'),box.checked,box.indeterminate,box.hasAttribute('checked')]").unwrap(),
+            serde_json::json!(["default", "default", true, false, true])
+        );
+        assert_eq!(before, rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap());
     }
 
     // SEC-503 / #820 — createObjectURL must reject non-Blob input (an object
@@ -5255,6 +5955,42 @@ mod tests {
     }
 
     #[test]
+    fn a_parsererror_says_what_was_wrong() {
+        // The <div> is where Chrome puts the reason, and callers show it. A
+        // parsererror that only says "error while parsing XML" tells a user
+        // nothing the presence of the element did not already say.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let detail = rt
+            .evaluate("(function(){var d=new DOMParser().parseFromString('<a><b></a>','application/xml'); return d.querySelector('parsererror').textContent;})()")
+            .unwrap();
+        let detail = detail.as_str().unwrap_or_default().to_string();
+        assert!(
+            detail.contains("mismatch") && detail.contains('b') && detail.contains('a'),
+            "the reason must name the fault and the tags involved, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_parsererror_detail_is_text_not_markup() {
+        // The reason quotes a tag name lifted from the input and is written
+        // through innerHTML, so an input tag name must not become an element.
+        //
+        // The input has to be one whose message carries the angle brackets:
+        // "unclosed tag <img>" does, "mismatch: img and a" does not, and a test
+        // built on the latter passes with the escaping removed.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let n = rt
+            .evaluate("(function(){var d=new DOMParser().parseFromString('<img src=x>','application/xml'); var e=d.querySelector('parsererror'); return e ? e.querySelectorAll('img').length : -1;})()")
+            .unwrap();
+        // JS numbers arrive as f64, so compare as one.
+        assert_eq!(
+            n.as_f64(),
+            Some(0.0),
+            "a tag name from the input became an element in the error detail"
+        );
+    }
+
+    #[test]
     fn dom_parser_html_never_gets_parsererror() {
         // HTML parsing is tolerant and must never synthesize a parsererror.
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -5297,6 +6033,140 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([true, true, true, 1, "ready"]));
+    }
+
+    #[test]
+    fn slot_element_has_own_brand_and_named_assignment() {
+        // Regression for the idealo search result slider: Swiper's getChildren
+        // helper guards with `instanceof HTMLSlotElement` before calling
+        // assignedElements(). With `HTMLSlotElement = Element` the guard matched
+        // a plain <div> and the missing method threw a TypeError.
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="plain"><i></i></div><slot id="light"><i></i></slot></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r##"
+                const tags = nodes => nodes.map(n => n.nodeType === 3 ? "#text" : n.tagName).join(",");
+                const children = el => {
+                    const out = [...el.children];
+                    if (window.HTMLSlotElement && el instanceof HTMLSlotElement) {
+                        out.push(...el.assignedElements());
+                    }
+                    return out;
+                };
+                const plain = document.getElementById("plain");
+                const light = document.getElementById("light");
+                const created = document.createElement("slot");
+
+                const host = document.createElement("x-host");
+                document.body.appendChild(host);
+                host.innerHTML = '<b slot="title">T</b>text<span>S</span><em slot="missing">M</em>';
+                const root = host.attachShadow({ mode: "open" });
+                root.innerHTML = '<slot name="title"></slot><div><slot></slot></div>'
+                    + '<slot name="title"></slot><slot name="empty"><u>fallback</u></slot>';
+                const title = root.childNodes[0];
+                const dflt = root.childNodes[1].firstChild;
+                const dupe = root.childNodes[2];
+                const empty = root.childNodes[3];
+
+                const outer = document.createElement("x-outer");
+                document.body.appendChild(outer);
+                outer.innerHTML = "<p>deep</p>";
+                const outerRoot = outer.attachShadow({ mode: "open" });
+                outerRoot.innerHTML = "<x-inner><slot></slot></x-inner>";
+                const inner = outerRoot.firstChild;
+                const innerRoot = inner.attachShadow({ mode: "open" });
+                innerRoot.innerHTML = '<slot name="unused"></slot><slot></slot>';
+                const innerDefault = innerRoot.childNodes[1];
+
+                created.name = "n1";
+
+                // Later same-name slot: no direct assignment, but its own
+                // fallback children with flatten (comments are not slottable).
+                const dupHost = document.createElement("x-dup");
+                document.body.appendChild(dupHost);
+                dupHost.innerHTML = '<b slot="title">T</b>';
+                const dupRoot = dupHost.attachShadow({ mode: "open" });
+                dupRoot.innerHTML = '<slot name="title"></slot><slot name="title"><i>fb</i>text<!--c--></slot>';
+                const dupSlot = dupRoot.childNodes[1];
+
+                // Manual slot assignment is not implemented: nothing assigned, fallback only.
+                const manHost = document.createElement("x-man");
+                document.body.appendChild(manHost);
+                manHost.innerHTML = "<b>light</b>";
+                const manRoot = manHost.attachShadow({ mode: "open", slotAssignment: "manual" });
+                manRoot.innerHTML = "<slot><u>fb</u></slot>";
+                const manSlot = manRoot.firstChild;
+
+                // Foreign-namespace "SLOT" (also via cloneNode) is no HTML slot
+                // and must not steal the assignment of a following real slot.
+                const foreign = document.createElementNS("urn:example", "SLOT");
+                const foreignClone = foreign.cloneNode();
+                const fHost = document.createElement("x-foreign");
+                document.body.appendChild(fHost);
+                fHost.innerHTML = "<b>light</b>";
+                const fRoot = fHost.attachShadow({ mode: "open" });
+                fRoot.appendChild(foreignClone);
+                const realSlot = document.createElement("slot");
+                fRoot.appendChild(realSlot);
+
+                // Deep shadow tree: assignment must not depend on JS recursion depth.
+                const deepHost = document.createElement("x-deep");
+                document.body.appendChild(deepHost);
+                deepHost.innerHTML = "<b>deep-light</b>";
+                const deepRoot = deepHost.attachShadow({ mode: "open" });
+                let cursor = deepRoot;
+                for (let i = 0; i < 20000; i++) {
+                    const div = document.createElement("div");
+                    cursor.appendChild(div);
+                    cursor = div;
+                }
+                const deepSlot = document.createElement("slot");
+                cursor.appendChild(deepSlot);
+
+                return [
+                    plain instanceof HTMLSlotElement,
+                    light instanceof HTMLSlotElement,
+                    created instanceof HTMLSlotElement,
+                    light instanceof HTMLElement && light instanceof Element,
+                    typeof plain.assignedElements,
+                    light.assignedNodes().length + light.assignedElements().length
+                        + light.assignedNodes({ flatten: true }).length,
+                    children(plain).length,
+                    children(light).length,
+                    created.name + "|" + created.getAttribute("name") + "|" + title.name + "|" + dflt.name,
+                    tags(title.assignedElements()),
+                    tags(dflt.assignedNodes()),
+                    tags(dflt.assignedElements()),
+                    dupe.assignedNodes().length,
+                    empty.assignedNodes().length,
+                    tags(empty.assignedNodes({ flatten: true })),
+                    tags(innerDefault.assignedNodes()),
+                    tags(innerDefault.assignedNodes({ flatten: true })),
+                    tags(children(dflt)),
+                    dupSlot.assignedNodes().length,
+                    tags(dupSlot.assignedNodes({ flatten: true })),
+                    tags(dupSlot.assignedElements({ flatten: true })),
+                    manSlot.assignedNodes().length,
+                    tags(manSlot.assignedNodes({ flatten: true })),
+                    foreign instanceof HTMLSlotElement,
+                    foreignClone instanceof HTMLSlotElement,
+                    typeof foreignClone.assignedNodes,
+                    tags(realSlot.assignedNodes()),
+                    tags(deepSlot.assignedNodes()),
+                ];
+                "##,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                false, true, true, true, "undefined", 0, 1, 1,
+                "n1|n1|title|", "B", "#text,SPAN", "SPAN", 0, 0, "U", "SLOT", "P", "SPAN",
+                0, "I,#text", "I", 0, "U", false, false, "undefined", "B", "B"
+            ])
+        );
     }
 
     #[test]
@@ -5712,6 +6582,80 @@ mod tests {
             )
             .unwrap();
         assert_eq!(normalized, serde_json::json!("live DOM title"));
+    }
+
+    #[test]
+    fn character_data_uses_webidl_ranges_and_rejects_children() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                (function() {
+                  const errorName = callback => {
+                    try { callback(); return null; } catch (error) { return error.name; }
+                  };
+                  const data = document.createTextNode("test");
+                  data.data = undefined;
+                  const undefinedData = data.data;
+                  data.data = null;
+
+                  const appended = document.createTextNode("a");
+                  appended.appendData(null);
+                  const inserted = document.createTextNode("test");
+                  inserted.insertData(-0x100000000 + 2, "X");
+                  const deleted = document.createTextNode("test");
+                  deleted.deleteData(2, -1);
+                  const replaced = document.createTextNode("test");
+                  replaced.replaceData(2, -1, "yo");
+                  const substring = document.createTextNode("test");
+
+                  return [
+                    undefinedData, data.data, appended.data, inserted.data,
+                    deleted.data, replaced.data,
+                    substring.substringData(-0x100000000 + 2, 1),
+                    errorName(() => substring.substringData(5, 0)),
+                    errorName(() => substring.substringData()),
+                    errorName(() => substring.splitText(5)),
+                    errorName(() => substring.appendChild(document.createComment("child")))
+                  ];
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "undefined", "", "anull", "teXst", "te", "teyo", "s",
+                "IndexSizeError", "TypeError", "IndexSizeError", "HierarchyRequestError"
+            ])
+        );
+    }
+
+    #[test]
+    fn node_identity_and_element_id_follow_dom_conversion_rules() {
+        let mut rt = setup_runtime(
+            r#"<html><body><div id=""></div><div id="null"></div><div id="undefined"></div></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                (function() {
+                  const node = document.body.firstChild;
+                  return [
+                    node.contains(node),
+                    node.isSameNode(null),
+                    document.getElementById("") === null,
+                    document.getElementById(null)?.id,
+                    document.getElementById(undefined)?.id
+                  ];
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, false, true, "null", "undefined"])
+        );
     }
 
     #[test]
@@ -14678,6 +15622,26 @@ mod tests {
         assert_eq!(wd, serde_json::json!(false));
         let plugins = rt.evaluate("navigator.plugins.length").unwrap();
         assert!(plugins.as_f64().unwrap() > 0.0, "Should have plugins");
+        let plugin_interfaces = rt
+            .evaluate(
+                r#"({
+                    Navigator: typeof Navigator,
+                    PluginArray: typeof PluginArray,
+                    Plugin: typeof Plugin,
+                    MimeType: typeof MimeType,
+                    MimeTypeArray: typeof MimeTypeArray,
+                    pluginsMatch: navigator.plugins instanceof PluginArray,
+                    enumerable: Object.getOwnPropertyDescriptor(window, "PluginArray").enumerable,
+                })"#,
+            )
+            .unwrap();
+        assert_eq!(plugin_interfaces["Navigator"], "function");
+        assert_eq!(plugin_interfaces["PluginArray"], "function");
+        assert_eq!(plugin_interfaces["Plugin"], "function");
+        assert_eq!(plugin_interfaces["MimeType"], "function");
+        assert_eq!(plugin_interfaces["MimeTypeArray"], "function");
+        assert_eq!(plugin_interfaces["pluginsMatch"], true);
+        assert_eq!(plugin_interfaces["enumerable"], false);
         let chrome = rt.evaluate("typeof window.chrome").unwrap();
         assert_eq!(chrome, serde_json::json!("object"));
     }
@@ -15468,6 +16432,30 @@ mod tests {
         );
     }
 
+    // #940: op_navigate must not move the document's cookie context before the
+    // navigation actually commits. A queued navigation to another origin must
+    // not let document.cookie read that origin's cookies (SOP bypass).
+    #[test]
+    fn queued_navigation_does_not_expose_another_origins_cookies() {
+        let (mut rt, jar) = setup_runtime_with_cookies("<html><body></body></html>");
+        // A cookie belonging to a different origin than the current page
+        // (the harness page is http://example.com/test).
+        let victim = url::Url::parse("https://victim.example/").unwrap();
+        jar.set_cookie("secret=victimtoken; Path=/", &victim);
+
+        // Start navigating to the victim origin. This only *queues* the
+        // navigation; it must not retroactively move the cookie context.
+        rt.evaluate("location.href = 'https://victim.example/'").unwrap();
+
+        let result = rt.evaluate("document.cookie").unwrap();
+        let cookie_str = result.as_str().unwrap();
+        assert!(
+            !cookie_str.contains("victimtoken"),
+            "document.cookie must not expose another origin's cookies after a queued navigation, got: {}",
+            cookie_str
+        );
+    }
+
     #[test]
     fn test_document_cookie_delete_via_max_age() {
         let (mut rt, jar) = setup_runtime_with_cookies("<html><body></body></html>");
@@ -15975,6 +16963,43 @@ mod tests {
         );
     }
 
+    // #969: fetch() must normalize the request method to uppercase, matching the
+    // Request constructor, so a lowercase standard method is not wrongly
+    // rejected by the case-sensitive CORS checks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_normalizes_request_method_to_uppercase() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const original = Deno.core.ops.op_fetch_url;
+                let captured = null;
+                try {
+                    Deno.core.ops.op_fetch_url = (url, method) => {
+                        captured = method;
+                        return JSON.stringify({ status: 200, headers: {}, body: "ok", url });
+                    };
+                    await fetch(new URL("/api", document.URL), { method: "delete" });
+                    return captured;
+                } finally {
+                    Deno.core.ops.op_fetch_url = original;
+                }
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!("DELETE"),
+            "fetch() must uppercase the method like the Request constructor"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_and_xhr_forward_browser_credentials_modes() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -16047,6 +17072,85 @@ mod tests {
                 ],
                 "invalidFetchRejected": true,
             })
+        );
+    }
+
+    fn cors_preflight_runtime() -> (
+        ObscuraJsRuntime,
+        String,
+        std::sync::mpsc::Receiver<String>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let target = format!("http://{address}/resource");
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..length]).to_string();
+                requests_tx.send(request.clone()).unwrap();
+                let response = if request.starts_with("OPTIONS ") {
+                    "HTTP/1.1 204 No Content\r\n\
+                     Access-Control-Allow-Origin: *\r\n\
+                     Access-Control-Allow-Headers: content-type\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    "HTTP/1.1 200 OK\r\n\
+                     Access-Control-Allow-Origin: *\r\n\
+                     Content-Length: 2\r\nConnection: close\r\n\r\nok"
+                        .to_string()
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let rt = setup_runtime("<html><body></body></html>");
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        (rt, target, requests_rx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn denied_preflight_never_sends_the_unsafe_request() {
+        let (mut rt, target, requests) = cors_preflight_runtime();
+        let result = rt
+            .call_function_on_for_cdp(
+                &format!(
+                    r#"async () => await fetch({target:?}, {{
+                        method: "DELETE",
+                        headers: {{ "Authorization": "Bearer test" }},
+                    }}).then(() => "resolved", () => "rejected")"#
+                ),
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value, Some(serde_json::json!("rejected")));
+
+        let preflight = requests
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("preflight request");
+        assert!(preflight.starts_with("OPTIONS /resource "), "{preflight}");
+        assert!(
+            requests
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "the denied DELETE request reached the server"
         );
     }
 
@@ -16402,6 +17506,77 @@ mod tests {
         });
 
         redirect_runtime_for_origin(&format!("http://{source_address}"))
+    }
+
+    // A redirector (cross-origin to the page) whose 302 carries no
+    // Access-Control-Allow-Origin, pointing at its own /final which does allow.
+    // Returns the runtime (page on a distinct origin) and the redirector base.
+    fn cross_origin_intermediate_redirect_runtime() -> (ObscuraJsRuntime, String) {
+        let redirector = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirector_address = redirector.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = redirector.accept() else {
+                    break;
+                };
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer);
+                let request = String::from_utf8_lossy(&buffer);
+                let response = if request.contains("/final") {
+                    "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                        .to_string()
+                } else {
+                    // 302 WITHOUT Access-Control-Allow-Origin.
+                    "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        // The page lives on a distinct origin, so the fetch is cross-origin.
+        let page = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let page_address = page.local_addr().unwrap();
+        drop(page);
+
+        (
+            redirect_runtime_for_origin(&format!("http://{page_address}")),
+            format!("http://{redirector_address}"),
+        )
+    }
+
+    // #973: in cors mode, a cross-origin redirect response that lacks
+    // Access-Control-Allow-Origin must be rejected before it is followed, even
+    // if the final destination would authorize the request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cors_mode_blocks_unauthorized_cross_origin_redirect_hop() {
+        let (mut rt, redirector) = cross_origin_intermediate_redirect_runtime();
+        let result = rt
+            .call_function_on_for_cdp(
+                &format!(
+                    r#"async () => {{
+                        try {{
+                            await fetch("{redirector}/start", {{ mode: "cors" }});
+                            return "allowed";
+                        }} catch (e) {{
+                            return "blocked";
+                        }}
+                    }}"#
+                ),
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!("blocked"),
+            "a cross-origin redirect without Access-Control-Allow-Origin must be blocked in cors mode"
+        );
     }
 
     /// HTTP-redirect fetch returns a network error as soon as the

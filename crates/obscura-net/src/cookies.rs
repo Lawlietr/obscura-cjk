@@ -376,7 +376,13 @@ impl CookieJar {
             if exp <= now {
                 let mut cookies = self.cookies.write().unwrap();
                 if let Some(domain_cookies) = cookies.get_mut(&domain) {
-                    domain_cookies.remove(&(name.clone(), path.clone()));
+                    // RFC 6265 §5.3: a non-HTTP API (document.cookie) must not
+                    // delete an existing HttpOnly cookie.
+                    let key = (name.clone(), path.clone());
+                    if domain_cookies.get(&key).is_some_and(|e| e.http_only) {
+                        return;
+                    }
+                    domain_cookies.remove(&key);
                 }
                 return;
             }
@@ -395,7 +401,16 @@ impl CookieJar {
         };
 
         let mut cookies = self.cookies.write().unwrap();
-        cookies.entry(domain).or_default().insert((name, path), entry);
+        let domain_cookies = cookies.entry(domain).or_default();
+        // RFC 6265 §5.3: a non-HTTP API (document.cookie) must not overwrite an
+        // existing HttpOnly cookie set by the server.
+        if domain_cookies
+            .get(&(name.clone(), path.clone()))
+            .is_some_and(|e| e.http_only)
+        {
+            return;
+        }
+        domain_cookies.insert((name, path), entry);
     }
 
     pub fn delete_cookie(&self, name: &str, domain: &str) {
@@ -648,6 +663,54 @@ mod tests {
 
         let header = jar.get_cookie_header(&url);
         assert!(header.contains("session=abc123"));
+    }
+
+    // RFC 6265 §5.3: document.cookie (a non-HTTP API) must not overwrite or
+    // delete a server-set HttpOnly cookie. See #915.
+    #[test]
+    fn js_cannot_overwrite_httponly_cookie() {
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie("session=server_secret; Path=/; HttpOnly", &url);
+
+        jar.set_cookie_from_js("session=attacker_value", &url);
+
+        assert!(
+            jar.get_cookie_header(&url).contains("session=server_secret"),
+            "JS must not overwrite an HttpOnly cookie"
+        );
+        assert!(
+            !jar.get_cookie_header(&url).contains("attacker_value"),
+            "the attacker value must not be stored"
+        );
+    }
+
+    #[test]
+    fn js_cannot_delete_httponly_cookie() {
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie("session=server_secret; Path=/; HttpOnly", &url);
+
+        jar.set_cookie_from_js("session=; Max-Age=0", &url);
+
+        assert!(
+            jar.get_cookie_header(&url).contains("session=server_secret"),
+            "JS must not delete an HttpOnly cookie"
+        );
+    }
+
+    #[test]
+    fn js_can_still_overwrite_non_httponly_cookie() {
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie("pref=light; Path=/", &url);
+
+        jar.set_cookie_from_js("pref=dark", &url);
+
+        assert!(
+            jar.get_cookie_header(&url).contains("pref=dark"),
+            "JS must remain able to overwrite a non-HttpOnly cookie"
+        );
     }
 
     #[test]

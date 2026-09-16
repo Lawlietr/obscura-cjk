@@ -500,7 +500,9 @@ impl<'a> Element for DomElement<'a> {
             PseudoClass::Enabled => self.is_form_control() && !self.has_boolean_attr("disabled"),
             PseudoClass::Disabled => self.is_form_control() && self.has_boolean_attr("disabled"),
             PseudoClass::Checked => {
-                self.has_boolean_attr("checked") || self.has_boolean_attr("selected")
+                self.tree
+                    .form_control_checked(self.node_id)
+                    .unwrap_or_else(|| self.has_boolean_attr("checked") || self.has_boolean_attr("selected"))
             }
             // Dynamic user-interaction pseudo-classes have no meaning against
             // a static DOM snapshot with no live user input.

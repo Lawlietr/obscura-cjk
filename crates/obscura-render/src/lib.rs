@@ -137,6 +137,8 @@ pub use paint::{
 // `dom.rs` name `inline::TextEngine` and call `try_build` unconditionally.
 #[cfg(feature = "paint")]
 pub mod inline;
+#[cfg(feature = "paint")]
+pub use inline::configure_font_directories;
 
 #[cfg(not(feature = "paint"))]
 pub mod inline {
@@ -145,7 +147,7 @@ pub mod inline {
 
     #[derive(Clone)]
     pub(crate) struct WebFont {
-        pub data: Vec<u8>,
+        pub data: std::sync::Arc<Vec<u8>>,
         pub family: Option<String>,
         pub weight: Option<(u16, u16)>,
         pub italic: Option<bool>,
@@ -1553,6 +1555,8 @@ pub struct LayoutStyle {
     /// text, so it is propagated into the shaped spans of the element's subtree
     /// (this is what underlines links, which are underlined by UA default).
     pub underline: Option<bool>,
+    pub overline: Option<bool>,
+    pub line_through: Option<bool>,
 
     /// `font-style: italic|oblique`. Inherited. Selects an available oblique
     /// face when shaping; the bundled Linux `system-ui` face synthesizes its

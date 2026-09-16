@@ -77,14 +77,14 @@ jobs:
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Build render,cjk release binary
-        run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --features render,cjk
+        run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --features render,cjk
 
       - name: Stage cjk release binary
         shell: bash
         run: |
           # This fork's flagship variant: embeds the Noto Sans CJK fallback
           # faces so Chinese/Japanese text shapes without host fonts.
-          BIN_DIR=target/${{ matrix.target }}/release
+          BIN_DIR=target/${{ matrix.target }}/release-dist
           mkdir -p dist/cjk
           if [ -f "$BIN_DIR/obscura.exe" ]; then
             cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/cjk/
@@ -93,12 +93,12 @@ jobs:
           fi
 
       - name: Build render,cjk,stealth release binary
-        run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --features render,cjk,stealth
+        run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --features render,cjk,stealth
 
       - name: Stage cjk-stealth release binary
         shell: bash
         run: |
-          BIN_DIR=target/${{ matrix.target }}/release
+          BIN_DIR=target/${{ matrix.target }}/release-dist
           mkdir -p dist/cjk-stealth
           if [ -f "$BIN_DIR/obscura.exe" ]; then
             cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/cjk-stealth/

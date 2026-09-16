@@ -146,6 +146,12 @@ pub struct RenderResourceCache {
     #[cfg(test)]
     content_image_layout_retries: usize,
     sync_loading_enabled: bool,
+    /// Resources a cache-only lookup missed since the last `take_sync_misses`,
+    /// with the request identity layout used (image CORS profile or none) and
+    /// whether the consumer is a font.
+    /// Deduplicated so repeated layouts do not grow the list.
+    sync_misses: Vec<(String, Option<ImageRequestProfile>, bool)>,
+    sync_miss_keys: HashSet<String>,
     loader: Box<dyn RenderResourceLoader>,
 }
 
@@ -185,6 +191,8 @@ impl RenderResourceCache {
             #[cfg(test)]
             content_image_layout_retries: 0,
             sync_loading_enabled: true,
+            sync_misses: Vec::new(),
+            sync_miss_keys: HashSet::new(),
             loader: Box::new(loader),
         }
     }
@@ -195,6 +203,47 @@ impl RenderResourceCache {
     /// unknown and can still be fetched by a later navigation/settle warmup.
     pub fn set_sync_loading_enabled(&mut self, enabled: bool) -> bool {
         std::mem::replace(&mut self.sync_loading_enabled, enabled)
+    }
+
+    /// Whether layout and paint may still open synchronous compatibility
+    /// requests. Page-owned caches disable this permanently and are fed by
+    /// the page transport instead.
+    pub fn sync_loading_enabled(&self) -> bool {
+        self.sync_loading_enabled
+    }
+
+    /// Take the resources that cache-only layout or paint asked for and did
+    /// not have, exactly as they were resolved (network URL plus the image
+    /// request profile, or `None` for CSS images and fonts). The owning page
+    /// loads them through its asynchronous transport; nothing is
+    /// reconstructed from the DOM, so script-registered fonts, shadow roots
+    /// and every other renderer-only source are covered.
+    pub fn take_sync_misses(&mut self) -> Vec<(String, Option<ImageRequestProfile>, bool)> {
+        self.sync_miss_keys.clear();
+        std::mem::take(&mut self.sync_misses)
+    }
+
+    /// Whether any cache-only miss is waiting to be taken.
+    pub fn has_sync_misses(&self) -> bool {
+        !self.sync_misses.is_empty()
+    }
+
+    fn record_sync_miss(
+        &mut self,
+        key: String,
+        url: String,
+        profile: Option<ImageRequestProfile>,
+        is_font: bool,
+    ) {
+        // Bound a hostile document's per-layout queue to the number of
+        // entries this cache could retain. A later layout reports skipped
+        // misses again after the current batch has been drained.
+        if self.sync_misses.len() >= self.max_entries {
+            return;
+        }
+        if self.sync_miss_keys.insert(key) {
+            self.sync_misses.push((url, profile, is_font));
+        }
     }
 
     pub fn retained_entry_count(&self) -> usize {
@@ -228,7 +277,16 @@ impl RenderResourceCache {
     }
 
     pub fn seed_image(&mut self, url: String, profile: ImageRequestProfile, bytes: Vec<u8>) {
-        self.seed(image_resource_key(&url, profile), bytes);
+        self.seed_shared(image_resource_key(&url, profile), Arc::from(bytes));
+    }
+
+    pub fn seed_image_shared(
+        &mut self,
+        url: String,
+        profile: ImageRequestProfile,
+        bytes: Arc<[u8]>,
+    ) {
+        self.seed_shared(image_resource_key(&url, profile), bytes);
     }
 
     pub fn seed_image_missing(&mut self, url: String, profile: ImageRequestProfile) {
@@ -242,9 +300,14 @@ impl RenderResourceCache {
     /// layer uses this entry point to fetch a bounded resource batch through
     /// its cookie/proxy/CORS-aware connection pool before entering layout.
     pub fn seed(&mut self, url: String, bytes: Vec<u8>) {
+        self.seed_shared(url, Arc::from(bytes));
+    }
+
+    /// Seed already-shared bytes without copying a complete response body.
+    pub fn seed_shared(&mut self, url: String, bytes: Arc<[u8]>) {
         let url = network_resource_url(&url);
         self.remove(&url);
-        self.insert_bytes(url, Arc::from(bytes));
+        self.insert_bytes(url, bytes);
     }
 
     /// Retain a page-transport failure so capture does not immediately repeat
@@ -406,7 +469,7 @@ impl RenderResourceCache {
         }
     }
 
-    fn get_or_load(&mut self, url: &str) -> Option<Arc<[u8]>> {
+    fn get_or_load(&mut self, url: &str, is_font: bool) -> Option<Arc<[u8]>> {
         let url = network_resource_url(url);
         if let Some(entry) = self.entries.get(&url) {
             match entry {
@@ -418,6 +481,7 @@ impl RenderResourceCache {
             }
         }
         if !self.sync_loading_enabled {
+            self.record_sync_miss(url.clone(), url, None, is_font);
             return None;
         }
         self.remove(&url);
@@ -451,6 +515,7 @@ impl RenderResourceCache {
             }
         }
         if !self.sync_loading_enabled {
+            self.record_sync_miss(key, network_resource_url(url), Some(profile), false);
             return None;
         }
         self.remove(&key);
@@ -2433,6 +2498,22 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
         && dynamic_fonts.is_empty()
         && mutations.is_empty()
         && previous.try_advance_visual_waapi_sample(tree, animation_sample, animation_timeline)
+    {
+        return Some(previous);
+    }
+    if previous.viewport == viewport
+        && previous.base_url.as_deref() == base_url
+        && !previous.has_dynamic_fonts
+        && dynamic_fonts.is_empty()
+        && crate::dom::can_retain_layout_for_tabindex(
+            tree,
+            viewport,
+            stylesheet_cache,
+            mutations,
+        )
+        && (!sample_changed
+            || (forward_document_sample
+                && previous.advance_inactive_animation_sample_time(animation_sample.time)))
     {
         return Some(previous);
     }
@@ -4643,35 +4724,90 @@ fn paint_laid_dom_scrolled(
             }
         }
 
+        let input_type = (name.local.as_ref() == "input")
+            .then(|| node.get_attribute("type").unwrap_or("text"));
+        let checkable = input_type.is_some_and(|kind| {
+            kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
+        });
+        if checkable && rect.width > 0.0 && rect.height > 0.0 {
+            let checked = tree
+                .form_control_checked(nid)
+                .unwrap_or_else(|| node.get_attribute("checked").is_some());
+            let is_radio = input_type.is_some_and(|kind| kind.eq_ignore_ascii_case("radio"));
+            let indeterminate = !is_radio && tree.form_control_indeterminate(nid);
+            let disabled = node.get_attribute("disabled").is_some();
+            let size = rect.width.min(rect.height);
+            let x = rect.x + (rect.width - size) / 2.0;
+            let y = rect.y + (rect.height - size) / 2.0;
+            let shape = if is_radio {
+                PathBuilder::from_circle(x + size / 2.0, y + size / 2.0, (size - 1.0).max(0.0) / 2.0)
+            } else {
+                tiny_skia::Rect::from_xywh(x + 0.5, y + 0.5, (size - 1.0).max(0.0), (size - 1.0).max(0.0))
+                    .map(PathBuilder::from_rect)
+            };
+            if let Some(shape) = shape {
+                let mut control_paint = Paint::default();
+                let selected = checked || indeterminate;
+                let color = if disabled { [160, 160, 160, 255] } else if selected { [0, 117, 255, 255] } else { [118, 118, 118, 255] };
+                control_paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
+                control_paint.anti_alias = true;
+                let stroke = tiny_skia::Stroke { width: 1.0, ..Default::default() };
+                if !is_radio && selected {
+                    pixmap.fill_path(&shape, &control_paint, FillRule::Winding, raster_transform(raster_scale), element_clip_mask);
+                } else {
+                    pixmap.stroke_path(&shape, &control_paint, &stroke, raster_transform(raster_scale), element_clip_mask);
+                }
+                if selected {
+                    if is_radio {
+                        if let Some(dot) = PathBuilder::from_circle(x + size / 2.0, y + size / 2.0, size * 0.25) {
+                            pixmap.fill_path(&dot, &control_paint, FillRule::Winding, raster_transform(raster_scale), element_clip_mask);
+                        }
+                    } else {
+                        let mut mark = PathBuilder::new();
+                        mark.move_to(x + size * 0.2, y + size * 0.5);
+                        if indeterminate {
+                            mark.line_to(x + size * 0.8, y + size * 0.5);
+                        } else {
+                            mark.line_to(x + size * 0.43, y + size * 0.73);
+                            mark.line_to(x + size * 0.82, y + size * 0.25);
+                        }
+                        if let Some(mark) = mark.finish() {
+                            control_paint.set_color(Color::WHITE);
+                            let stroke = tiny_skia::Stroke { width: (size * 0.14).max(1.0), ..Default::default() };
+                            pixmap.stroke_path(&mark, &control_paint, &stroke, raster_transform(raster_scale), element_clip_mask);
+                        }
+                    }
+                }
+            }
+        }
+
         // An empty text `<input>`/`<textarea>` shows its `placeholder`
         // attribute as muted text; there is no DOM text node for it (it is
         // not real content), so paint it directly from the attribute instead
         // of going through `paint_text_node`.
-        if name.local.as_ref() == "input" || name.local.as_ref() == "textarea" {
-            let has_value = node
-                .get_attribute("value")
-                .map(|v| !v.is_empty())
-                .unwrap_or(false)
+        if !checkable && (name.local.as_ref() == "input" || name.local.as_ref() == "textarea") {
+            let live_value = tree.form_control_state(nid).and_then(|control| control.value);
+            let value = live_value.as_deref().or_else(|| node.get_attribute("value"));
+            let has_value = value.is_some_and(|v| !v.is_empty())
                 || (name.local.as_ref() == "textarea"
                     && !tree.text_content(nid).is_empty());
             // A text `<input>`'s value is not a DOM text node either, so it
-            // needs painting from the attribute the same way. Without this the
+            // needs painting from its live state, falling back to the attribute.
+            // Without this the
             // control renders empty however it was filled in — from markup,
             // from script, or by typing — while its `value` reads back
             // correctly, so only a screenshot or PDF shows anything wrong.
             // `<textarea>` is unaffected: its value *is* a text node.
             if has_value && name.local.as_ref() == "input" {
-                if let Some(value) = node.get_attribute("value") {
+                if let Some(value) = value {
                     if !value.is_empty() {
                         let fsize = style.font_size.unwrap_or(16.0);
                         let text_x = rect.x + style.padding.left + style.border.left;
                         let text_y = rect.y + style.padding.top + style.border.top;
                         let color = style.color.unwrap_or([0, 0, 0, 255]);
                         let masked;
-                        let shown = if node
-                            .get_attribute("type")
-                            .is_some_and(|kind| kind.eq_ignore_ascii_case("password"))
-                        {
+                        let shown = if input_type
+                            .is_some_and(|kind| kind.eq_ignore_ascii_case("password")) {
                             masked = "\u{2022}".repeat(value.chars().count());
                             masked.as_str()
                         } else {
@@ -6926,6 +7062,23 @@ fn fetch_bytes(
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
 ) -> Option<Arc<[u8]>> {
+    fetch_bytes_with_kind(src, base_url, cache, false)
+}
+
+fn fetch_font_bytes(
+    src: &str,
+    base_url: Option<&str>,
+    cache: &mut RenderResourceCache,
+) -> Option<Arc<[u8]>> {
+    fetch_bytes_with_kind(src, base_url, cache, true)
+}
+
+fn fetch_bytes_with_kind(
+    src: &str,
+    base_url: Option<&str>,
+    cache: &mut RenderResourceCache,
+    is_font: bool,
+) -> Option<Arc<[u8]>> {
     if let Some(rest) = src.strip_prefix("data:") {
         let comma_idx = rest.find(',')?;
         let (meta, data) = (&rest[..comma_idx], &rest[comma_idx + 1..]);
@@ -6941,7 +7094,7 @@ fn fetch_bytes(
         return Some(Arc::from(bytes));
     }
     let resolved = resolve_resource_url(src, base_url)?;
-    cache.get_or_load(&resolved)
+    cache.get_or_load(&resolved, is_font)
 }
 
 fn fetch_profiled_image_bytes(
@@ -7161,12 +7314,12 @@ fn fetch_and_decode_font(
     src: &str,
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
-) -> Option<Vec<u8>> {
-    let compressed = fetch_bytes(src, base_url, cache)?;
+) -> Option<std::sync::Arc<Vec<u8>>> {
+    let compressed = fetch_font_bytes(src, base_url, cache)?;
     if compressed.len() > 8 * 1024 * 1024 {
         return None;
     }
-    crate::inline::decode_font_bytes(&compressed)
+    crate::inline::decode_font_bytes(&compressed).map(std::sync::Arc::new)
 }
 
 fn font_face_blocks(css: &str) -> Vec<&str> {
@@ -10246,7 +10399,7 @@ fn svg_font_database_for_tree(
     // is the cost of keeping the rasterizer and layout engine deterministic.
     let mut database = (*base).clone();
     for font in web_fonts {
-        database.load_font_data(font.data.clone());
+        database.load_font_data(font.data.as_ref().clone());
     }
     std::sync::Arc::new(database)
 }
@@ -11722,7 +11875,7 @@ mod tests {
 
         let previous = cache.set_sync_loading_enabled(false);
         assert!(previous);
-        assert!(cache.get_or_load(url).is_none());
+        assert!(cache.get_or_load(url, false).is_none());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(
             !cache.has_live_outcome(url),
@@ -11731,8 +11884,77 @@ mod tests {
 
         cache.set_sync_loading_enabled(previous);
         cache.seed(url.to_string(), vec![9, 8, 7]);
-        assert_eq!(cache.get_or_load(url).as_deref(), Some([9, 8, 7].as_slice()));
+        assert_eq!(cache.get_or_load(url, false).as_deref(), Some([9, 8, 7].as_slice()));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cache_only_misses_are_reported_with_their_request_identity() {
+        let mut cache = RenderResourceCache::with_loader(|_url: &str| Some(vec![1, 2, 3]));
+        let font = "https://example.test/font?id=late";
+        let image = "https://example.test/late.png#fragment";
+        assert!(!cache.has_sync_misses());
+
+        cache.set_sync_loading_enabled(false);
+        assert!(cache.get_or_load(font, true).is_none());
+        assert!(cache.get_or_load(font, true).is_none(), "a repeated miss is reported once");
+        assert!(cache
+            .get_or_load_image(image, ImageRequestProfile::CorsInclude)
+            .is_none());
+        assert!(cache.has_sync_misses());
+        assert_eq!(
+            cache.take_sync_misses(),
+            vec![
+                (font.to_string(), None, true),
+                (
+                    "https://example.test/late.png".to_string(),
+                    Some(ImageRequestProfile::CorsInclude),
+                    false,
+                ),
+            ],
+            "misses carry the network URL, image request profile and resource kind"
+        );
+        assert!(!cache.has_sync_misses(), "take clears the report");
+
+        cache.seed(font.to_string(), vec![9]);
+        assert!(cache.get_or_load(font, true).is_some());
+        assert!(!cache.has_sync_misses(), "a hit is not a miss");
+
+        cache.set_sync_loading_enabled(true);
+        assert!(cache
+            .get_or_load("https://example.test/other.png", false)
+            .is_some());
+        assert!(
+            !cache.has_sync_misses(),
+            "the synchronous compatibility loader never reports a miss"
+        );
+    }
+
+    #[test]
+    fn cache_only_miss_queue_respects_the_cache_entry_limit() {
+        let mut cache = RenderResourceCache::with_loader_and_limits(
+            |_url: &str| None,
+            1,
+            DEFAULT_RESOURCE_CACHE_BYTES,
+        );
+        cache.set_sync_loading_enabled(false);
+
+        assert!(cache
+            .get_or_load("https://example.test/first.png", false)
+            .is_none());
+        assert!(cache
+            .get_or_load("https://example.test/second.png", false)
+            .is_none());
+        assert_eq!(cache.take_sync_misses().len(), 1);
+
+        assert!(cache
+            .get_or_load("https://example.test/second.png", false)
+            .is_none());
+        assert_eq!(
+            cache.take_sync_misses().len(),
+            1,
+            "a deferred miss is reported later"
+        );
     }
 
     #[test]
@@ -15530,7 +15752,7 @@ mod tests {
 
         assert_eq!(fonts.len(), 1);
         assert_eq!(fonts[0].family.as_deref(), Some("Fixture"));
-        assert_eq!(fonts[0].data, SERIF_FONT_BYTES);
+        assert_eq!(fonts[0].data.as_slice(), SERIF_FONT_BYTES);
         assert_eq!(
             *loads.lock().expect("font loads"),
             vec![

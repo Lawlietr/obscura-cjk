@@ -496,6 +496,24 @@ fn cap_malloc_arenas() {
     }
 }
 
+/// Return free glibc heap pages after the last CDP connection tears down.
+///
+/// A connection owns its pages, DOMs, render buffers, and V8 isolates. Dropping
+/// those objects releases the allocations, but glibc normally keeps the freed
+/// pages mapped for reuse, so a server that becomes idle can retain its peak RSS
+/// indefinitely (#873). Trimming only when this is the final live connection
+/// avoids imposing a process-wide allocator pause on active clients.
+fn release_idle_connection_memory() {
+    #[cfg(target_env = "gnu")]
+    {
+        // SAFETY: malloc_trim is process-wide and thread-safe. The caller has
+        // already dropped this connection's LocalSet and Tokio runtime.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+}
+
 /// Run one WebSocket connection on its own OS thread: a `current_thread` tokio
 /// runtime + `LocalSet` hosting this connection's `cdp_processor` (with its own
 /// `CdpContext` and pages) and its frame reader. Confining a connection's pages
@@ -514,10 +532,17 @@ fn run_connection(
     // however it exits — clean close, error return, or panic. A plain
     // decrement at the end of the closure would leak slots on the early
     // returns below until the cap wedged the server shut.
-    struct SlotGuard(Arc<AtomicUsize>);
+    struct SlotGuard(Option<Arc<AtomicUsize>>);
+    impl SlotGuard {
+        fn release(&mut self) -> Option<usize> {
+            self.0
+                .take()
+                .map(|counter| counter.fetch_sub(1, Ordering::AcqRel).saturating_sub(1))
+        }
+    }
     impl Drop for SlotGuard {
         fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::AcqRel);
+            self.release();
         }
     }
 
@@ -525,7 +550,7 @@ fn run_connection(
     let spawned = std::thread::Builder::new()
         .name("obscura-cdp-conn".into())
         .spawn(move || {
-            let _slot = SlotGuard(slot);
+            let mut slot_guard = SlotGuard(Some(slot));
             let default_context = Arc::new(
                 context_template.isolated_copy("default".to_string(), true),
             );
@@ -565,6 +590,12 @@ fn run_connection(
                 let _ = processor.await;
             });
 
+            // `LocalSet` owns any detached local navigation tasks, and the
+            // runtime owns their scheduler allocations. Drop both before the
+            // idle trim so every page allocation is eligible to be returned.
+            drop(local);
+            drop(rt);
+
             // Apply only this connection's cookie changes to the persistence
             // template. Unchanged cookies cannot overwrite another connection's
             // updates, while explicit deletes and replacements still persist.
@@ -576,6 +607,11 @@ fn run_connection(
                     &persisted_context.cookie_jar.get_all_cookies(),
                 );
                 persistence_context.save_cookies();
+            }
+
+            drop(persisted_context);
+            if slot_guard.release() == Some(0) {
+                release_idle_connection_memory();
             }
         });
 
@@ -747,7 +783,7 @@ fn accept_dispatch(
         // The request head is already sitting in the kernel receive buffer;
         // switch back to blocking mode for the synchronous /json serve.
         let _ = stream.set_nonblocking(false);
-        return handle_http_json_blocking(stream, port, ep);
+        return handle_http_json_blocking(stream, port, ep, head);
     }
     // Fall through: GET request that isn't a /json endpoint → treat as
     // WebSocket upgrade (Chromium DevTools clients issue GET with
@@ -775,11 +811,13 @@ fn handle_http_json_blocking(
     mut stream: std::net::TcpStream,
     port: u16,
     endpoint: &str,
+    request_head: &str,
 ) -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
     let mut buf = vec![0u8; 4096];
     let _ = stream.read(&mut buf)?;
+    let authority = websocket_authority(request_head, port);
 
     let body = match endpoint {
         "version" => serde_json::to_string_pretty(&json!({
@@ -788,7 +826,7 @@ fn handle_http_json_blocking(
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
             "V8-Version": "14.5.0.0",
             "WebKit-Version": "537.36",
-            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
+            "webSocketDebuggerUrl": format!("ws://{}/devtools/browser", authority),
         }))?,
         "list" => serde_json::to_string_pretty(&json!([{
             "description": "",
@@ -797,7 +835,7 @@ fn handle_http_json_blocking(
             "title": "",
             "type": "page",
             "url": "about:blank",
-            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/page-1", port),
+            "webSocketDebuggerUrl": format!("ws://{}/devtools/page/page-1", authority),
         }]))?,
         "protocol" => {
             serde_json::to_string_pretty(&json!({ "version": { "major": "1", "minor": "3" } }))?
@@ -812,6 +850,27 @@ fn handle_http_json_blocking(
     stream.write_all(resp.as_bytes())?;
     stream.flush()?;
     Ok(())
+}
+
+fn websocket_authority(request_head: &str, port: u16) -> String {
+    request_head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.trim())
+        .filter(|value| {
+            let Ok(url) = url::Url::parse(&format!("http://{value}/")) else {
+                return false;
+            };
+            url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("127.0.0.1:{port}"))
 }
 
 /// Per-connection CDP processor. Each connection runs its own processor (with
@@ -905,6 +964,7 @@ async fn cdp_processor(
                             tokio::task::yield_now().await;
                         }
                     }
+                    service_live_page_render_resources(&mut ctx);
                     sync_live_page_network_events(&mut ctx);
                     dispatch::drain_runtime_events(&mut ctx);
                     dispatch::drain_binding_calls(&mut ctx);
@@ -1091,57 +1151,100 @@ fn emit_intercepted_request(
 }
 
 async fn pump_live_page_event_loop(ctx: &mut CdpContext) -> Result<bool, String> {
-    let Some(page) = ctx.pages.iter_mut().find(|page| page.has_js()) else {
+    // Several pages on one connection can be live at once (#872), each with its
+    // own event loop, so pump a turn on *every* live page rather than only the
+    // first. The pump stays armed until all live pages report idle.
+    let live_ids: Vec<String> = ctx
+        .pages
+        .iter()
+        .filter(|page| page.has_js())
+        .map(|page| page.id.clone())
+        .collect();
+    if live_ids.is_empty() {
         return Ok(true);
-    };
-    page.run_autonomous_event_loop_turn().await
+    }
+    let mut all_idle = true;
+    for page_id in live_ids {
+        if let Some(page) = ctx.get_page_mut(&page_id) {
+            all_idle &= page.run_autonomous_event_loop_turn().await?;
+        }
+    }
+    Ok(all_idle)
+}
+
+/// Apply finished background render-resource loads and start loads for
+/// resources the last layout/paint missed, for every live page. Runs before a
+/// command (so it observes bytes that landed while the client was silent),
+/// after a command (so its layout misses start loading immediately) and after
+/// each autonomous pump turn.
+fn service_live_page_render_resources(ctx: &mut CdpContext) {
+    for page in ctx.pages.iter_mut().filter(|page| page.has_js()) {
+        page.queue_pending_render_resources();
+    }
 }
 
 fn sync_live_page_network_events(ctx: &mut CdpContext) {
-    let page_route = ctx.pages.iter().find(|page| page.has_js()).and_then(|page| {
-        ctx.sessions
+    // Emit script-initiated network events for every live page, each attributed
+    // to its own session/frame — not just the first live page (#872).
+    let live_ids: Vec<String> = ctx
+        .pages
+        .iter()
+        .filter(|page| page.has_js())
+        .map(|page| page.id.clone())
+        .collect();
+    for page_id in live_ids {
+        let Some(session_id) = ctx
+            .sessions
             .iter()
-            .find(|(_, page_id)| *page_id == &page.id)
-            .map(|(session_id, _)| {
-                (
-                    Some(session_id.clone()),
-                    page.id.clone(),
-                    page.frame_id.clone(),
-                    page.url_string(),
-                )
-            })
-    });
-    let Some((session_id, page_id, frame_id, page_url)) = page_route else {
-        return;
-    };
-    let network_events = {
-        let Some(page) = ctx.get_page_mut(&page_id) else {
-            return;
+            .find(|(_, pid)| *pid == &page_id)
+            .map(|(session_id, _)| Some(session_id.clone()))
+        else {
+            continue;
         };
-        page.sync_js_network_events();
-        page.network_events.drain(..).collect::<Vec<_>>()
-    };
-    crate::domains::page::emit_runtime_network_events(
-        ctx,
-        &session_id,
-        &frame_id,
-        &page_url,
-        &page_id,
-        &network_events,
-    );
+        let (frame_id, page_url, network_events) = {
+            let Some(page) = ctx.get_page_mut(&page_id) else {
+                continue;
+            };
+            page.sync_js_network_events();
+            (
+                page.frame_id.clone(),
+                page.url_string(),
+                page.network_events.drain(..).collect::<Vec<_>>(),
+            )
+        };
+        if network_events.is_empty() {
+            continue;
+        }
+        crate::domains::page::emit_runtime_network_events(
+            ctx,
+            &session_id,
+            &frame_id,
+            &page_url,
+            &page_id,
+            &network_events,
+        );
+    }
 }
 
 fn take_live_pending_navigation(
     ctx: &CdpContext,
 ) -> Option<(String, String, String, String)> {
-    let page = ctx.pages.iter().find(|page| page.has_js())?;
-    let session_id = ctx
-        .sessions
-        .iter()
-        .find(|(_, page_id)| *page_id == &page.id)
-        .map(|(session_id, _)| session_id.clone())?;
-    let (url, method, body) = page.take_pending_navigation()?;
-    Some((session_id, url, method, body))
+    // With several live pages, a pending navigation may belong to any of them,
+    // not just the first live page — scan until one yields a navigation (#872).
+    for page in ctx.pages.iter().filter(|page| page.has_js()) {
+        let Some(session_id) = ctx
+            .sessions
+            .iter()
+            .find(|(_, page_id)| *page_id == &page.id)
+            .map(|(session_id, _)| session_id.clone())
+        else {
+            continue;
+        };
+        if let Some((url, method, body)) = page.take_pending_navigation() {
+            return Some((session_id, url, method, body));
+        }
+    }
+    None
 }
 
 fn forward_pending_events(
@@ -1198,7 +1301,7 @@ fn is_navigate_method(text: &str) -> bool {
 // Fetch.continueRequest / fulfillRequest) into a map. Returns None when the
 // `headers` field is absent, so the caller can leave the request's headers
 // untouched rather than clearing them.
-fn parse_cdp_headers(params: &serde_json::Value) -> Option<HashMap<String, String>> {
+pub(crate) fn parse_cdp_headers(params: &serde_json::Value) -> Option<HashMap<String, String>> {
     let arr = params.get("headers")?.as_array()?;
     Some(
         arr.iter()
@@ -1239,14 +1342,18 @@ fn handle_fetch_resolution(
                 "Fetch.fulfillRequest" => {
                     let status = req.params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
                     let raw_body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                    // `body` is a lossy text view; `body_base64` carries the CDP
+                    // body (already base64) through unchanged so op_fetch_url can
+                    // hand JS the exact bytes for a binary fulfill (#912).
                     let body = decode_base64(raw_body);
+                    let body_base64 = raw_body.to_string();
                     let headers = req.params.get("responseHeaders")
                         .and_then(|v| v.as_array())
                         .map(|arr| arr.iter().filter_map(|h| {
                             Some((h.get("name")?.as_str()?.to_string(), h.get("value")?.as_str()?.to_string()))
                         }).collect())
                         .unwrap_or_default();
-                    obscura_js::ops::InterceptResolution::Fulfill { status, headers, body }
+                    obscura_js::ops::InterceptResolution::Fulfill { status, headers, body, body_base64 }
                 }
                 "Fetch.failRequest" => {
                     let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string();
@@ -1308,20 +1415,15 @@ async fn process_with_interception(
         }
     };
 
-    // Issue #19 follow-up: V8 only allows ONE entered Isolate per OS thread.
-    // The regular dispatch path enforces this via `get_session_page_mut`
-    // (which `suspend_js`'es every other page before letting the target
-    // page run JS). The interception path here bypasses that — it removes
-    // the target page and spawns a nav task — so we have to enforce the
-    // same invariant explicitly. Otherwise nav-2's `init_js` constructs
-    // Isolate-2 while page-1's Isolate-1 is still alive in ctx.pages, and
-    // the next V8 scope unwind aborts the process via `Context::Exit`'s
-    // `heap->isolate() == Isolate::TryGetCurrent()` check.
-    for other in ctx.pages.iter_mut() {
-        if other.has_js() {
-            other.suspend_js();
-        }
-    }
+    // V8 allows only ONE *entered* isolate per OS thread, but many *live*
+    // ones. Since #756 every op enters its isolate only transiently (never
+    // across an `.await`) and construction leaves the entry stack empty, so a
+    // nav task's `init_js` can build a new isolate while other pages' isolates
+    // are live without tripping `Context::Exit`'s
+    // `heap->isolate() == Isolate::TryGetCurrent()` check. The old defensive
+    // `suspend_js` of every other page here (which tore their heaps down and
+    // was never resumed once the dispatch-path resume was removed in #872) is
+    // therefore no longer needed and would strand concurrent pages.
 
     let url = req.params.get("url").and_then(|v| v.as_str()).unwrap_or("");
     let wait_until = crate::domains::page::parse_wait_until(&req.params);
@@ -1541,7 +1643,9 @@ async fn process_cdp_message(
 
     tracing::debug!("CDP: {} (id={}, s={:?})", req.method, req.id, req.session_id);
 
+    service_live_page_render_resources(ctx);
     let response = dispatch::dispatch(&req, ctx).await;
+    service_live_page_render_resources(ctx);
 
     // Chromium CDP semantics: events emitted as a side-effect of a command
     // (e.g. Target.targetCreated + Target.attachedToTarget from
@@ -1576,7 +1680,7 @@ async fn process_cdp_message(
     }
 }
 
-fn decode_base64(input: &str) -> String {
+pub(crate) fn decode_base64(input: &str) -> String {
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
@@ -1732,12 +1836,25 @@ async fn handle_connection_ws(
 mod tests {
     use super::{
         handle_fetch_resolution, is_navigate_method, merge_cookie_delta, parse_cdp_headers,
+        websocket_authority,
     };
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn discovery_uses_the_client_facing_http_authority() {
+        let request = "GET /json/version HTTP/1.1\r\nhOsT: cdp.example.test:9222\r\n\r\n";
+        assert_eq!(
+            websocket_authority(request, 9223),
+            "cdp.example.test:9222"
+        );
+
+        let malformed = "GET /json/version HTTP/1.1\r\nHost: attacker.test/path\r\n\r\n";
+        assert_eq!(websocket_authority(malformed, 9223), "127.0.0.1:9223");
+    }
 
     fn cookie(name: &str, value: &str) -> CookieInfo {
         CookieInfo {

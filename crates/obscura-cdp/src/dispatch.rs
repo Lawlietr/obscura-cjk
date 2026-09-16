@@ -515,25 +515,22 @@ impl CdpContext {
     }
 
     pub fn get_session_page_mut(&mut self, session_id: &Option<String>) -> Option<&mut Page> {
+        // Lazily bring the target page's JS isolate live, but — unlike before —
+        // do NOT suspend the other pages. Since #756 made N concurrently-live
+        // isolates on one thread safe (every op enters its isolate only
+        // transiently, never across an `.await`), routing a command to one page
+        // no longer needs to tear down another's isolate. Tearing them down is
+        // exactly what silently destroyed a concurrent page's JS heap and
+        // object handles (#872); a page resumed here now simply stays live.
         let page_id = session_id
             .as_ref()
             .and_then(|sid| self.sessions.get(sid))
             .cloned()?;
-
-        let target_has_js = self.pages.iter().any(|p| p.id == page_id && p.has_js());
-
-        if !target_has_js {
-            for page in &mut self.pages {
-                if page.id != page_id && page.has_js() {
-                    page.suspend_js();
-                    break;
-                }
-            }
-            if let Some(target) = self.pages.iter_mut().find(|p| p.id == page_id) {
+        if let Some(target) = self.pages.iter_mut().find(|p| p.id == page_id) {
+            if !target.has_js() {
                 target.resume_js();
             }
         }
-
         self.get_page_mut(&page_id)
     }
 }
@@ -647,9 +644,10 @@ mod context_ownership_tests {
 ///
 /// Methods listed here were audited to confirm they do not transitively
 /// call into a `JsRuntime`. They either don't touch any `Page` at all, or
-/// use only the immutable `get_session_page` accessor and Rust-side field
-/// reads. `get_session_page_mut` triggers `suspend_js`/`resume_js` and
-/// must stay behind the lock.
+/// use only page accessors plus Rust-side field reads and run no script.
+/// (As of #872 `get_session_page_mut` no longer enters V8 — it just returns
+/// the session's page — so calling it does not by itself require the lock;
+/// only a handler that actually runs JS does.)
 fn is_v8_free_method(method: &str) -> bool {
     matches!(
         method,
@@ -742,8 +740,8 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     // Optimization: methods that demonstrably never touch V8 bypass the lock
     // (Puppeteer's newPage() setup issues ~8 such calls). Each listed method was
     // audited to confirm it never reaches `JsRuntime::execute_script` or DOM
-    // mutation that re-enters V8; `get_session_page_mut` (which can trigger
-    // `suspend_js`/`resume_js`) is NOT in the list.
+    // mutation that re-enters V8. (`get_session_page_mut` itself no longer
+    // enters V8 as of #872, so calling it is not what gates a method here.)
     let _v8_guard = if is_v8_free_method(&req.method) {
         None
     } else {
