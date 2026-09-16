@@ -6,6 +6,16 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
 
 ## 待辦
 
+### 上游合併 #2（2026-09-17，`694c8e1`，71 commits since `727cc46`）
+
+- [ ] 合併後回歸：`render,cjk` nextest + release build + 障礙課程 32/33。
+- [ ] CJK 抽檢：cjk fixture 截圖無豆腐框；確認 `extra_fallback_fonts`
+      已注入新 `base_font_database` cache 架構（HTML + SVG 兩路徑）。
+- [ ] 文件同步：兩套字型目錄機制並存需寫清楚（fork `--fonts`/
+      `OBSCURA_FONTS_DIR`：非遞迴、支援 woff/woff2；上游 `--font-dir`：
+      serve 層可重複、遞迴、純 sfnt、須在首次 render 前設定）。
+      目標檔案：AGENTS.md、docs/CJK-and-custom-fonts.md、docs/CLI-reference.md。
+
 ### 中-高優先級（2026-09-16 問題回報，Leaflet 1.9.4 + `obscura-cjk:merged-local` 實測）
 
 - [ ] SVG DOM API 補齊（factory 方法 + animated-value + shape class +
@@ -45,6 +55,18 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
       `df -h /`。
 
 ## 完成進度
+
+### 上游合併
+
+- [x] **上游合併 #2（2026-09-17，`694c8e1`）。** 4 個衝突手解：
+      `inline.rs` 採上游字型 cache 架構（`base_font_database`/
+      `cached_web_font_database`、`WebFont.data` 改 `Arc`），fork 的
+      CJK + `OBSCURA_FONTS_DIR` fallback 改注入 `base_font_database()`，
+      與上游 `--font-dir`（`FONT_DIRECTORIES`）兩套並存；`paint.rs` 保留
+      `decode_font_bytes` 去重 + SVG fallback 更名函式，採上游 `Arc` 型別；
+      `release.yml` 保留 cjk/cjk-stealth 兩變體，採上游 `release-dist`
+      profile；`README.md` 保留 fork 精簡版。其餘 30+ 檔（cdp/dom/js/net/
+      mcp/render style+dom、taffy float）直接採上游 bug 修正。
 
 ### Release
 
