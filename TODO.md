@@ -13,8 +13,12 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
       browser+mcp 479/3），2026-09-17 重跑。
 - [ ] 合併後回歸（剩餘關卡）：release build（`render,cjk`）+ 障礙課程 32/33。
       障礙課程自 2026-09-17 合併後尚未重跑。
-- [ ] CJK 抽檢：cjk fixture 截圖無豆腐框；確認 `extra_fallback_fonts`
-      已注入新 `base_font_database` cache 架構（HTML + SVG 兩路徑）。
+- [x] **CJK 截檢（2026-09-17）。** `target/release/obscura`（`render,cjk`
+      建置，139MB）跑 `cjk-fallback.html`：text dump 繁/簡/日/混排字元全數
+      正確還原；截圖 55KB 無豆腐框，字距與行高跟實字形 advance。`extra_fallback_fonts`
+      注入新 `base_font_database` 快取架構兩路徑皆確認：HTML 路徑
+      `base_font_database()`（inline.rs:462 注入 `BASE_FONT_DATABASE`）、SVG
+      路徑 `svg_font_database_with_fallbacks()`（paint.rs:10364）。
 - [x] 文件同步：兩套字型目錄機制並存已寫清楚（fork `--fonts`/
       `OBSCURA_FONTS_DIR`：非遞迴、支援 woff/woff2；上游 `--font-dir`：
       serve 層可重複、遞迴、純 sfnt、須在首次 render 前設定）。
@@ -106,6 +110,9 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
       全量 **1691 passed / 4 skipped / 0 failed**（render 601/1、js+net
       611/0、cdp+dom+cli+browser+mcp 479/3）。release build、障礙課程 32/33
       與 CJK 截檢未隨本批執行（障礙課程留待後續）。
+- [x] **CJK 視覺抽檢（2026-09-17）。** 繁/簡/日/混排字形正確，截圖 55KB，
+      豆腐框全無；`extra_fallback_fonts` 已注入新 `base_font_database` 快取
+      架構（HTML + SVG 兩路徑）。
 - [x] **完整回歸（2026-08-25）。** `render,cjk` 1487/1487、`render`
       1486/1486（各 4 skipped）；建置 6m19s。
 - [x] **磁碟檢查（2026-08-25）。** 測試後 6.5G 可用（78%）；清
