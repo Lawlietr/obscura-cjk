@@ -37,13 +37,16 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
       Leaflet 點擊座標換算出 NaN）。
       細節：[design/cssom-view-box-geometry.md](design/cssom-view-box-geometry.md)
 
-### Release：v0.2.0-cjk
+### Release：v0.2.1-cjk
 
-- [ ] push main + 打 tag `v0.2.0-cjk`（觸發 release ~28min 五平台 ×
-      cjk/cjk-stealth 兩變體 + docker GHCR ~7min）。
-- [ ] release 跑完後：抽驗 cjk-stealth 變體 smoke test（#831 動了
-      wreq，本機無 cmake 無法本地建置驗證）；本機 `docker-compose.yaml`
-      從 `obscura-cjk:merged-local` 切回 `ghcr.io/lawlietr/obscura-cjk:latest`。
+- [x] push main + 打 tag `v0.2.1-cjk`（2026-09-17 早上觸發 release，
+      已上線：https://github.com/Lawlietr/obscura-cjk/releases/tag/v0.2.1-cjk）。
+- [x] 本機 `docker-compose.yaml` 切回 `ghcr.io/lawlietr/obscura-cjk:latest`
+      （2026-09-17）。pull + `docker compose up -d` 重建容器；MCP smoke：
+      initialize 回 `serverInfo 0.2.1-cjk`、navigate example.com、
+      evaluate 含 CJK 字串、screenshot PNG、close 全過。
+- [ ] 抽驗 cjk-stealth 變體 smoke test（#831 動了 wreq，本機無 cmake
+      無法本地建置驗證）。
 - 細節：[design/release-workflow.md](design/release-workflow.md)
 
 ### Dependabot
@@ -79,6 +82,9 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
 
 ### Release
 
+- [x] **v0.2.1-cjk release（2026-09-17）。** tag 推送後 release 上線；
+      本機 compose 已切回 GHCR `latest`，容器重建後 MCP smoke test
+      （navigate / evaluate / CJK / screenshot / close）全數通過。
 - [x] **v0.2.0-cjk 上游大合併（2026-09-07）。** 自分叉點 `c1380190`
       起 114 commits（~40 PR，+9482/−1056 行，44 檔）；3 個衝突全數
       按預先評估處理。
@@ -168,5 +174,7 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
 - 工作分支：`main`（追蹤 `origin/main`）
 - 首個 tag：`v0.1.0-cjk` @ `84c7223`（2026-08-24 推送，觸發首次
   release）
+- 最新 tag：`v0.2.1-cjk`（2026-09-17 推送；本機 compose 已跟隨 GHCR
+  `latest` 驗證通過）
 - 上游 `h4ckf0r0day/obscura` 目前未設 remote，僅歷史與 Apache-2.0
   授權歸屬參考
