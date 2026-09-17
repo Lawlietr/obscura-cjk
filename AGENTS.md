@@ -99,6 +99,13 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
 
 - The first build compiles V8 from source: ~5 minutes and a few GB of disk.
   Incremental builds are seconds.
+- **Disk: check before, watch during.** A full `target/` reaches ~8 GB on this
+  host (`release` ~5 G, `release-dist` ~1.5 G, `debug` ~1.5 G). A cold build
+  (`cargo clean` then build, or `--profile release-dist`, which rebuilds V8 and
+  applies fat LTO into its own `target/release-dist/`) needs the whole tree plus
+  V8 temp files in flight, so keep at least ~12 GB free first (`df -h /`) and
+  watch it during the run. A release-dist build once filled the disk mid-compile
+  and was killed; keep an eye out so it does not recur.
 - **CJK:** `--features render,cjk` embeds Noto Sans CJK SC/TC Regular as
   glyph-level fallback faces (SIL OFL) so Chinese/Japanese text shapes without
   any host fonts or page webfonts. It is off by default to keep the base
@@ -304,6 +311,11 @@ screenshots or reports.
 - **SSRF:** loopback / RFC1918 / link-local fetches are blocked by default. Use
   `--allow-private-network` (or `OBSCURA_ALLOW_PRIVATE_NETWORK=1`) for local
   testing.
+- **Disk fills during big builds.** `cargo build --profile release-dist` (and a
+  cold `cargo clean` + build) recompiles V8 and fat-LTOs it, and `target/` grows
+  toward ~8 GB. Check `df -h /` for >= ~12 GB free before starting and poll it
+  during the run; the release-dist build previously filled the disk and was
+  killed mid-compile.
 
 ## Robustness invariants (do not remove)
 
