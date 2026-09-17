@@ -6,7 +6,7 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
 
 ## 待辦
 
-### 上游合併 #2（2026-09-17，`694c8e1`，71 commits since `727cc46`）
+### 高優先級｜上游合併 #2（2026-09-17，`694c8e1`，71 commits since `727cc46`）
 
 - [x] 合併後回歸（nextest）：`render,cjk` 九 crate 全量 **1691 passed /
       4 skipped / 0 failed**（render 601/1、js+net 611/0、cdp+dom+cli+
@@ -25,19 +25,7 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
       2026-09-17 更新：AGENTS.md、docs/CJK-and-custom-fonts.md、
       docs/Environment-variables.md；docs/CLI-reference.md 原本已兩套並存。
 
-### 中-高優先級（2026-09-16 問題回報，Leaflet 1.9.4 + `obscura-cjk:merged-local` 實測）
-
-- [ ] SVG DOM API 補齊（factory 方法 + animated-value + shape class +
-      SVG2 反射），分「最小 / 完整」兩層。
-      細節：[design/svg-dom-api.md](design/svg-dom-api.md)
-- [ ] MCP `browser_console_messages` 接線（目前死欄位，永遠回
-      "No console messages."；未捕獲例外同樣捕不到）。
-      細節：[design/mcp-console-capture.md](design/mcp-console-capture.md)
-- [ ] CSSOM View 盒模型 getter（`clientLeft` / `clientTop` 等，
-      Leaflet 點擊座標換算出 NaN）。
-      細節：[design/cssom-view-box-geometry.md](design/cssom-view-box-geometry.md)
-
-### Release：v0.2.1-cjk
+### 中優先級｜Release：v0.2.1-cjk
 
 - [x] push main + 打 tag `v0.2.1-cjk`（2026-09-17 早上觸發 release，
       已上線：https://github.com/Lawlietr/obscura-cjk/releases/tag/v0.2.1-cjk）。
@@ -49,7 +37,7 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
       無法本地建置驗證）。
 - 細節：[design/release-workflow.md](design/release-workflow.md)
 
-### Dependabot
+### 中優先級｜Dependabot
 
 - [ ] Repo Settings 確認 Dependabot GitHub App 權限（public repo 預設
       已啟用，無需額外開關；security alerts 預設開）。
@@ -60,7 +48,37 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
       （RUSTSEC ID 綁定 transitive 版本，cargo-deny CI 會提示）。
 - 細節：[design/dependabot.md](design/dependabot.md)
 
-### 本機環境（非仓库變更）
+### 低優先級｜Leaflet 功能補齊（2026-09-16 問題回報，Leaflet 1.9.4 + `obscura-cjk:merged-local` 實測）
+
+> 2026-09-17 拆分為獨立子項，可各自獨立 PR。建議順序 A → B → C（三個
+> 快速勝利，做完 Leaflet 地圖頁基本可用）→ D/E → F 決策 → G。A、B、F、G
+> 互相獨立；僅 SVG 鏈有依賴 C → D → E。全部完成後加一批驗證收尾
+> （全量 nextest + release build + 障礙課程，~0.5 天，可與「上游合併 #2
+> 剩餘關卡」合併跑）。
+
+- [ ] **（A）CSSOM View 盒模型 getter**（`clientLeft` / `clientTop` /
+      `clientRight` / `clientBottom`，Leaflet 點擊座標換算出 NaN）。~25 行，
+      0.5–1 天。細節：[design/cssom-view-box-geometry.md](design/cssom-view-box-geometry.md)
+- [ ] **（B）MCP `browser_console_messages` 接線**（目前死欄位，永遠回
+      "No console messages."；未捕獲例外同樣捕不到）。三層接線：
+      `set_runtime_events_enabled(true)` + drain `take_pending_runtime_events()`
+      + 格式化。0.5–1 天，含 chatty 頁面效能量測。細節：
+      [design/mcp-console-capture.md](design/mcp-console-capture.md)
+- [ ] **（C）SVG factory 方法（最小層）**：`createSVGRect` /
+      `createSVGPoint` / `createSVGNumber` / `createSVGAngle` /
+      `createSVGMatrix` / `createSVGTransform`，解鎖 Leaflet 功能偵測
+      （驗收：`L.Browser.svg === true`，向量層正常渲染）。0.5–1 天。
+      細節：[design/svg-dom-api.md](design/svg-dom-api.md)
+- [ ] **（D）SVG shape class + `instanceof` 映射**（`SVGCircleElement` 等 +
+      `_elementClassFor`）。依賴 C。估算含在 2–3 天完整層內。
+- [ ] **（E）SVG animated transform + `getTotalLength` /
+      `getPointAtLength` + SVG2 屬性反射**。依賴 D。
+- [ ] **（F）`getBBox` 處理決策**：快速回 `DOMException`（數小時）vs 讀真實
+      幾何（需 layout 資料，與 G 同類）。先決策再排期。
+- [ ] **（G）`getCTM` / `getScreenCTM`**：需 frame transform 鏈 / layout
+      資料，成本高，獨立排程，預估 2–4 天。
+
+### 低優先級（可選）｜本機環境（非仓库變更）
 
 - [ ] 可選：`obscura-benchmark` 倉庫 clone 下來跑完整驗證。
 - [ ] 磁碟衛生：`target/release/deps` 定期清舊 binary；重 build 前查
