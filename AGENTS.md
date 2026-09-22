@@ -316,6 +316,20 @@ screenshots or reports.
   toward ~8 GB. Check `df -h /` for >= ~12 GB free before starting and poll it
   during the run; the release-dist build previously filled the disk and was
   killed mid-compile.
+- **HIGH PRIORITY — React hydration may silently never complete** (reported
+  2026-09-22 from the `translate` project; full report:
+  [design/hydration-bug-report.md](design/hydration-bug-report.md), TODO.md
+  HP-1). A Next.js 16 dev (Turbopack) + React 19 page renders its SSR HTML with
+  zero console errors but never hydrates: no `__reactFiber*` keys on any
+  element, all event handlers dead, `browser_click` and DOM `element.click()`
+  both no-ops — while the identical page hydrates and works in real Chromium.
+  Two suspects: (1) websocket/HMR handling — Next 16 dev hydration is
+  empirically gated on the HMR ws (an HTTP proxy without `upgrade` forwarding
+  reproduces the exact dead state); (2) Origin/Referer on `/_next/*`
+  dev-resource requests — Next 16 dev 403s cross-origin dev resources, which
+  would kill the dev client silently. Until fixed, use real Chromium
+  (Playwright) for any click→assert verification; Obscura is
+  screenshots/read-only probing only.
 
 ## Robustness invariants (do not remove)
 
@@ -359,5 +373,6 @@ The targeting options (country, region, session id) live in the proxy username,
 so a sticky session keeps the same exit IP across requests.
 
 Sign up: https://go.nodemaven.com/obscuraagentsmdseptembeb
+
 Obscura discount codes: `OBSCURA35` (35% off mobile and residential),
 `OBSCURA40` (40% off ISP / static).
