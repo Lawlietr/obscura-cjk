@@ -6,21 +6,18 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
 
 ## 待辦
 
-### 高優先級｜React hydration 靜默未完成 — 事件處理器全死、點擊無效（2026-09-22 問題回報，translate 專案實測）
+### 低優先級（可選）｜React hydration 靜默未完成 — 事件處理器全死、點擊無效（2026-09-22 問題回報，translate 專案實測）
 
-> 影響所有「點擊 → 斷言狀態改變」類功能驗證；目前下游專案改走真 Chromium
-> （Playwright）規避。症狀、重現環境、懷疑方向（ws/HMR、Origin/Referer）與
-> 最小重現建議：
+> 下游專案採兩階段策略：Obscura 負責截圖 + 只讀 DOM 探測（SSR 內容不受
+> 影響），「點擊 → 斷言狀態改變」類驗證改走真 Chromium（Playwright）。
+> Obscura 定位維持 scraping/只讀自動化，WebSocket 支援非核心需求。
+> 症狀、環境、懷疑方向（ws/HMR、Origin/Referer）與最小重現建議：
 > [design/hydration-bug-report.md](design/hydration-bug-report.md)
 
-- [ ] 最小重現：純 React 19 單頁（非 Next）在 Obscura 能否 hydrate → 排除/
-      確認框架相關性
-- [ ] 驗證 production build 是否同受影響（目前僅 dev 模式實證；Next 16 dev
-      hydration 實證上被 HMR websocket 卡住——不轉發 `upgrade` 的代理可重現
-      完全相同的死狀）
-- [ ] 定位：與 Playwright 對照 `/_next/*` dev 資源請求 headers
-      （Origin/Referer）與 websocket 生命週期
-- [ ] 修復 + 回歸（障礙課程 + 下游 translate 45 項交互檢查）
+- [ ] （可選）最小重現：純 React 19 單頁（非 Next）在 Obscura 能否 hydrate
+- [ ] （可選）驗證 production build 是否同受影響
+- [ ] （可選）定位：與 Playwright 對照 `/_next/*` dev 資源 headers 與 ws 生命週期
+- [ ] （可選）修復 + 回歸（需實作頁面級 WebSocket，屬獨立功能，非 fork regression）
 
 ### 高優先級｜上游合併 #2（2026-09-17，`694c8e1`，71 commits since `727cc46`）
 

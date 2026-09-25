@@ -316,20 +316,22 @@ screenshots or reports.
   toward ~8 GB. Check `df -h /` for >= ~12 GB free before starting and poll it
   during the run; the release-dist build previously filled the disk and was
   killed mid-compile.
-- **HIGH PRIORITY — React hydration may silently never complete** (reported
+- **Known limitation — React hydration may silently never complete** (reported
   2026-09-22 from the `translate` project; full report:
   [design/hydration-bug-report.md](design/hydration-bug-report.md), TODO.md
-  HP-1). A Next.js 16 dev (Turbopack) + React 19 page renders its SSR HTML with
-  zero console errors but never hydrates: no `__reactFiber*` keys on any
-  element, all event handlers dead, `browser_click` and DOM `element.click()`
-  both no-ops — while the identical page hydrates and works in real Chromium.
-  Two suspects: (1) websocket/HMR handling — Next 16 dev hydration is
-  empirically gated on the HMR ws (an HTTP proxy without `upgrade` forwarding
-  reproduces the exact dead state); (2) Origin/Referer on `/_next/*`
-  dev-resource requests — Next 16 dev 403s cross-origin dev resources, which
-  would kill the dev client silently. Until fixed, use real Chromium
-  (Playwright) for any click→assert verification; Obscura is
-  screenshots/read-only probing only.
+  HP-1, lowered to optional). A Next.js 16 dev (Turbopack) + React 19 page
+  renders its SSR HTML with zero console errors but never hydrates: no
+  `__reactFiber*` keys on any element, all event handlers dead, `browser_click`
+  and DOM `element.click()` both no-ops — while the identical page hydrates and
+  works in real Chromium. Root cause: Obscura has no page-level WebSocket
+  support (bootstrap.js exposes a stub that throws). Suspects: (1) websocket/HMR
+  handling — Next 16 dev hydration is empirically gated on the HMR ws (an HTTP
+  proxy without `upgrade` forwarding reproduces the exact dead state); (2)
+  Origin/Referer on `/_next/*` dev-resource requests — Next 16 dev 403s
+  cross-origin dev resources. Strategy: Obscura maintains its original focus on
+  scraping/read-only automation; for click→assert verification, use real
+  Chromium (Playwright). WebSocket support is a separate feature, not a fork
+  regression.
 
 ## Robustness invariants (do not remove)
 
