@@ -337,15 +337,18 @@ screenshots or reports.
   renders its SSR HTML with zero console errors but never hydrates: no
   `__reactFiber*` keys on any element, all event handlers dead, `browser_click`
   and DOM `element.click()` both no-ops — while the identical page hydrates and
-  works in real Chromium. Root cause: Obscura has no page-level WebSocket
-  support (bootstrap.js exposes a stub that throws). Suspects: (1) websocket/HMR
-  handling — Next 16 dev hydration is empirically gated on the HMR ws (an HTTP
-  proxy without `upgrade` forwarding reproduces the exact dead state); (2)
-  Origin/Referer on `/_next/*` dev-resource requests — Next 16 dev 403s
-  cross-origin dev resources. Strategy: Obscura maintains its original focus on
-  scraping/read-only automation; for click→assert verification, use real
-  Chromium (Playwright). WebSocket support is a separate feature, not a fork
-  regression.
+  works in real Chromium. Root cause: Obscura has no real page-level WebSocket
+  transport (bootstrap.js exposes a fake shim that transitions straight to
+  OPEN and drops `send()` data; no socket is established). Suspects: (1)
+  websocket/HMR handling — Next 16 dev hydration is empirically gated on the
+  HMR ws (an HTTP proxy without `upgrade` forwarding reproduces the exact dead
+  state); (2) Origin/Referer on `/_next/*` dev-resource requests — Next 16 dev
+  403s cross-origin dev resources. Strategy: Obscura maintains its original
+  focus on scraping/read-only automation; for click→assert verification, use
+  real Chromium (Playwright). A real websocket client is a separate feature,
+  not a fork regression; upstream PR h4ckf0r0day/obscura#1080
+  ("fix: implement websocket client") is open as of 2026-09-28 and would be
+  the candidate to pull in if real ws support is ever wanted.
 
 ## Robustness invariants (do not remove)
 

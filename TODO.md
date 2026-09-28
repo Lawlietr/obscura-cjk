@@ -88,13 +88,17 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
 > 下游專案採兩階段策略：Obscura 負責截圖 + 只讀 DOM 探測（SSR 內容不受
 > 影響），「點擊 → 斷言狀態改變」類驗證改走真 Chromium（Playwright）。
 > Obscura 定位維持 scraping/只讀自動化，WebSocket 支援非核心需求。
+> 2026-09-28 rebase 後註記：bootstrap.js 的 WebSocket 已是 fake shim
+>（直接轉 OPEN、send() 丟棄資料，非早期文件說的 throw stub）；upstream
+> PR h4ckf0r0day/obscura#1080（fix: implement websocket client）截至
+> 2026-09-28 仍 OPEN 未合併，未隨 rebase 進來。
 > 症狀、環境、懷疑方向（ws/HMR、Origin/Referer）與最小重現建議：
 > [design/hydration-bug-report.md](design/hydration-bug-report.md)
 
 - [ ] （可選）最小重現：純 React 19 單頁（非 Next）在 Obscura 能否 hydrate
 - [ ] （可選）驗證 production build 是否同受影響
 - [ ] （可選）定位：與 Playwright 對照 `/_next/*` dev 資源 headers 與 ws 生命週期
-- [ ] （可選）修復 + 回歸（需實作頁面級 WebSocket，屬獨立功能，非 fork regression）
+- [ ] （可選）修復 + 回歸（需實作頁面級 WebSocket，屬獨立功能，非 fork regression；候選來源：upstream PR h4ckf0r0day/obscura#1080，2026-09-28 時仍 OPEN）
 
 ### 低優先級｜Leaflet 功能補齊（2026-09-16 問題回報，Leaflet 1.9.4 + `obscura-cjk:merged-local` 實測）
 
