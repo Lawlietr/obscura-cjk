@@ -7454,6 +7454,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "render")]
     #[test]
     fn computed_style_exposes_generated_pseudo_content() {
         let mut rt = setup_runtime(
