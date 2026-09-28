@@ -1,99 +1,249 @@
 # TODO
 
-Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與重要事項。
-分支：`cjk`（已 rebase 到 `lawlietr/main` `2810cb4`，已 force-push）。
-主分支合併前，先跑完「合併前必做」的項目。
+Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
+工作分支：`main`。本文件只記錄條目、優先級與進度；實施細節放
+`design/` 目錄，各條目附鏈接。
 
-## Release：GitHub Actions 二進位發布
+## 待辦
 
-上游的 release 機制是 GitHub Actions，fork 已繼承三個 workflow
-（`.github/workflows/`）：
+### 【最高優先級】｜Upstream Rebase：基於 upstream/main 重建（deno_core 0.350 → 0.412）（2026-09-29 評估）
 
-- `release.yml`：push 任何 `v*` tag 觸發。5 平台全部**原生**建置
-  （x86_64 linux / aarch64 linux / aarch64 macos / x86_64 macos / windows），
-  每平台 4 個 feature 變體（`render`、`render,stealth`、`no-render`、
-  `no-render,stealth`），各打包 `obscura` + `obscura-worker`，
-  上傳前逐變體 smoke test（V8 isolate + 截圖），
-  發布 job 只下載 artifacts、不 checkout 程式碼（token 隔離）。
-- `docker.yml`：`v*` tag 觸發，buildx 多平台映像推 Docker Hub，
-  需要 repo secrets `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`。
-- `ci.yml`：PR checks，read-only token。
+> **背景：** Upstream `df8b058`（9/19）把 deno_core 從 0.350 升到 0.412，
+> 此後 78 commits 都基於新 API。Fork 最近一次 upstream merge（`694c8e1`,
+> 9/17）在此之前，所以 fork main 仍固定在 0.350。
+> `merge-wave2-security-render` 分支嘗試合併 upstream 變更但無法編譯
+>（API 全面不兼容），不應使用。
+>
+> **策略：** 從 `upstream/main` 建立新分支，cherry-pick fork 的 2 個
+> 程式碼 commits（`d0712cb` CJK 字型 + `c9af5de` fork 引用），再複製
+> fork 特有文件。完整計劃：
+> [design/upstream-rebase-20260929.md](design/upstream-rebase-20260929.md)
 
-### 待辦
+- [x] Phase 0: Pre-checks（磁碟 14 GB、remotes、upstream fetch）
+- [x] Phase 1: `git checkout -b rebase-upstream-20260929 upstream/main`
+- [x] Phase 2: Cherry-pick `d0712cb`（CJK）— 4 檔衝突全解：`inline.rs`
+      （fallback 注入移入 `base_font_database`）、`paint.rs`（`decode_font_bytes`
+      對齊 `Arc` 回傳型別）、`render/Cargo.toml`（保留 `obscura-ssrf` + 加 `cjk`
+      feature）、`AGENTS.md`（採 upstream 側）
+- [x] Phase 3: Cherry-pick `c9af5de`（fork 引用）— 3 檔衝突採 fork 版本
+- [x] Phase 4: 複製 fork 特有文件（design/ 7 檔、CJK docs、README_ZH、
+      compose example、dependabot、docker/release workflows）
+- [x] Phase 5: Release build（`render,cjk`，2m44s，148MB）
+- [x] Phase 6: 全量 nextest **1885 passed / 5 skipped / 0 failed** + CJK
+      fixture 截圖 55KB 無豆腐 + 障礙課程 **32/33**（2026-09-29）
+- [x] Phase 7: Push `rebase-upstream-20260929` 到 origin
+- [ ] 開 PR 或 force-push 到 main（由用戶決定）
+- [ ] 清理 `merge-wave2-security-render` 分支（本地 + 遠端）
+- [ ] 抽驗 cjk-stealth 變體 smoke test（#831 動了 wreq，本機無 cmake
+      無法本地建置驗證）— 原 v0.2.1-cjk 項，合併至此
 
-- [ ] **`release.yml` 加 `render,cjk` 變體。** 現狀只 build 上游的
-      feature 組合，照現狀打 tag 出的 release 二進位**沒有內嵌 CJK 字型**，
-      與 README 宣稱的 fork 特性不符。改法：build job 加一段
-      `--features render,cjk` 的 build + stage + package（每平台多一個
-      tarball，約 +20 行），smoke test 迴圈加入該變體。
-- [ ] **首次發布前決定 tag 策略。** fork 目前沒有任何 tag
-      （`git ls-remote --tags lawlietr` 為空）。version 號避免與上游撞
-      （上游 `1.0.103`，Cargo.toml 已同步該版本）。建議形如
-      `v1.0.104-cjk.1` 之類。`docs/Use-as-a-Rust-library.md` 的 git 依賴
-      pin 已從 `tag` 改為 `rev`（等第一個 tag 出來後可再改回 tag pin）。
-- [ ] **決定 `docker.yml` 的去留。** 目前會推到上游的 Docker Hub 帳密
-      變數所指向的帳號，fork 沒有該帳號。政策已是「映像檔本地 build，
-      不發布 registry」，選項：(a) 停用/移除 `docker.yml`，
-      (b) 改推到 `Lawlietr` 自己的 Docker Hub 帳號（需在 fork 的
-      Settings → Secrets 配置）。
-- [ ] 打第一個 tag push 觸發首次 release；驗證 artifacts 的 CJK 變體
-      截圖正常。
-- 額度備註：公開倉庫每月 2000 分鐘免費 Actions；5 平台 × V8 全編
-  約每平台 10–15 分鐘，单次 release 沒有額度問題。
+### 中優先級｜上游合併 #2 剩餘關卡（2026-09-17，`694c8e1`）
 
-## 合併前必做（cjk → main）
+> 注意：上游合併 #2 的 deno_core 版本（0.350）已過時，upstream 已升到
+> 0.412。剩餘關卡（release build + 障礙課程）應在 rebase 完成後跑，
+> 不必在舊 base 上重跑。
 
-- [ ] 完整回歸：`CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run
-      --release --features render,cjk --no-fail-fast`。
-      **post-rebase 尚未跑過**（rebase 前是 1399/1399，不適用現況）。
-      上游 933 commits 中有 1 個動到 `paint.rs`（box-shadow clip，
-      `00a8a81`，+178 行）——低風險但未驗證。
-- [ ] **先查磁碟**：`df -h /` 確保 ≥15G。`target/` 目前 ~8.7G，
-      nextest 會再產 ~5G 測試二進位（~134MB × ~40 個，V8-linked）。
-      不足時先清 `target/release/deps` 舊 binary。
-- [ ] CJK 視覺抽檢：
-      `OBSCURA_BIN=./target/release/obscura fetch
-      file://$PWD/render-repros/cjk/cjk-fallback.html --screenshot
-      "$RUN_ROOT/cjk.png"`，確認繁/簡/日文字形正確。
-- [ ] 非 cjk 路徑抽測（`--features render`）確認無回歸。
-- [ ] `obscura-benchmark` 障礙課程 33/33（該倉庫只存在於上游，本機沒有
-      clone；可選，但 AGENTS.md 列為正式 gate）。
+- [x] 合併後回歸（nextest）：`render,cjk` 九 crate 全量 **1691 passed /
+      4 skipped / 0 failed**（render 601/1、js+net 611/0、cdp+dom+cli+
+      browser+mcp 479/3），2026-09-17 重跑。
+- [x] ~~合併後回歸（剩餘關卡）~~ → 移至 rebase 完成後統一跑。
+- [x] **CJK 截檢（2026-09-17）。** `target/release/obscura`（`render,cjk`
+      建置，139MB）跑 `cjk-fallback.html`：text dump 繁/簡/日/混排字元全數
+      正確還原；截圖 55KB 無豆腐框，字距與行高跟實字形 advance。`extra_fallback_fonts`
+      注入新 `base_font_database` 快取架構兩路徑皆確認：HTML 路徑
+      `base_font_database()`（inline.rs:462 注入 `BASE_FONT_DATABASE`）、SVG
+      路徑 `svg_font_database_with_fallbacks()`（paint.rs:10364）。
+- [x] 文件同步：兩套字型目錄機制並存已寫清楚（fork `--fonts`/
+      `OBSCURA_FONTS_DIR`：非遞迴、支援 woff/woff2；上游 `--font-dir`：
+      serve 層可重複、遞迴、純 sfnt、須在首次 render 前設定）。
+      2026-09-17 更新：AGENTS.md、docs/CJK-and-custom-fonts.md、
+      docs/Environment-variables.md；docs/CLI-reference.md 原本已兩套並存。
 
-## 文件同步
+### 中優先級｜Release：v0.2.1-cjk
 
-- [ ] **README_ZH.md 重寫。** 目前仍是舊結構（含上游 trendshift 徽章、
-      Docker Hub 連結、舊 Install 連結）。英文 README 已重寫為 fork 版本
-      （34 個標題、fork 歸屬、本地 Docker build、docker-compose 範例），
-      中文版需完整跟進，繁體中文、技術識別字保留英文、結構 1:1 對應。
-- [ ] `docker-compose.yaml` 與文件已一致（`obscura-cjk` + `build: .`）；
-      若 (b) 選項生效（發布自己的 Docker Hub），需再同步。
+- [x] push main + 打 tag `v0.2.1-cjk`（2026-09-17 早上觸發 release，
+      已上線：https://github.com/Lawlietr/obscura-cjk/releases/tag/v0.2.1-cjk）。
+- [x] 本機 `docker-compose.yaml` 切回 `ghcr.io/lawlietr/obscura-cjk:latest`
+      （2026-09-17）。pull + `docker compose up -d` 重建容器；MCP smoke：
+      initialize 回 `serverInfo 0.2.1-cjk`、navigate example.com、
+      evaluate 含 CJK 字串、screenshot PNG、close 全過。
+- [ ] 抽驗 cjk-stealth 變體 smoke test（#831 動了 wreq，本機無 cmake
+      無法本地建置驗證）。
+- 細節：[design/release-workflow.md](design/release-workflow.md)
 
-## 本機環境（非仓库變更）
+### 中優先級｜Dependabot
+
+- [ ] Repo Settings 確認 Dependabot GitHub App 權限（public repo 預設
+      已啟用，無需額外開關；security alerts 預設開）。
+- [ ] 觀察首批 PR：確認 `[patch.crates-io]` 的 vendored `taffy` /
+      `cosmic-text` 行為符合預期（本體不會被更新，屬正常 warning；其
+      transitive 依賴仍會進 lockfile 更新）。
+- [ ] 後續維護：升級後視需要同步清理 `deny.toml` 的 ignore 清單
+      （RUSTSEC ID 綁定 transitive 版本，cargo-deny CI 會提示）。
+- 細節：[design/dependabot.md](design/dependabot.md)
+
+### 低優先級（可選）｜React hydration 靜默未完成 — 事件處理器全死、點擊無效（2026-09-22 問題回報，translate 專案實測）
+
+> 下游專案採兩階段策略：Obscura 負責截圖 + 只讀 DOM 探測（SSR 內容不受
+> 影響），「點擊 → 斷言狀態改變」類驗證改走真 Chromium（Playwright）。
+> Obscura 定位維持 scraping/只讀自動化，WebSocket 支援非核心需求。
+> 症狀、環境、懷疑方向（ws/HMR、Origin/Referer）與最小重現建議：
+> [design/hydration-bug-report.md](design/hydration-bug-report.md)
+
+- [ ] （可選）最小重現：純 React 19 單頁（非 Next）在 Obscura 能否 hydrate
+- [ ] （可選）驗證 production build 是否同受影響
+- [ ] （可選）定位：與 Playwright 對照 `/_next/*` dev 資源 headers 與 ws 生命週期
+- [ ] （可選）修復 + 回歸（需實作頁面級 WebSocket，屬獨立功能，非 fork regression）
+
+### 低優先級｜Leaflet 功能補齊（2026-09-16 問題回報，Leaflet 1.9.4 + `obscura-cjk:merged-local` 實測）
+
+> 2026-09-17 拆分為獨立子項，可各自獨立 PR。建議順序 A → B → C（三個
+> 快速勝利，做完 Leaflet 地圖頁基本可用）→ D/E → F 決策 → G。A、B、F、G
+> 互相獨立；僅 SVG 鏈有依賴 C → D → E。全部完成後加一批驗證收尾
+> （全量 nextest + release build + 障礙課程，~0.5 天，可與「上游合併 #2
+> 剩餘關卡」合併跑）。
+
+- [ ] **（A）CSSOM View 盒模型 getter**（`clientLeft` / `clientTop` /
+      `clientRight` / `clientBottom`，Leaflet 點擊座標換算出 NaN）。~25 行，
+      0.5–1 天。細節：[design/cssom-view-box-geometry.md](design/cssom-view-box-geometry.md)
+- [ ] **（B）MCP `browser_console_messages` 接線**（目前死欄位，永遠回
+      "No console messages."；未捕獲例外同樣捕不到）。三層接線：
+      `set_runtime_events_enabled(true)` + drain `take_pending_runtime_events()`
+      + 格式化。0.5–1 天，含 chatty 頁面效能量測。細節：
+      [design/mcp-console-capture.md](design/mcp-console-capture.md)
+- [ ] **（C）SVG factory 方法（最小層）**：`createSVGRect` /
+      `createSVGPoint` / `createSVGNumber` / `createSVGAngle` /
+      `createSVGMatrix` / `createSVGTransform`，解鎖 Leaflet 功能偵測
+      （驗收：`L.Browser.svg === true`，向量層正常渲染）。0.5–1 天。
+      細節：[design/svg-dom-api.md](design/svg-dom-api.md)
+- [ ] **（D）SVG shape class + `instanceof` 映射**（`SVGCircleElement` 等 +
+      `_elementClassFor`）。依賴 C。估算含在 2–3 天完整層內。
+- [ ] **（E）SVG animated transform + `getTotalLength` /
+      `getPointAtLength` + SVG2 屬性反射**。依賴 D。
+- [ ] **（F）`getBBox` 處理決策**：快速回 `DOMException`（數小時）vs 讀真實
+      幾何（需 layout 資料，與 G 同類）。先決策再排期。
+- [ ] **（G）`getCTM` / `getScreenCTM`**：需 frame transform 鏈 / layout
+      資料，成本高，獨立排程，預估 2–4 天。
+
+### 低優先級（可選）｜本機環境（非仓库變更）
 
 - [ ] 可選：`obscura-benchmark` 倉庫 clone 下來跑完整驗證。
 - [ ] 磁碟衛生：`target/release/deps` 定期清舊 binary；重 build 前查
       `df -h /`。
 
-## 已記錄在 AGENTS.md（無需再跟）
+## 完成進度
+
+### 上游合併
+
+- [x] **上游合併 #2（2026-09-17，`694c8e1`）。** 4 個衝突手解：
+      `inline.rs` 採上游字型 cache 架構（`base_font_database`/
+      `cached_web_font_database`、`WebFont.data` 改 `Arc`），fork 的
+      CJK + `OBSCURA_FONTS_DIR` fallback 改注入 `base_font_database()`，
+      與上游 `--font-dir`（`FONT_DIRECTORIES`）兩套並存；`paint.rs` 保留
+      `decode_font_bytes` 去重 + SVG fallback 更名函式，採上游 `Arc` 型別；
+      `release.yml` 保留 cjk/cjk-stealth 兩變體，採上游 `release-dist`
+      profile；`README.md` 保留 fork 精簡版。其餘 30+ 檔（cdp/dom/js/net/
+      mcp/render style+dom、taffy float）直接採上游 bug 修正。
+
+### Release
+
+- [x] **v0.2.1-cjk release（2026-09-17）。** tag 推送後 release 上線；
+      本機 compose 已切回 GHCR `latest`，容器重建後 MCP smoke test
+      （navigate / evaluate / CJK / screenshot / close）全數通過。
+      注意：此 release 基於 deno_core 0.350；rebase 完成後需重新 release。
+- [x] **v0.2.0-cjk 上游大合併（2026-09-07）。** 自分叉點 `c1380190`
+      起 114 commits（~40 PR，+9482/−1056 行，44 檔）；3 個衝突全數
+      按預先評估處理。
+- [x] **合併後本地回歸（2026-09-07）。** `render,cjk` nextest
+      **1647/1647**（4 skipped）、release build 6m52s、svg filter
+      21/21、CJK fixture 無豆腐框、障礙課程 **32/33**（已知
+      `observer-intersection`）。
+- [x] **本地容器換上合併版驗證。** `obscura-cjk:merged-local`：nonroot、
+      compose hardening、MCP、真實站 navigate+eval、CJK 截圖全過；
+      正式容器 `obscura` 已重建。
+- [x] **文件同步（v0.2.0-cjk tag 前）。** `docs/Use-as-a-Rust-library.md`
+      pin、AGENTS.md、`docs/Run-in-production-at-scale.md`、
+      `docker-compose.example.yaml` storage dir 權限註解。
+- [x] **v0.1.0-cjk 首次 release（2026-08-24）。** Release run ~28min、
+      25 資產（5 平台 × 5 變體）、Docker run ~7min、本機抽檔通過。
+- [x] **release 機制落地。** `release.yml` 加 `render,cjk` 變體、tag
+      策略（`v0.1.0-cjk` 起跳）、`docker.yml` 改造為 GHCR 發佈、映像
+      tag 慣例（`latest` 為主）。細節：design/release-workflow.md
+- [x] **README 移除上游 Chrome 對比表（2026-08-24，EN/ZH 同步）。**
+      數據無出處且「Anti-detect: Built-in」對本 fork 錯誤（stealth 是
+      build-time feature，Docker 映像不含）。
+
+### 回歸驗證（下次 release 前的品質關卡）
+
+> 首個 release 的 CI smoke test 已全數通過；完整本地回歸 2026-08-25
+> 補跑。
+
+- [x] **上游合併 #2 回歸（nextest，2026-09-17）。** `render,cjk` 九 crate
+      全量 **1691 passed / 4 skipped / 0 failed**（render 601/1、js+net
+      611/0、cdp+dom+cli+browser+mcp 479/3）。release build、障礙課程 32/33
+      與 CJK 截檢未隨本批執行（障礙課程留待後續）。
+- [x] **CJK 視覺抽檢（2026-09-17）。** 繁/簡/日/混排字形正確，截圖 55KB，
+      豆腐框全無；`extra_fallback_fonts` 已注入新 `base_font_database` 快取
+      架構（HTML + SVG 兩路徑）。
+- [x] **完整回歸（2026-08-25）。** `render,cjk` 1487/1487、`render`
+      1486/1486（各 4 skipped）；建置 6m19s。
+- [x] **磁碟檢查（2026-08-25）。** 測試後 6.5G 可用（78%）；清
+      `target/` 後 6.5G → 802M。
+- [x] **CJK 視覺抽檢（2026-08-25）。** 繁/簡/日文字形正確，截圖
+      55KB，無豆腐框。
+- [x] **非 cjk 路徑抽測（2026-08-25）。** 1486/1486，無回歸。
+- [x] **`obscura-benchmark` 障礙課程 32/33（2026-08-25）。** 已知
+      `observer-intersection` 失敗：headless 模式不模擬 scroll，
+      IntersectionObserver callback 只觸發一次（本質限制，AGENTS.md
+      有記錄）。
+
+### 文件同步
+
+- [x] **Release 前置文件同步（2026-08-24，方案 B）。** README ×2、
+      docs/Installation.md、docs/CJK-and-custom-fonts.md 同步；修正
+      Docker 映像 runtime 描述錯誤。
+- [x] **README.md 精簡（614 → 243 行）。** 中間各節移至 docs/
+      （CJK、CDP surface、Integrations、`--fonts` 等）。
+- [x] **README_ZH.md 重寫（237 行，與英文 1:1）。** docs/ 保持英文。
+- [x] **`docker-compose.yaml` 切換為 GHCR 映像部署。** `latest` 為主，
+      本機已用新 compose 重建容器驗證。
+
+### Dependabot
+
+- [x] **`.github/dependabot.yml`（2026-08-24）。** 例行 lockfile-only
+      更新（`routine` group）+ security 獨立 group；v8/deno 家族排除
+      留人工；github-actions ecosystem。細節：design/dependabot.md
+
+## 參考
+
+### 已記錄在 AGENTS.md（無需再跟）
 
 - fork 政策：本倉庫是獨立 fork，所有操作面引用（文件、安裝、release、
-  Docker、CI、issue/security）指向本倉庫；上游僅保留於 Apache-2.0 授權
-  歸屬、`obscura-benchmark`（僅存於上游）、歷史 PR 引述。
-- Docker：映像檔本地 build（`obscura-cjk`，`docker-compose.yaml` 為正式
-  部署方式）；本機容器已由 compose 管理。
+  Docker、CI、issue/security）指向本倉庫；上游僅保留於 Apache-2.0
+  授權歸屬、`obscura-benchmark`（僅存於上游）、歷史 PR 引述。
+- Docker：release 映像由 GitHub Actions 發佈至
+  `ghcr.io/lawlietr/obscura-cjk`（每個 `v*` tag；`latest` 跟隨最新，
+  版本 tag 供回退）；`docker-compose.yaml` 跟隨 `latest` 為正式部署，
+  `docker build -t obscura-cjk .` 保留為本地開發流程；本機容器已由
+  compose 管理。
 - 不自動跑驗證：build / nextest / render capture / obstacle course
   只在用戶明確要求時執行。
-- SVG fallback 字型 lazy loading 的 gotcha（`svg_font_database_with_fallbacks`
-  獨立 OnceLock，只在頁面含 inline SVG text 時建置）。
+- SVG fallback 字型 lazy loading 的 gotcha
+  （`svg_font_database_with_fallbacks` 獨立 OnceLock，只在頁面含
+  inline SVG text 時建置）。
 - `render-repros/cjk/` 置於子目錄是故意的（`run.sh` 只 glob 頂層
   `*.html`）。
 
-## 分支 / remote 現況
+### 分支 / remote 現況
 
-- `origin` → `h4ckf0r0day/obscura`（upstream，只讀參考）
-- `lawlietr` → `Lawlietr/obscura-cjk`（自己的倉庫）
-- `lawlietr/main` @ `2810cb4`（= 上游最新，933 commits ahead of 舊 base）
-- `lawlietr/cjk` @ 本分支（rebased，5 commits：Docker config → CJK feature
-  → AGENTS.md flags → README/README_ZH → AGENTS.md fixture note，
-  + 本輪的 fork 身份重寫）
-- 合併入口：https://github.com/Lawlietr/obscura-cjk/pull/new/cjk
+- `origin` → `Lawlietr/obscura-cjk`（自己的倉庫，唯一 remote）
+- 工作分支：`main`（追蹤 `origin/main`）
+- 首個 tag：`v0.1.0-cjk` @ `84c7223`（2026-08-24 推送，觸發首次
+  release）
+- 最新 tag：`v0.2.1-cjk`（2026-09-17 推送；本機 compose 已跟隨 GHCR
+  `latest` 驗證通過）
+- `upstream` → `h4ckf0r0day/obscura`（已設 remote，2026-09-28 確認）
+- 上游 deno_core 0.412（`df8b058`, 9/19）；fork main 仍 0.350；
+  差異 80 commits。rebase 計劃：
+  [design/upstream-rebase-20260929.md](design/upstream-rebase-20260929.md)
+- `merge-wave2-security-render` 已損壞（無法編譯），不應使用
