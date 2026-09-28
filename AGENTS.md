@@ -34,6 +34,7 @@ services:
     environment:
       - OBSCURA_ALLOW_PRIVATE_NETWORK=0
       - OBSCURA_PROXY=
+      - OBSCURA_MCP_TOKEN=<openssl rand -hex 32>
     read_only: true
     tmpfs:
       - /tmp
@@ -69,6 +70,7 @@ Then connect clients at `ws://localhost:9222/devtools/browser`.
 | `OBSCURA_ALLOW_PRIVATE_NETWORK` | Allow SSRF to loopback/RFC1918 | `0` |
 | `OBSCURA_PROXY` | Proxy URL for HTTP requests | empty |
 | `OBSCURA_FONTS_DIR` | Optional dir of extra fallback fonts (see font-directory note) | empty |
+| `OBSCURA_MCP_TOKEN` | Bearer token for MCP HTTP auth (required, >= 32 bytes; `openssl rand -hex 32`) | empty (MCP HTTP refuses to start without it) |
 
 ### Notes
 

@@ -138,6 +138,8 @@ services:
     environment:
       - OBSCURA_ALLOW_PRIVATE_NETWORK=0
       - OBSCURA_PROXY=
+      # Required (v0.3.0+). Generate: openssl rand -hex 32
+      - OBSCURA_MCP_TOKEN=<your-token>
     read_only: true
     tmpfs:
       - /tmp
@@ -149,9 +151,12 @@ services:
     cpus: 2.0
 ```
 
-The MCP endpoint is `http://localhost:3000/mcp`. To add fonts the embedded set
-lacks (Hangul, CJK weights), mount a read-only directory with the font files
-and set `OBSCURA_FONTS_DIR` in `environment`.
+The MCP endpoint is `http://localhost:3000/mcp`. MCP HTTP mode requires
+bearer-token auth: set `OBSCURA_MCP_TOKEN` (generate with
+`openssl rand -hex 32`) and send `Authorization: Bearer <token>` on
+every request. To add fonts the embedded set lacks (Hangul, CJK weights),
+mount a read-only directory with the font files and set `OBSCURA_FONTS_DIR`
+in `environment`.
 
 ### Build from source
 

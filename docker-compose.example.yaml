@@ -12,6 +12,9 @@ services:
     environment:
       - OBSCURA_ALLOW_PRIVATE_NETWORK=0
       - OBSCURA_PROXY=
+      # Required for MCP HTTP mode (v0.3.0+). Generate with:
+      #   openssl rand -hex 32
+      - OBSCURA_MCP_TOKEN=CHANGE_ME
     read_only: true
     tmpfs:
       - /tmp

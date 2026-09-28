@@ -133,6 +133,8 @@ services:
     environment:
       - OBSCURA_ALLOW_PRIVATE_NETWORK=0
       - OBSCURA_PROXY=
+      # 必填（v0.3.0+）。產生方式：openssl rand -hex 32
+      - OBSCURA_MCP_TOKEN=<your-token>
     read_only: true
     tmpfs:
       - /tmp
@@ -144,9 +146,11 @@ services:
     cpus: 2.0
 ```
 
-MCP endpoint 為 `http://localhost:3000/mcp`。若要補內嵌字集沒有的字型
-（Hangul、CJK 字重），掛一個唯讀字型目錄並在 `environment` 設定
-`OBSCURA_FONTS_DIR`。
+MCP endpoint 為 `http://localhost:3000/mcp`。MCP HTTP 模式需要
+bearer token 認證：設定 `OBSCURA_MCP_TOKEN`（用 `openssl rand -hex 32`
+產生），每個請求帶 `Authorization: Bearer <token>`。若要補內嵌字集
+沒有的字型（Hangul、CJK 字重），掛一個唯讀字型目錄並在 `environment`
+設定 `OBSCURA_FONTS_DIR`。
 
 ### 從原始碼建置
 
