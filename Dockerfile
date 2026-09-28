@@ -41,19 +41,24 @@ RUN echo "Building Obscura version ${OBSCURA_VERSION:-from Cargo.toml}" && \
 
 # ---
 
-# distroless/cc: glibc + libgcc + CA certs only — no shell, no package manager.
-#
-# `:nonroot` runs as uid/gid 65532 instead of root. Obscura executes untrusted
-# page JavaScript in-process through V8, so a V8 exploit lands with the
-# process's privileges; there is no reason for those to be root's. The image
-# needs no privileged operation: it binds an unprivileged port, reads the CA
-# bundle, and writes only to the storage dir and a temp dir.
-#
-# The tag is deliberately not pinned to a digest. distroless is rebuilt often
-# with base-layer security patches, and tracking the tag picks those up; a
-# digest pin would freeze them until someone remembers to bump it, which for a
-# *base* image trades a real ongoing risk for a theoretical one.
-FROM gcr.io/distroless/cc-debian12:nonroot
+# Debian 12 with full timezone support
+FROM debian:12-slim
+
+# Copy CA certs from distroless
+COPY --from=gcr.io/distroless/cc-debian12 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# Set timezone to Asia/Taipei
+ENV TZ=Asia/Taipei
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# Run as uid/gid 65532 instead of root. Obscura executes untrusted page
+# JavaScript in-process through V8, so a V8 exploit lands with the process's
+# privileges; there is no reason for those to be root's. The image needs no
+# privileged operation: it binds an unprivileged port, reads the CA bundle,
+# and writes only to the storage dir and a temp dir.
+# A mounted --storage-dir must be writable by uid 65532, or the cookie jar
+# silently fails to persist.
+USER 65532:65532
 
 COPY --from=builder /build/target/release/obscura /obscura
 COPY --from=builder /build/target/release/obscura-worker /obscura-worker

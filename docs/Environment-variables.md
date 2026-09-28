@@ -14,6 +14,26 @@ OBSCURA_ALLOW_PRIVATE_NETWORK=1 obscura fetch http://localhost:8080
 
 Per-process equivalent: `--allow-private-network` on any subcommand.
 
+### `OBSCURA_FONTS_DIR`
+
+Directory of extra fallback font files, added after the bundled font set. The
+scan is non-recursive, filename-sorted, and accepts `ttf`/`otf`/`ttc`/`woff`/
+`woff2`; unparseable files are skipped with a warning. Use it for scripts the
+embedded faces lack (Korean Hangul, CJK weights, etc.). Opt-in: layout then
+depends on the directory contents, breaking bundled-faces-only determinism.
+
+```bash
+OBSCURA_FONTS_DIR=/path/to/fonts obscura fetch https://example.com -s page.png
+```
+
+Per-process equivalent: the global `--fonts <PATH>` flag, valid before or
+after the subcommand. See [CJK and custom fonts](CJK-and-custom-fonts.md).
+
+Note: this is the fork's per-request escape hatch, distinct from the upstream
+`--font-dir` flag on `obscura serve`. `--font-dir` loads a font tree once before
+the first render of the process (recursive, pure sfnt only, repeatable); see the
+"Two font-directory mechanisms" section of [CJK and custom fonts](CJK-and-custom-fonts.md).
+
 ### `OBSCURA_NAV_TIMEOUT_MS`
 
 Hard ceiling on a single navigation. Default 30000 (30 seconds). Applies to `Page.navigate` and the CLI `fetch` command.

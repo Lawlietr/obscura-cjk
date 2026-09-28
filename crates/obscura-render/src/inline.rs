@@ -457,6 +457,13 @@ fn base_font_database(load_emoji: bool) -> &'static FontDatabase {
                 declarations.push((id, None, None, None));
             }
         }
+        // CJK/directory fallbacks come after the bundled faces so a page's
+        // own webfont still wins for CJK code points it covers.
+        for font in extra_fallback_fonts() {
+            for id in database.load_font_source(cosmic_text::fontdb::Source::Binary(font)) {
+                declarations.push((id, None, None, None));
+            }
+        }
         declarations.extend(
             load_font_directories(
                 &mut database,

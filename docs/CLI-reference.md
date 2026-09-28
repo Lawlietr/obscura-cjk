@@ -11,6 +11,7 @@ Top-level flags apply to every subcommand.
     --user-agent <UA>        Override the User-Agent
     --storage-dir <DIR>      Persistent cookies and localStorage
     --allow-private-network  Permit loopback / RFC1918 / link-local
+    --fonts <PATH>           Directory of extra fallback font files
     --v8-flags <FLAGS>       Raw V8 flags, applied at startup
 -h, --help                   Help
 -V, --version                Version
