@@ -122,7 +122,7 @@ Run obscura as an MCP server.
 -v, --verbose                Enable info logging
 ```
 
-`--host` only applies with `--http`. The default `127.0.0.1` keeps the server loopback-only; set `0.0.0.0` to bind all interfaces (for example a Docker Compose sidecar) and pair it with `OBSCURA_MCP_ALLOWED_ORIGINS`.
+`--host` only applies with `--http`. The default `127.0.0.1` keeps the server loopback-only. A non-loopback bind requires `OBSCURA_MCP_TOKEN` (at least 32 bytes); use `OBSCURA_MCP_ALLOWED_ORIGINS` as well when a browser-based client needs access.
 
 Default transport is stdio. See [Use the MCP server](Use-the-MCP-server.md).
 

@@ -111,7 +111,7 @@ fn relational_key_may_match(
     tree: &DomTree,
     node: NodeId,
 ) -> bool {
-    let Some(dom_node) = tree.get_node(node) else {
+    let Some(dom_node) = tree.borrow_node(node) else {
         return false;
     };
     if dom_node.as_element().is_none() {
@@ -147,7 +147,7 @@ impl RelationalInvalidation {
     }
 
     pub(crate) fn relative_path_may_match(&self, tree: &DomTree, node: NodeId) -> bool {
-        let Some(dom_node) = tree.get_node(node) else {
+        let Some(dom_node) = tree.borrow_node(node) else {
             return false;
         };
         let Some(element) = dom_node.as_element() else {
@@ -281,7 +281,7 @@ impl InvalidationMap {
         {
             return true;
         }
-        let Some(node) = tree.get_node(node) else {
+        let Some(node) = tree.borrow_node(node) else {
             return false;
         };
         let reaches_sibling = |dependencies: &[InvalidationDependency]| {
@@ -1592,9 +1592,9 @@ fn append_declaration_stream(target: &mut String, declarations: &str) {
 const NO_CANDIDATE_SLOT: u32 = u32::MAX;
 
 fn is_root_element(tree: &DomTree, nid: NodeId) -> bool {
-    tree.get_node(nid)
+    tree.borrow_node(nid)
         .and_then(|node| node.parent)
-        .and_then(|parent| tree.get_node(parent))
+        .and_then(|parent| tree.borrow_node(parent))
         .is_some_and(|parent| parent.is_document())
 }
 
@@ -1722,7 +1722,7 @@ impl PseudoRuleMap {
         if self.candidate_slot_count != 0 {
             matcher.begin_candidate_collection(self.candidate_slot_count);
         }
-        let Some(node) = tree.get_node(nid) else {
+        let Some(node) = tree.borrow_node(nid) else {
             return false;
         };
         node.as_element().is_some_and(|element| {
@@ -2214,13 +2214,13 @@ impl<'a> ContainerQueryEvaluator<'a> {
             .unwrap_or_default();
         let mut candidate = match kind {
             ContainerQuerySubjectKind::Element => {
-                self.tree.get_node(subject).and_then(|node| node.parent)
+                self.tree.borrow_node(subject).and_then(|node| node.parent)
             }
             ContainerQuerySubjectKind::OriginatingPseudo => Some(subject),
         };
         while let Some(id) = candidate {
             self.stats.ancestor_steps += 1;
-            let parent = self.tree.get_node(id).and_then(|node| node.parent);
+            let parent = self.tree.borrow_node(id).and_then(|node| node.parent);
             if let Some(container) = self.snapshot.boxes.get(&id) {
                 let supports_axis = match container.container_type {
                     crate::ContainerType::Normal => !required_axes.inline && !required_axes.block,
@@ -2432,6 +2432,20 @@ struct CachedStylesheet {
 }
 
 impl StylesheetCache {
+    // A style-only read must not replace the key that validates retained layout
+    // styles. A miss goes through normal preparation before taking this path.
+    pub(crate) fn get(
+        &self,
+        sources: &[String],
+        viewport: (f32, f32),
+        media_type: CssMediaType,
+    ) -> Option<Arc<Stylesheet>> {
+        let entry = self.entry.as_ref()?;
+        (entry.viewport_bits == (viewport.0.to_bits(), viewport.1.to_bits())
+            && entry.media_type == media_type && entry.sources == sources)
+            .then(|| Arc::clone(&entry.sheet))
+    }
+
     pub(crate) fn get_or_parse(
         &mut self,
         tree: &DomTree,
@@ -2440,14 +2454,9 @@ impl StylesheetCache {
         media_type: CssMediaType,
     ) -> (Arc<Stylesheet>, bool) {
         let viewport_bits = (viewport.0.to_bits(), viewport.1.to_bits());
-        if let Some(entry) = self.entry.as_ref() {
-            if entry.viewport_bits == viewport_bits
-                && entry.media_type == media_type
-                && entry.sources == sources
-            {
-                self.hits = self.hits.saturating_add(1);
-                return (Arc::clone(&entry.sheet), true);
-            }
+        if let Some(sheet) = self.get(sources, viewport, media_type) {
+            self.hits = self.hits.saturating_add(1);
+            return (sheet, true);
         }
 
         self.misses = self.misses.saturating_add(1);
@@ -2564,7 +2573,7 @@ impl Stylesheet {
         if self.candidate_slot_count != 0 {
             matcher.begin_candidate_collection(self.candidate_slot_count);
         }
-        let Some(node) = tree.get_node(nid) else {
+        let Some(node) = tree.borrow_node(nid) else {
             return false;
         };
         let normal_match = node.as_element().is_some_and(|element| {
@@ -3062,7 +3071,7 @@ impl Stylesheet {
                     }
                 };
 
-            if let Some(node) = tree.get_node(nid) {
+            if let Some(node) = tree.borrow_node(nid) {
                 if let Some(element) = node.as_element() {
                     consider(
                         rules.by_local.get(element.local.as_ref()),
@@ -3225,7 +3234,7 @@ impl Stylesheet {
             }
         };
         let supports_placeholder = tree
-            .get_node(nid)
+            .borrow_node(nid)
             .is_some_and(|node| {
                 node.as_element().is_some_and(|element| {
                     matches!(element.local.as_ref(), "input" | "textarea")
@@ -3688,7 +3697,7 @@ impl Stylesheet {
             );
         }
         if !self.by_attribute.is_empty() {
-            if let Some(node) = tree.get_node(nid) {
+            if let Some(node) = tree.borrow_node(nid) {
                 if let Some(attributes) = node.attrs() {
                     for attribute in attributes {
                         consider(
@@ -5654,7 +5663,7 @@ fn parse_generated_content_items(
                     .next()
                     .filter(|name| !name.is_empty())?;
                 let value = tree
-                    .get_node(nid)
+                    .borrow_node(nid)
                     .and_then(|node| node.get_attribute(attribute).map(str::to_owned))
                     .unwrap_or_default();
                 items.push(crate::GeneratedContentItem::Text(value));

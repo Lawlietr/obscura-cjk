@@ -96,6 +96,8 @@ mod image_capability_tests {
 #[cfg(feature = "paint")]
 mod paint;
 #[cfg(feature = "paint")]
+pub use tiny_skia::Pixmap;
+#[cfg(feature = "paint")]
 pub use paint::{
     image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
     paint_dom_scrolled_at_animation_time,
@@ -988,6 +990,8 @@ pub struct LayoutStyle {
     /// top-down before layout because `container-type` is otherwise
     /// non-inherited.
     pub(crate) container_type_inherit: bool,
+    /// Explicit `contain` flags, independent of size-query eligibility.
+    pub(crate) containment: u8,
     /// Computed CSS `container-name`; empty represents `none` (not inherited).
     pub container_names: Vec<String>,
     /// The specified `container-name` value was CSS-wide `inherit`.
@@ -1413,6 +1417,9 @@ pub struct LayoutStyle {
     /// a real inherited CSS property). Resolved into `effectively_invisible`
     /// during `dom::layout_dom`'s inheritance pass.
     pub visibility_hidden: Option<bool>,
+    /// Computed `pointer-events: none|auto`. The property is inherited, so
+    /// `None` means the top-down style pass still needs the parent's value.
+    pub pointer_events_none: Option<bool>,
     /// `opacity`, own (non-inherited) value in 0.0-1.0. `None` means the
     /// default of 1.0.
     pub opacity: Option<f32>,
@@ -1697,6 +1704,12 @@ pub(crate) fn blockify_outer_display(style: &mut LayoutStyle) {
 }
 
 pub(crate) const CB_TRIGGER_TRANSFORM: u16 = 1 << 0;
+pub(crate) const CONTAIN_SIZE: u8 = 1 << 0;
+pub(crate) const CONTAIN_INLINE_SIZE: u8 = 1 << 1;
+pub(crate) const CONTAIN_LAYOUT: u8 = 1 << 2;
+pub(crate) const CONTAIN_STYLE: u8 = 1 << 3;
+pub(crate) const CONTAIN_PAINT: u8 = 1 << 4;
+pub(crate) const CONTAIN_INHERIT: u8 = 1 << 7;
 pub(crate) const CB_TRIGGER_FILTER: u16 = 1 << 1;
 pub(crate) const CB_TRIGGER_BACKDROP_FILTER: u16 = 1 << 2;
 pub(crate) const CB_TRIGGER_PERSPECTIVE: u16 = 1 << 3;

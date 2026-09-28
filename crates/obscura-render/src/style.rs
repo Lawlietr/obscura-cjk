@@ -505,6 +505,33 @@ pub(crate) fn split_declarations(css: &str) -> Vec<&str> {
     parts
 }
 
+fn parse_containment(value: &str) -> Option<u8> {
+    use crate::{CONTAIN_SIZE, CONTAIN_INLINE_SIZE, CONTAIN_LAYOUT, CONTAIN_STYLE, CONTAIN_PAINT};
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "none" | "initial" | "unset" | "revert" | "revert-layer" => return Some(0),
+        "inherit" => return Some(crate::CONTAIN_INHERIT),
+        "strict" => return Some(CONTAIN_SIZE | CONTAIN_LAYOUT | CONTAIN_STYLE | CONTAIN_PAINT),
+        "content" => return Some(CONTAIN_LAYOUT | CONTAIN_STYLE | CONTAIN_PAINT),
+        _ => {}
+    }
+    let mut flags = 0;
+    for token in value.split_ascii_whitespace() {
+        let flag = match token {
+            "size" => CONTAIN_SIZE,
+            "inline-size" => CONTAIN_INLINE_SIZE,
+            "layout" => CONTAIN_LAYOUT,
+            "style" => CONTAIN_STYLE,
+            "paint" => CONTAIN_PAINT,
+            _ => return None,
+        };
+        if flags & flag != 0 { return None; }
+        flags |= flag;
+    }
+    (flags != 0 && flags & (CONTAIN_SIZE | CONTAIN_INLINE_SIZE)
+        != (CONTAIN_SIZE | CONTAIN_INLINE_SIZE)).then_some(flags)
+}
+
 fn parse_container_type(value: &str) -> Option<crate::ContainerType> {
     match value.trim().to_ascii_lowercase().as_str() {
         "normal" => Some(crate::ContainerType::Normal),
@@ -562,14 +589,22 @@ struct ParsedOverflowAxis {
     inherit: bool,
 }
 
+const OVERFLOW_VISIBLE: u8 = 0;
+const OVERFLOW_CLIP: u8 = 1;
+const OVERFLOW_HIDDEN: u8 = 2;
+const OVERFLOW_SCROLL: u8 = 3;
+const OVERFLOW_AUTO: u8 = 4;
+
 fn parse_overflow_axis(value: &str) -> Option<ParsedOverflowAxis> {
     let lower = value.trim().to_ascii_lowercase();
     let (specified, inherit) = match lower.as_str() {
-        "visible" => (0, false),
-        "clip" => (1, false),
-        "hidden" | "scroll" | "auto" | "overlay" => (2, false),
-        "inherit" => (0, true),
-        "initial" | "unset" | "revert" | "revert-layer" => (0, false),
+        "visible" => (OVERFLOW_VISIBLE, false),
+        "clip" => (OVERFLOW_CLIP, false),
+        "hidden" => (OVERFLOW_HIDDEN, false),
+        "scroll" => (OVERFLOW_SCROLL, false),
+        "auto" | "overlay" => (OVERFLOW_AUTO, false),
+        "inherit" => (OVERFLOW_VISIBLE, true),
+        "initial" | "unset" | "revert" | "revert-layer" => (OVERFLOW_VISIBLE, false),
         _ => return None,
     };
     Some(ParsedOverflowAxis { specified, inherit })
@@ -618,23 +653,35 @@ fn parse_overflow_declaration(
     }
 }
 
+pub(crate) fn computed_overflow_axes(style: &LayoutStyle) -> (u8, u8) {
+    let mut computed_x = style.overflow_specified_x;
+    let mut computed_y = style.overflow_specified_y;
+    if computed_x <= OVERFLOW_CLIP && computed_y > OVERFLOW_CLIP {
+        computed_x = if computed_x == OVERFLOW_VISIBLE {
+            OVERFLOW_AUTO
+        } else {
+            OVERFLOW_HIDDEN
+        };
+    }
+    if computed_y <= OVERFLOW_CLIP && computed_x > OVERFLOW_CLIP {
+        computed_y = if computed_y == OVERFLOW_VISIBLE {
+            OVERFLOW_AUTO
+        } else {
+            OVERFLOW_HIDDEN
+        };
+    }
+    (computed_x, computed_y)
+}
+
 pub(crate) fn recompute_overflow(style: &mut LayoutStyle) {
     // CSS Overflow computed-value coupling: if exactly one axis is scrollable,
     // `visible` on the other computes to `auto` and `clip` computes to
     // `hidden`. A clip/visible pair remains genuinely axis-specific.
-    let mut computed_x = style.overflow_specified_x;
-    let mut computed_y = style.overflow_specified_y;
-    if (computed_x == 2) != (computed_y == 2) {
-        if computed_x == 2 {
-            computed_y = 2;
-        } else {
-            computed_x = 2;
-        }
-    }
-    style.overflow_clip_x = computed_x != 0;
-    style.overflow_clip_y = computed_y != 0;
-    style.overflow_scroll_x = computed_x == 2;
-    style.overflow_scroll_y = computed_y == 2;
+    let (computed_x, computed_y) = computed_overflow_axes(style);
+    style.overflow_clip_x = computed_x != OVERFLOW_VISIBLE;
+    style.overflow_clip_y = computed_y != OVERFLOW_VISIBLE;
+    style.overflow_scroll_x = computed_x > OVERFLOW_CLIP;
+    style.overflow_scroll_y = computed_y > OVERFLOW_CLIP;
     style.overflow_hidden = style.overflow_clip_x || style.overflow_clip_y;
     style.overflow_scroll_container = style.overflow_scroll_x || style.overflow_scroll_y;
 }
@@ -1466,6 +1513,9 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             };
         }
         "visibility" => style.visibility_hidden = Some(value.eq_ignore_ascii_case("hidden")),
+        "pointer-events" => {
+            style.pointer_events_none = Some(value.eq_ignore_ascii_case("none"));
+        }
         "opacity" => style.opacity = value.trim().parse::<f32>().ok(),
         "animation" => apply_animation_shorthand(style, value),
         "animation-name" => {
@@ -1839,13 +1889,11 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             non_none_value(value),
         ),
         "contain" => {
-            let establishes = value.split_whitespace().any(|v| {
-                matches!(
-                    v.to_ascii_lowercase().as_str(),
-                    "layout" | "paint" | "strict" | "content"
-                )
-            });
-            set_containing_block_trigger(style, crate::CB_TRIGGER_CONTAIN, establishes);
+            if let Some(flags) = parse_containment(value) {
+                style.containment = flags;
+                set_containing_block_trigger(style, crate::CB_TRIGGER_CONTAIN,
+                    flags & (crate::CONTAIN_LAYOUT | crate::CONTAIN_PAINT) != 0);
+            }
         }
         "will-change" => {
             let establishes = value.split([',', ' ']).map(str::trim).any(|v| {
@@ -2123,6 +2171,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "overflow-y"
             | "scrollbar-gutter"
             | "visibility"
+            | "pointer-events"
             | "opacity"
             | "animation"
             | "animation-name"
@@ -2309,6 +2358,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             value.to_ascii_lowercase().as_str(),
             "visible" | "hidden" | "collapse"
         ),
+        "pointer-events" => matches!(value.to_ascii_lowercase().as_str(), "auto" | "none"),
         "scrollbar-gutter" => matches!(
             value.to_ascii_lowercase().as_str(),
             "auto" | "stable" | "stable both-edges"
@@ -6383,7 +6433,32 @@ struct LengthContext {
     percent_base: f32,
 }
 
+// CSS math functions recurse through nested calc()/min()/max()/clamp()
+// expressions. Real stylesheets stay shallow; bounding the nesting prevents a
+// hostile declaration from exhausting the native stack before it is rejected.
+const MAX_CSS_MATH_NESTING: usize = 64;
+
+fn css_math_nesting_is_safe(value: &str) -> bool {
+    let mut depth = 0usize;
+    for character in value.chars() {
+        match character {
+            '(' => {
+                depth += 1;
+                if depth > MAX_CSS_MATH_NESTING {
+                    return false;
+                }
+            }
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    true
+}
+
 fn resolve_contextual(value: &str, context: &LengthContext) -> Option<f32> {
+    if !css_math_nesting_is_safe(value) {
+        return None;
+    }
     let value = value.trim();
     if let Some(rest) = value.strip_prefix('(') {
         let end = find_matching_paren(rest)?;
@@ -6607,6 +6682,9 @@ fn eval_contextual_product(term: &str, context: &LengthContext) -> Option<f32> {
 /// example from Wikipedia's icon sizing), so each case recurses back into
 /// this function rather than assuming a flat expression.
 fn resolve_length(value: &str) -> Option<f32> {
+    if !css_math_nesting_is_safe(value) {
+        return None;
+    }
     let v = value.trim();
     if let Some(rest) = v.strip_prefix('(') {
         let end = find_matching_paren(rest)?;
@@ -10821,6 +10899,26 @@ mod tests {
         // calc(max(calc(var(--font-size-medium,1rem) + 4px),10px))
         let expr = "calc(max(calc(var(--font-size-medium,1rem) + 4px),10px))";
         assert_eq!(resolve_length(expr), Some(20.0));
+    }
+
+    #[test]
+    fn deeply_nested_css_math_is_rejected_without_recursing() {
+        let mut expression = "1px".to_string();
+        for _ in 0..5_000 {
+            expression = format!("calc({expression})");
+        }
+
+        assert_eq!(resolve_length(&expression), None);
+        assert_eq!(
+            resolve_contextual_length(&expression, 16.0, 16.0, 10.0, 10.0, 100.0),
+            None
+        );
+
+        let mut ordinary = "1px".to_string();
+        for _ in 0..8 {
+            ordinary = format!("calc({ordinary})");
+        }
+        assert_eq!(resolve_length(&ordinary), Some(1.0));
     }
 
     #[test]

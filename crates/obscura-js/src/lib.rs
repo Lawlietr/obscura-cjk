@@ -18,7 +18,8 @@ pub use obscura_render::{
     configure_font_directories, screenshot_png, screenshot_png_scrolled,
     screenshot_png_scrolled_at_animation_time,
     screenshot_png_scrolled_at_animation_time_with_surface_color,
+    screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources,
     validate_capture_region, AnimationSample, AnimationSampleMode, AnimationSampleTime,
-    CaptureError, CaptureRegion, CssMediaType, ImageRequestProfile,
+    CaptureError, CaptureRegion, CssMediaType, ImageRequestProfile, RenderResourceCache,
     MAX_CAPTURE_DIMENSION, MAX_CAPTURE_PIXELS,
 };

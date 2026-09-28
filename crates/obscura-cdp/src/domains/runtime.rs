@@ -1,4 +1,5 @@
 use obscura_browser::lifecycle::WaitUntil;
+use obscura_browser::page::PendingNavigationOutcome;
 use obscura_js::runtime::RemoteObjectInfo;
 use serde_json::{json, Value};
 
@@ -49,11 +50,20 @@ async fn emit_post_eval_nav(
     ctx: &mut CdpContext,
     session_id: &Option<String>,
 ) -> Result<(), String> {
+    let server_managed_navigation = ctx.intercept_tx.is_some();
     let page = ctx
         .get_session_page_mut(session_id)
         .ok_or("No page")?;
-    let did_navigate = page.process_pending_navigation().await.map_err(|e| e.to_string())?;
-    if !did_navigate {
+    // The connection processor owns the Fetch reply channel. Let it perform
+    // document navigation outside dispatch so destination requests can resume.
+    if server_managed_navigation && page.has_pending_navigation() {
+        return Ok(());
+    }
+    let navigation = page
+        .process_pending_navigation_outcome()
+        .await
+        .map_err(|e| e.to_string())?;
+    if navigation == PendingNavigationOutcome::None {
         return Ok(());
     }
     let (frame_id, page_url, page_id, network_events, reached_idle) = {
@@ -66,6 +76,10 @@ async fn emit_post_eval_nav(
             p.lifecycle.is_network_idle(),
         )
     };
+    if navigation == PendingNavigationOutcome::SameDocument {
+        super::page::emit_same_document_navigation(ctx, session_id, &frame_id, &page_url);
+        return Ok(());
+    }
     let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
     super::page::emit_navigation_events(
         ctx,
@@ -394,7 +408,7 @@ pub async fn handle(
                         if (arguments.length !== 1) return;\
                         try {{\
                             const payload = typeof arg === 'string' ? arg : String(arg);\
-                            Deno.core.ops.op_binding_called('{name}', payload);\
+                            globalThis.__obscura_binding_called('{name}', payload);\
                         }} catch (e) {{ /* swallow: binding must not throw into page */ }}\
                     }};",
                     name = name,
@@ -549,6 +563,10 @@ fn remote_object_from_info(info: &RemoteObjectInfo) -> Value {
 
     if let Some(ref value) = info.value {
         obj["value"] = value.clone();
+    }
+
+    if let Some(ref value) = info.unserializable_value {
+        obj["unserializableValue"] = json!(value);
     }
 
     obj

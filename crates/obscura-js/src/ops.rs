@@ -1,23 +1,24 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use deno_core::op2;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use deno_core::Extension;
 use deno_core::JsBuffer;
-use deno_core::v8;
 use deno_core::OpState;
-use obscura_dom::{DomTree, NodeData, NodeId};
+use deno_core::op2;
+use deno_core::v8;
 use obscura_dom::tree::{AttachShadowError, ShadowRootMode};
-#[cfg(feature = "render")]
-use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
+use obscura_dom::{DomTree, NodeData, NodeId};
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 use obscura_net::{
     CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response,
+    SameSiteContext, same_site,
 };
+#[cfg(feature = "render")]
+use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
 use tokio::sync::Mutex;
 
 #[cfg(feature = "render")]
@@ -59,6 +60,7 @@ pub enum InterceptResolution {
 
 pub struct InterceptedRequest {
     pub request_id: String,
+    pub page_id: String,
     pub url: String,
     pub method: String,
     pub headers: HashMap<String, String>,
@@ -82,6 +84,8 @@ pub struct JsNetworkEvent {
     /// Matches the `fetch-{N}` id under which the body is stored, so CDP
     /// Network.getResponseBody resolves for the same request.
     pub request_id: String,
+    /// The interception consumer already received the request start.
+    pub intercepted: bool,
     pub url: String,
     pub method: String,
     pub status: u16,
@@ -129,9 +133,18 @@ pub struct ObscuraState {
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
     pub pending_navigation: Option<(String, String, String)>,
+    /// The tab's session history as the owning page sees it: entry URLs, the
+    /// index of this document's first entry, and the current index. Empty
+    /// for frames and for runtimes outside a page, where `history` only
+    /// covers the document's own same-document entries.
+    pub session_history: SessionHistory,
+    /// Session history index a cross-document `history.go()` asked for. It
+    /// travels with `pending_navigation`, which carries the entry's URL, so
+    /// the page can move its cursor instead of appending an entry.
+    pub pending_history_traversal: Option<usize>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
-    pub intercept_counter: u64,
     pub intercept_enabled: bool,
+    pub intercept_page_id: String,
     // Queue of (binding_name, payload) calls made by page JS via the
     // `op_binding_called` op. Drained by the CDP layer after each dispatch
     // and emitted as `Runtime.bindingCalled` events.
@@ -145,7 +158,6 @@ pub struct ObscuraState {
     pub runtime_exception_counter: u64,
     pub network_response_bodies: HashMap<String, StoredNetworkResponseBody>,
     pub network_response_body_order: VecDeque<String>,
-    pub network_response_body_counter: u64,
     // Absolute URLs requested via JS fetch() / XHR (op_fetch_url), in request
     // order. Surfaced by `--dump assets` so resources pulled in by script, not
     // just static DOM attributes, are listed (issue #301).
@@ -301,6 +313,9 @@ pub struct ObscuraState {
     /// The document's input stream for `document.write()`, created on the first call.
     /// Why the calls share one parser is in `write_stream`.
     pub(crate) write_stream: RefCell<Option<crate::write_stream::DocumentWriteStream>>,
+    /// Cheap native signal that the current parser script wrote another
+    /// script. This avoids polling V8 after every ordinary parser script.
+    pub(crate) document_write_inserted_script: Cell<bool>,
 }
 
 /// A frame document waiting to be given a realm.
@@ -352,9 +367,11 @@ impl ObscuraState {
             #[cfg(feature = "stealth")]
             stealth_client: None,
             pending_navigation: None,
+            session_history: SessionHistory::default(),
+            pending_history_traversal: None,
             intercept_tx: None,
-            intercept_counter: 0,
             intercept_enabled: false,
+            intercept_page_id: String::new(),
             pending_binding_calls: Vec::new(),
             pending_runtime_events: VecDeque::new(),
             runtime_events_enabled: false,
@@ -363,7 +380,6 @@ impl ObscuraState {
             runtime_exception_counter: 0,
             network_response_bodies: HashMap::new(),
             network_response_body_order: VecDeque::new(),
-            network_response_body_counter: 0,
             fetched_urls: Vec::new(),
             js_network_events: Vec::new(),
             pending_frames: Vec::new(),
@@ -435,6 +451,7 @@ impl ObscuraState {
             import_map: Rc::new(RefCell::new(ImportMap::default())),
             already_started_scripts: RefCell::new(HashSet::new()),
             write_stream: RefCell::new(None),
+            document_write_inserted_script: Cell::new(false),
         }
     }
 }
@@ -462,6 +479,7 @@ pub struct RuntimeExceptionEvent {
 pub enum RuntimeEvent {
     Console(RuntimeConsoleEvent),
     Exception(RuntimeExceptionEvent),
+    DocumentLifecycle { name: String, timestamp: f64 },
 }
 
 pub(crate) fn node_is_script(dom: &DomTree, node_id: NodeId) -> bool {
@@ -687,7 +705,7 @@ pub fn frame_state(op_state: &OpState, frame_id: u32) -> SharedState {
 ///
 /// A page with no frames pays only an `is_empty` check: looking up the current
 /// context is not free, and `op_dom` is the hottest op in the system.
-pub fn realm_state(scope: &mut v8::HandleScope, op_state: &OpState) -> SharedState {
+pub fn realm_state(scope: &mut v8::PinScope, op_state: &OpState) -> SharedState {
     let page = || op_state.borrow::<SharedState>().clone();
     let registry = match op_state.try_borrow::<Rc<RefCell<RealmStates>>>() {
         Some(registry) => registry.clone(),
@@ -755,12 +773,13 @@ fn render_mutation_impact(
             };
             let actual_change = match cmd {
                 "set_form_value" => !dom.form_control_value_matches(target, arg2),
-                "set_form_checked" => {
-                    dom.form_control_checked(target) != Some(arg2 == "true")
-                }
+                "set_form_checked" => dom.form_control_checked(target) != Some(arg2 == "true"),
                 _ => dom.form_control_indeterminate(target) != (arg2 == "true"),
             };
-            RenderMutationImpact { connected: node_is_connected(dom, target), actual_change }
+            RenderMutationImpact {
+                connected: node_is_connected(dom, target),
+                actual_change,
+            }
         }
         "set_attribute" => {
             let Some(target) = node(arg1) else {
@@ -840,7 +859,7 @@ fn render_mutation_impact(
                 // Moving a connected node into a detached subtree removes its
                 // old box, while attaching a detached node creates a new one.
                 connected: node_is_connected(dom, parent) || node_is_connected(dom, child),
-                actual_change: !already_last,
+                actual_change: !already_last || dom.has_cssom_stylesheet(parent) || dom.has_cssom_stylesheet(child),
             }
         }
         "remove_child" => {
@@ -868,7 +887,8 @@ fn render_mutation_impact(
                 dom.get_node(reference).and_then(|node| node.prev_sibling) == Some(new_node);
             RenderMutationImpact {
                 connected: node_is_connected(dom, reference_parent) || new_was_connected,
-                actual_change: new_node != reference && !already_immediately_before,
+                actual_change: new_node != reference && (!already_immediately_before
+                    || dom.has_cssom_stylesheet(reference_parent) || dom.has_cssom_stylesheet(new_node)),
             }
         }
         "set_inner_html" | "set_inner_html_context" => {
@@ -888,7 +908,10 @@ fn render_mutation_impact(
             };
             let changed = dom
                 .with_node(target, |node| match &node.data {
-                    NodeData::Text { contents } | NodeData::Comment { contents } => {
+                    NodeData::Text { contents } => {
+                        contents.as_str() != arg2 || node.parent.is_some_and(|parent| dom.has_cssom_stylesheet(parent))
+                    }
+                    NodeData::Comment { contents } => {
                         contents.as_str() != arg2
                     }
                     NodeData::ProcessingInstruction { data, .. } => data.as_str() != arg2,
@@ -943,20 +966,20 @@ fn retained_style_mutation(
                 return None;
             }
             let keeps_selector_value = !name.eq_ignore_ascii_case("style");
-            Some(obscura_render::AttributeStyleMutation {
+            Some(
+                obscura_render::AttributeStyleMutation {
                 node,
                 name: name.to_string(),
                 old_value: keeps_selector_value
                     .then(|| {
-                        dom.with_node(node, |node| {
-                            node.get_attribute(name).map(str::to_owned)
-                        })
+                            dom.with_node(node, |node| node.get_attribute(name).map(str::to_owned))
                         .flatten()
                     })
                     .flatten(),
                 new_value: keeps_selector_value.then(|| value.to_string()),
             }
-            .into())
+                .into(),
+            )
         }
         "remove_attribute" => {
             if obscura_render::dom::retained_attribute_mutation_kind(dom, node, arg2)
@@ -965,20 +988,20 @@ fn retained_style_mutation(
                 return None;
             }
             let keeps_selector_value = !arg2.eq_ignore_ascii_case("style");
-            Some(obscura_render::AttributeStyleMutation {
+            Some(
+                obscura_render::AttributeStyleMutation {
                 node,
                 name: arg2.to_string(),
                 old_value: keeps_selector_value
                     .then(|| {
-                        dom.with_node(node, |node| {
-                            node.get_attribute(arg2).map(str::to_owned)
-                        })
+                            dom.with_node(node, |node| node.get_attribute(arg2).map(str::to_owned))
                         .flatten()
                     })
                     .flatten(),
                 new_value: None,
             }
-            .into())
+                .into(),
+            )
         }
         "append_child" => {
             let child = NodeId::new(arg2.parse::<u32>().ok()?);
@@ -995,9 +1018,7 @@ fn retained_style_mutation(
         }
         "remove_child" => {
             let old_parent = dom.get_node(node)?.parent?;
-            Some(
-                obscura_render::TreeStyleMutation::Remove { node, old_parent }.into(),
-            )
+            Some(obscura_render::TreeStyleMutation::Remove { node, old_parent }.into())
         }
         "insert_before" => {
             let reference = NodeId::new(arg2.parse::<u32>().ok()?);
@@ -1237,7 +1258,14 @@ fn fragment_context_and_html(arg: &str) -> (html5ever::QualName, &str) {
         Some((prefix, local)) if !prefix.is_empty() && !local.is_empty() => {
             (Some(html5ever::Prefix::from(prefix)), local)
         }
-        _ => (None, if qualified.is_empty() { "body" } else { qualified }),
+        _ => (
+            None,
+            if qualified.is_empty() {
+                "body"
+            } else {
+                qualified
+            },
+        ),
     };
     (
         html5ever::QualName::new(
@@ -1326,6 +1354,160 @@ fn op_shadow_root_info(state: &OpState, host_nid: u32) -> String {
         .unwrap_or_default()
 }
 
+fn stylesheet_origin_clean(document_url: &str, response_url: &str) -> bool {
+    let (Ok(document), Ok(response)) =
+        (url::Url::parse(document_url), url::Url::parse(response_url))
+    else {
+        return false;
+    };
+    document.origin() == response.origin()
+}
+
+/// Install host-fetched CSS without manufacturing a page-visible `<style>`.
+#[op2(fast)]
+fn op_external_stylesheet_set(
+    state: &OpState,
+    owner_nid: u32,
+    #[string] css: String,
+    #[string] response_url: String,
+    imported_origin_clean: bool,
+    frame_id: u32,
+) -> bool {
+    let shared = frame_state(state, frame_id);
+    let mut state = shared.borrow_mut();
+    let owner = NodeId::new(owner_nid);
+    let valid_owner = state.dom.as_ref().is_some_and(|dom| {
+        dom.get_node(owner).is_some_and(|node| {
+            node.as_element()
+                .is_some_and(|element| matches!(element.local.as_ref(), "link" | "style"))
+        })
+    });
+    if !valid_owner {
+        return false;
+    }
+    let origin_clean = imported_origin_clean && stylesheet_origin_clean(&state.url, &response_url);
+    let connected = state
+        .dom
+        .as_ref()
+        .is_some_and(|dom| node_is_connected(dom, owner));
+    let changed = state
+        .dom
+        .as_ref()
+        .is_some_and(|dom| dom.replace_external_stylesheet(owner, css, origin_clean));
+    if changed && connected {
+        state.activity_generation = state.activity_generation.wrapping_add(1);
+        #[cfg(feature = "render")]
+        {
+            state.prepared_render = None;
+            state.pending_style_mutations.clear();
+            state.resolved_scroll = None;
+        }
+    }
+    changed
+}
+
+#[op2(fast)]
+fn op_external_stylesheet_remove(state: &OpState, owner_nid: u32, frame_id: u32) -> bool {
+    let shared = frame_state(state, frame_id);
+    let mut state = shared.borrow_mut();
+    let owner = NodeId::new(owner_nid);
+    let connected = state
+        .dom
+        .as_ref()
+        .is_some_and(|dom| node_is_connected(dom, owner));
+    let changed = state
+        .dom
+        .as_ref()
+        .is_some_and(|dom| dom.remove_external_stylesheet(owner));
+    if changed && connected {
+        state.activity_generation = state.activity_generation.wrapping_add(1);
+        #[cfg(feature = "render")]
+        {
+            state.prepared_render = None;
+            state.pending_style_mutations.clear();
+            state.resolved_scroll = None;
+        }
+    }
+    changed
+}
+
+/// CSSOM sources change through both DOM operations and native stylesheet loading.
+#[op2(fast)]
+fn op_stylesheet_generation(state: &OpState, frame_id: u32, linked: bool) -> f64 {
+    let shared = frame_state(state, frame_id);
+    let state = shared.borrow();
+    let generation = if linked {
+        state.dom.as_ref().map_or(0, |dom| dom.external_stylesheet_generation())
+    } else {
+        state.activity_generation.wrapping_add(
+            state.dom.as_ref().map_or(0, |dom| dom.external_stylesheet_generation()))
+    };
+    generation as f64
+}
+
+#[op2(fast)]
+fn op_cssom_stylesheet_has(state: &OpState, owner_nid: u32, frame_id: u32) -> bool {
+    frame_state(state, frame_id).borrow().dom.as_ref()
+        .is_some_and(|dom| dom.has_cssom_stylesheet(NodeId::new(owner_nid)))
+}
+
+fn invalidate_cssom_render(state: &mut ObscuraState) {
+    state.activity_generation = state.activity_generation.wrapping_add(1);
+    #[cfg(feature = "render")]
+    {
+        state.prepared_render = None;
+        state.pending_style_mutations.clear();
+        state.resolved_scroll = None;
+    }
+}
+
+#[op2]
+fn op_cssom_stylesheet_update(
+    state: &OpState, owner_nid: u32, index: u32, delete_count: u32,
+    #[serde] rules: Vec<String>, reset: bool, frame_id: u32,
+) -> bool {
+    let shared = frame_state(state, frame_id);
+    let mut state = shared.borrow_mut();
+    let changed = state.dom.as_ref().is_some_and(|dom| dom.update_cssom_stylesheet(
+        NodeId::new(owner_nid), index as usize, delete_count as usize, rules, reset));
+    if changed { invalidate_cssom_render(&mut state); }
+    changed
+}
+
+#[op2(fast)]
+fn op_cssom_stylesheet_clear(state: &OpState, owner_nid: u32, frame_id: u32) {
+    let shared = frame_state(state, frame_id);
+    let mut state = shared.borrow_mut();
+    if state.dom.as_ref().is_some_and(|dom| dom.clear_cssom_stylesheet(NodeId::new(owner_nid))) {
+        invalidate_cssom_render(&mut state);
+    }
+}
+
+/// Return CSSOM-readable bytes only for an origin-clean loaded sheet.
+#[op2]
+#[string]
+fn op_external_stylesheet_get(state: &OpState, owner_nid: u32, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
+    let state = shared.borrow();
+    let Some(sheet) = state
+        .dom
+        .as_ref()
+        .and_then(|dom| dom.external_stylesheet(NodeId::new(owner_nid)))
+    else {
+        return "null".to_string();
+    };
+    if !sheet.origin_clean {
+        return r#"{"originClean":false}"#.to_string();
+    }
+    let css = sheet
+        .sources
+        .iter()
+        .map(|source| source.as_ref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_json::json!({ "originClean": true, "css": css }).to_string()
+}
+
 #[op2]
 #[string]
 fn op_dom(
@@ -1352,6 +1534,20 @@ fn op_dom(
 }
 
 fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
+    if cmd == "document_lifecycle" {
+        let mut state = shared.borrow_mut();
+        // Page lifecycle collection is independent of Runtime.enable.
+        // The queue remains bounded; CDP filters delivery by Page subscription.
+        if matches!(arg1.as_str(), "init" | "DOMContentLoaded" | "load") {
+            if state.pending_runtime_events.len() >= 1_024 {
+                state.pending_runtime_events.pop_front();
+            }
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+            state.pending_runtime_events.push_back(RuntimeEvent::DocumentLifecycle { name: arg1, timestamp });
+        }
+        return "true".into();
+    }
     {
         // Scroll offsets belong to a node at its current tree position.
         // Temporary box/style loss keeps that latent state, but DOM removal,
@@ -1424,6 +1620,13 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             state.activity_generation = state.activity_generation.wrapping_add(1);
         }
         #[cfg(feature = "render")]
+        // Native text values and indeterminate checkbox marks are consumed
+        // directly by paint. They do not participate in the selector surface
+        // or intrinsic control sizing, so keep the existing geometry. Checked
+        // state is deliberately excluded because `:checked` can affect style.
+        let invalidate_geometry =
+            invalidate && !matches!(cmd.as_str(), "set_form_value" | "set_form_indeterminate");
+        #[cfg(feature = "render")]
         if !reset_nodes.is_empty() {
             state
                 .element_scroll_offsets
@@ -1436,7 +1639,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         #[cfg(feature = "render")]
         let had_prepared_render = state.prepared_render.is_some();
         #[cfg(feature = "render")]
-        if invalidate {
+        if invalidate_geometry {
             let mutation_time_ms = (state.animation_timeline_origin.elapsed().as_secs_f64()
                 * 1_000.0)
                 .min(f64::from(f32::MAX)) as f32;
@@ -1473,9 +1676,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                     .parse::<u32>()
                     .ok()
                     .map(NodeId::new)
-                    .and_then(|reference| {
-                        state.dom.as_ref()?.get_node(reference)?.parent
-                    }),
+                    .and_then(|reference| state.dom.as_ref()?.get_node(reference)?.parent),
                 "remove_child" => arg1
                     .parse::<u32>()
                     .ok()
@@ -1493,10 +1694,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             }
             if let Some(mutation) = retained_style_mutation {
                 let retained = state.prepared_render.is_some()
-                    && queue_retained_style_mutation(
-                        &mut state.pending_style_mutations,
-                        mutation,
-                    );
+                    && queue_retained_style_mutation(&mut state.pending_style_mutations, mutation);
                 if !retained {
                     state.prepared_render = None;
                     state.pending_style_mutations.clear();
@@ -1519,7 +1717,13 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             };
             eprintln!(
                 "[timing] render-cache mutation sequence={} cmd={} node={} detail={} connected={} actual_change={} invalidated={}",
-                sequence, cmd, arg1, detail, impact.connected, impact.actual_change, invalidate
+                sequence,
+                cmd,
+                arg1,
+                detail,
+                impact.connected,
+                impact.actual_change,
+                invalidate_geometry
             );
         }
     }
@@ -1882,9 +2086,15 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 Err(_) => return "false".into(),
             };
             let child = NodeId::new(child);
-            let had_parent = dom.get_node(child).is_some_and(|node| node.parent.is_some());
+            let had_parent = dom
+                .get_node(child)
+                .is_some_and(|node| node.parent.is_some());
             dom.remove_child(child);
-            (had_parent && dom.get_node(child).is_some_and(|node| node.parent.is_none())).to_string()
+            (had_parent
+                && dom
+                    .get_node(child)
+                    .is_some_and(|node| node.parent.is_none()))
+            .to_string()
         }
         "insert_before" => {
             let new_node = match arg1.parse::<u32>() {
@@ -1905,11 +2115,24 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         }
         "remove_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.with_node_mut(NodeId::new(nid), |n| {
+            let node_id = NodeId::new(nid);
+            // Removing `id` must clear the id_index too, matching set_attribute /
+            // remove_attribute_ns; otherwise getElementById keeps returning the
+            // still-attached element (#1013).
+            let old_id = if arg2 == "id" {
+                dom.with_node(node_id, |n| n.get_attribute("id").map(str::to_owned))
+                    .flatten()
+            } else {
+                None
+            };
+            dom.with_node_mut(node_id, |n| {
                 if let NodeData::Element { attrs, .. } = &mut n.data {
                     attrs.retain(|a| !a.qualified_name_eq(&arg2));
                 }
             });
+            if arg2 == "id" {
+                dom.update_id_index(node_id, old_id.as_deref(), None);
+            }
             "true".into()
         }
         // Namespace-aware attribute ops. arg2 packs the pieces with a NUL:
@@ -1919,7 +2142,9 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let (ns, local) = arg2.split_once('\0').unwrap_or(("", arg2.as_str()));
             let val = dom
-                .with_node(NodeId::new(nid), |n| n.get_attribute_ns(ns, local).map(|s| s.to_string()))
+                .with_node(NodeId::new(nid), |n| {
+                    n.get_attribute_ns(ns, local).map(|s| s.to_string())
+                })
                 .flatten();
             serde_json::to_string(&val).unwrap_or("null".into())
         }
@@ -2047,8 +2272,14 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         "document_write" => {
             let mut slot = gs.write_stream.borrow_mut();
             let stream = slot.get_or_insert_with(DocumentWriteStream::new);
-            let pairs: Vec<[i32; 2]> = stream
-                .write(&arg2, dom)
+            let placements = stream.write(&arg2, dom);
+            if placements
+                .iter()
+                .any(|placement| node_is_script(dom, placement.node))
+            {
+                gs.document_write_inserted_script.set(true);
+            }
+            let pairs: Vec<[i32; 2]> = placements
                 .iter()
                 .map(|placement| {
                     [
@@ -2062,6 +2293,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         // document.open() discards what the input stream holds and starts over.
         "document_write_reset" => {
             *gs.write_stream.borrow_mut() = None;
+            gs.document_write_inserted_script.set(false);
             "true".into()
         }
         "set_text_content" => {
@@ -2315,7 +2547,10 @@ fn compare_node_order(dom: &DomTree, a: NodeId, b: NodeId) -> i32 {
 
 #[op2(fast)]
 fn op_runtime_events_enabled(state: &OpState) -> bool {
-    state.borrow::<SharedState>().borrow().runtime_events_enabled
+    state
+        .borrow::<SharedState>()
+        .borrow()
+        .runtime_events_enabled
 }
 
 #[op2(fast)]
@@ -2480,6 +2715,12 @@ fn request_origin(request_url: &str) -> Option<String> {
         .map(|url| url.origin().ascii_serialization())
 }
 
+/// Fetch "append a request `Origin` header": cross-origin requests and any
+/// request whose method is neither GET nor HEAD carry the requester's origin.
+fn sends_origin_header(method: &str, cross_origin: bool) -> bool {
+    cross_origin || !matches!(method, "GET" | "HEAD")
+}
+
 /// Strip headers that must not survive a redirect. On a redirect that changes
 /// origin, credential headers (`Authorization`, `Proxy-Authorization`, an
 /// explicit `Cookie`) are removed so they are not forwarded to a different
@@ -2534,8 +2775,19 @@ fn is_cors_unsafe_request_header_byte(byte: u8) -> bool {
     (byte < 0x20 && byte != b'\t')
         || matches!(
             byte,
-            b'"' | b'(' | b')' | b':' | b'<' | b'>' | b'?' | b'@' | b'[' | b'\\'
-                | b']' | b'{' | b'}' | 0x7f
+            b'"' | b'('
+                | b')'
+                | b':'
+                | b'<'
+                | b'>'
+                | b'?'
+                | b'@'
+                | b'['
+                | b'\\'
+                | b']'
+                | b'{'
+                | b'}'
+                | 0x7f
         )
 }
 
@@ -2543,8 +2795,20 @@ fn is_http_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
         || matches!(
             byte,
-            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
-                | b'^' | b'_' | b'`' | b'|' | b'~'
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
         )
 }
 
@@ -2605,11 +2869,11 @@ fn is_cors_safelisted_request_header(name: &str, value: &str) -> bool {
     if name.eq_ignore_ascii_case("accept") {
         return !value.bytes().any(is_cors_unsafe_request_header_byte);
     }
-    if name.eq_ignore_ascii_case("accept-language")
-        || name.eq_ignore_ascii_case("content-language")
+    if name.eq_ignore_ascii_case("accept-language") || name.eq_ignore_ascii_case("content-language")
     {
         return value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'*' | b',' | b'-' | b'.' | b';' | b'=')
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b' ' | b'*' | b',' | b'-' | b'.' | b';' | b'=')
         });
     }
     if name.eq_ignore_ascii_case("content-type") {
@@ -2668,18 +2932,66 @@ fn parse_cors_header_list<'a>(
 
 fn preflight_allows_method(method: &reqwest::Method, allowed: &[&str], credentialed: bool) -> bool {
     is_cors_safelisted_method(method)
-        || allowed.iter().any(|allowed| {
-            *allowed == method.as_str() || (*allowed == "*" && !credentialed)
-        })
+        || allowed
+            .iter()
+            .any(|allowed| *allowed == method.as_str() || (*allowed == "*" && !credentialed))
 }
 
 fn preflight_allows_header(name: &str, allowed: &[&str], credentialed: bool) -> bool {
     allowed
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(name))
-        || (!name.eq_ignore_ascii_case("authorization")
-            && !credentialed
-            && allowed.contains(&"*"))
+        || (!name.eq_ignore_ascii_case("authorization") && !credentialed && allowed.contains(&"*"))
+}
+
+fn visible_response_headers(
+    headers: &HashMap<String, String>,
+    cross_origin: bool,
+    credentials: FetchCredentials,
+) -> HashMap<String, String> {
+    const SAFE: [&str; 7] = [
+        "cache-control",
+        "content-language",
+        "content-length",
+        "content-type",
+        "expires",
+        "last-modified",
+        "pragma",
+    ];
+
+    let mut expose_all = false;
+    let mut exposed = Vec::new();
+    if cross_origin {
+        if let Some(value) = headers.get("access-control-expose-headers") {
+            for name in value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                if name == "*" && credentials != FetchCredentials::Include {
+                    expose_all = true;
+                } else {
+                    exposed.push(name);
+                }
+            }
+        }
+    }
+
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            if name.eq_ignore_ascii_case("set-cookie") || name.eq_ignore_ascii_case("set-cookie2") {
+                return false;
+            }
+            !cross_origin
+                || expose_all
+                || SAFE.iter().any(|safe| name.eq_ignore_ascii_case(safe))
+                || exposed
+                    .iter()
+                    .any(|exposed| name.eq_ignore_ascii_case(exposed))
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
 }
 
 /// Build the JS-facing result for an intercepted request a CDP client chose to
@@ -2694,17 +3006,29 @@ fn intercept_fulfill_response(
     body: &str,
     body_base64: &str,
     url: &str,
+    page_origin: &str,
+    mode: &str,
+    credentials: FetchCredentials,
+    internal_load: bool,
 ) -> serde_json::Value {
+    let cross_origin = request_origin(url).is_some_and(|origin| origin != page_origin);
+    let opaque = !internal_load && mode == "no-cors" && cross_origin;
+    let visible_headers = if opaque {
+        HashMap::new()
+    } else {
+        visible_response_headers(&headers, cross_origin, credentials)
+    };
     serde_json::json!({
-        "status": status,
-        "body": body,
-        "bodyBase64": body_base64,
+        "status": if opaque { 0 } else { status },
+        "body": if opaque { "" } else { body },
+        "bodyBase64": if opaque { "" } else { body_base64 },
         "url": url,
-        "headers": headers,
+        "headers": visible_headers,
+        "opaque": opaque,
     })
 }
 
-#[op2(async)]
+#[op2]
 #[string]
 async fn op_fetch_url(
     state: Rc<RefCell<OpState>>,
@@ -2715,6 +3039,7 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
+    internal_load: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
     let body = body.to_vec();
     tracing::debug!(
@@ -2723,7 +3048,7 @@ async fn op_fetch_url(
         url
     );
 
-    let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client) = {
+    let (cookie_jar, in_flight, page_in_flight, intercept_tx, page_id, request_id, proxy_url, callbacks, http_client) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -2757,11 +3082,13 @@ async fn op_fetch_url(
             gs.intercept_enabled,
             gs.intercept_tx.is_some()
         );
+        // Allocate once, before interception. CDP must use this identity for
+        // the request start, completion and retained response body.
+        // The CDP resolver map spans pages and navigations on a connection.
+        static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let request_id = format!("fetch-{}", NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let itx = if gs.intercept_enabled {
-            gs.intercept_counter += 1;
-            gs.intercept_tx
-                .clone()
-                .map(|tx| (tx, format!("intercept-{}", gs.intercept_counter)))
+            gs.intercept_tx.clone()
         } else {
             None
         };
@@ -2770,6 +3097,8 @@ async fn op_fetch_url(
             in_flight,
             Arc::clone(&gs.page_in_flight),
             itx,
+            gs.intercept_page_id.clone(),
+            request_id,
             proxy_url,
             gs.callbacks.clone(),
             gs.http_client.clone(),
@@ -2782,18 +3111,22 @@ async fn op_fetch_url(
     let allow_private_network = http_client
         .as_ref()
         .is_some_and(|client| client.allow_private_network);
-    if let Ok(parsed_url) = url::Url::parse(&url) {
-        if let Err(e) = validate_fetch_url(&parsed_url, allow_private_network) {
-            return Ok(serde_json::json!({
-                "status": 0,
-                "body": "",
-                "url": url,
-                "headers": {},
-                "blocked": true,
-                "error": e,
-            })
-            .to_string());
-        }
+    // Same rule as the rewrite below: a URL the gate cannot parse is one it
+    // cannot check, so it never reaches the transport.
+    let gate_error = match url::Url::parse(&url) {
+        Ok(parsed_url) => validate_fetch_url(&parsed_url, allow_private_network).err(),
+        Err(err) => Some(format!("Unparsable URL blocked: {}", err)),
+    };
+    if let Some(e) = gate_error {
+        return Ok(serde_json::json!({
+            "status": 0,
+            "body": "",
+            "url": url,
+            "headers": {},
+            "blocked": true,
+            "error": e,
+        })
+        .to_string());
     }
     struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
     impl Drop for PageInFlightGuard {
@@ -2803,6 +3136,7 @@ async fn op_fetch_url(
     }
     page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _page_in_flight = PageInFlightGuard(page_in_flight);
+    let credentials = FetchCredentials::parse(&credentials);
 
     // Slots the interception channel can override via Continue so a consumer
     // can rewrite url/method/headers/body before the request goes out.
@@ -2811,12 +3145,14 @@ async fn op_fetch_url(
     let mut override_headers: Option<HashMap<String, String>> = None;
     let mut override_body: Option<Vec<u8>> = None;
 
-    if let Some((tx, request_id)) = intercept_tx {
+    let mut was_intercepted = false;
+    if let Some(tx) = intercept_tx {
         let custom_headers: HashMap<String, String> =
             serde_json::from_str(&headers_json).unwrap_or_default();
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
             request_id: request_id.clone(),
+            page_id,
             url: url.clone(),
             method: method.clone(),
             headers: custom_headers.clone(),
@@ -2824,6 +3160,7 @@ async fn op_fetch_url(
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
+            was_intercepted = true;
             match resolve_rx.await {
                 Ok(InterceptResolution::Fulfill {
                     status,
@@ -2831,7 +3168,18 @@ async fn op_fetch_url(
                     body: b,
                     body_base64: bb,
                 }) => {
-                    return Ok(intercept_fulfill_response(status, h, &b, &bb, &url).to_string());
+                    return Ok(intercept_fulfill_response(
+                        status,
+                        h,
+                        &b,
+                        &bb,
+                        &url,
+                        &origin,
+                        &mode,
+                        credentials,
+                        internal_load,
+                    )
+                    .to_string());
                 }
                 Ok(InterceptResolution::Fail { reason }) => {
                     return Ok(serde_json::json!({
@@ -2873,17 +3221,30 @@ async fn op_fetch_url(
     // below). Without this re-validation a rewrite to an internal address would
     // bypass validate_fetch_url entirely.
     let url = if let Some(new_url) = override_url {
-        if let Ok(parsed) = url::Url::parse(&new_url) {
-            if let Err(reason) = validate_fetch_url(&parsed, allow_private_network) {
+        // A rewrite the gate cannot parse is a rewrite the gate cannot check:
+        // refuse it here rather than hand the raw string to the transport.
+        let parsed = match url::Url::parse(&new_url) {
+            Ok(parsed) => parsed,
+            Err(err) => {
                 return Ok(serde_json::json!({
                     "status": 0,
                     "body": "",
                     "url": new_url,
                     "blocked": true,
-                    "error": format!("Intercept rewrite to forbidden URL blocked: {}", reason),
+                    "error": format!("Intercept rewrite to unparsable URL blocked: {}", err),
                 })
                 .to_string());
             }
+        };
+        if let Err(reason) = validate_fetch_url(&parsed, allow_private_network) {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": new_url,
+                "blocked": true,
+                "error": format!("Intercept rewrite to forbidden URL blocked: {}", reason),
+            })
+            .to_string());
         }
         new_url
     } else {
@@ -2906,7 +3267,6 @@ async fn op_fetch_url(
         origin.clone()
     };
     let is_cross_origin = !page_origin.is_empty() && initial_request_origin != page_origin;
-    let credentials = FetchCredentials::parse(&credentials);
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
@@ -2952,10 +3312,7 @@ async fn op_fetch_url(
                 unsafe_header_names.join(","),
             );
         }
-        let preflight = preflight_request
-            .send()
-            .await
-            .map_err(|e| {
+        let preflight = preflight_request.send().await.map_err(|e| {
                 deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
             })?;
 
@@ -2986,19 +3343,15 @@ async fn op_fetch_url(
             )));
         }
 
-        let allowed_methods = parse_cors_header_list(
-            preflight.headers(),
-            "access-control-allow-methods",
-        )
+        let allowed_methods =
+            parse_cors_header_list(preflight.headers(), "access-control-allow-methods")
         .ok_or_else(|| {
             deno_error::JsErrorBox::generic(
                 "CORS preflight returned an invalid Access-Control-Allow-Methods value",
             )
         })?;
-        let allowed_headers = parse_cors_header_list(
-            preflight.headers(),
-            "access-control-allow-headers",
-        )
+        let allowed_headers =
+            parse_cors_header_list(preflight.headers(), "access-control-allow-headers")
         .ok_or_else(|| {
             deno_error::JsErrorBox::generic(
                 "CORS preflight returned an invalid Access-Control-Allow-Headers value",
@@ -3045,6 +3398,7 @@ async fn op_fetch_url(
                 credentials,
                 callbacks.clone(),
                 allow_private_network,
+                internal_load,
             )
             .await;
         }
@@ -3063,6 +3417,7 @@ async fn op_fetch_url(
     let mut redirects_followed: usize = 0;
     let mut redirected_from = Vec::new();
     let mut crossed_origin = is_cross_origin;
+    let cookie_initiator = url::Url::parse(&page_origin).ok();
     let response = loop {
         let mut req = client
             .request(current_method.clone(), &current_url)
@@ -3072,7 +3427,7 @@ async fn op_fetch_url(
             .map(|request_origin| request_origin != page_origin)
             .unwrap_or(false);
         crossed_origin |= current_is_cross_origin;
-        if current_is_cross_origin {
+        if sends_origin_header(current_method.as_str(), current_is_cross_origin) {
             req = req.header("Origin", &page_origin);
         }
 
@@ -3080,7 +3435,15 @@ async fn op_fetch_url(
         if credentials_allowed {
             if let Some(ref jar) = cookie_jar {
                 if let Ok(parsed_url) = url::Url::parse(&current_url) {
-                    let cookie_header = jar.get_cookie_header(&parsed_url);
+                    let context = if cookie_initiator
+                        .as_ref()
+                        .is_some_and(|source| same_site(source, &parsed_url))
+                    {
+                        SameSiteContext::SameSite
+                    } else {
+                        SameSiteContext::CrossSite
+                    };
+                    let cookie_header = jar.get_cookie_header_in_context(&parsed_url, context);
                     if !cookie_header.is_empty() {
                         req = req.header("Cookie", &cookie_header);
                     }
@@ -3215,8 +3578,7 @@ async fn op_fetch_url(
         // Browser semantics: 301/302/303 downgrade to GET with no body.
         // 307/308 preserve method and body.
         let status_code = resp.status().as_u16();
-        let downgraded_to_get =
-            status_code == 301 || status_code == 302 || status_code == 303;
+        let downgraded_to_get = status_code == 301 || status_code == 302 || status_code == 303;
         if downgraded_to_get {
             current_method = reqwest::Method::GET;
             current_body.clear();
@@ -3298,8 +3660,6 @@ async fn op_fetch_url(
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
-        gs.network_response_body_counter += 1;
-        let request_id = format!("fetch-{}", gs.network_response_body_counter);
         let max_entries = response_body_entry_limit();
         let max_bytes = response_body_byte_limit();
         if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
@@ -3327,6 +3687,7 @@ async fn op_fetch_url(
             .as_secs_f64();
         gs.js_network_events.push(JsNetworkEvent {
             request_id: request_id.clone(),
+            intercepted: was_intercepted,
             url: current_url.clone(),
             method: current_method.as_str().to_string(),
             status,
@@ -3349,15 +3710,22 @@ async fn op_fetch_url(
         resp_body.len()
     );
 
+    let opaque = !internal_load && mode == "no-cors" && crossed_origin;
+    let script_headers = if opaque {
+        HashMap::new()
+    } else {
+        visible_response_headers(&resp_headers, final_is_cross_origin, credentials)
+    };
+
     Ok(serde_json::json!({
-        "status": status,
-        "body": resp_body,
-        "bodyBase64": resp_body_base64,
+        "status": if opaque { 0 } else { status },
+        "body": if opaque { String::new() } else { resp_body },
+        "bodyBase64": if opaque { String::new() } else { resp_body_base64 },
         "requestId": response_request_id,
         "url": current_url,
         "redirected": redirected,
-        "opaque": mode == "no-cors" && crossed_origin,
-        "headers": resp_headers,
+        "opaque": opaque,
+        "headers": script_headers,
     })
     .to_string())
 }
@@ -3399,6 +3767,7 @@ async fn stealth_fetch_all(
     credentials: FetchCredentials,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
+    internal_load: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -3411,6 +3780,7 @@ async fn stealth_fetch_all(
     let mut crossed_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
         .unwrap_or(false);
+    let cookie_initiator = url::Url::parse(&page_origin).ok();
 
     let (status, resp_headers, resp_bytes): (u16, HashMap<String, String>, Vec<u8>) = loop {
         let parsed_current = match url::Url::parse(&current_url) {
@@ -3426,7 +3796,7 @@ async fn stealth_fetch_all(
         let mut req_headers: HashMap<String, String> = HashMap::new();
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
         crossed_origin |= current_is_cross_origin;
-        if current_is_cross_origin {
+        if sends_origin_header(&current_method, current_is_cross_origin) {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
         for (k, v) in &current_headers {
@@ -3434,13 +3804,23 @@ async fn stealth_fetch_all(
         }
 
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
+        let cookie_context = credentials_allowed.then(|| {
+            if cookie_initiator
+                .as_ref()
+                .is_some_and(|source| same_site(source, &parsed_current))
+            {
+                SameSiteContext::SameSite
+            } else {
+                SameSiteContext::CrossSite
+            }
+        });
         let r = stealth
-            .send_single(
+            .send_single_with_context(
                 &current_method,
                 &parsed_current,
                 &req_headers,
                 &current_body,
-                credentials_allowed,
+                cookie_context,
                 credentials_allowed,
             )
             .await
@@ -3566,14 +3946,21 @@ async fn stealth_fetch_all(
         }
     }
 
+    let opaque = !internal_load && mode == "no-cors" && crossed_origin;
+    let script_headers = if opaque {
+        HashMap::new()
+    } else {
+        visible_response_headers(&resp_headers, final_is_cross_origin, credentials)
+    };
+
     Ok(serde_json::json!({
-        "status": status,
-        "body": resp_body,
-        "bodyBase64": resp_body_base64,
+        "status": if opaque { 0 } else { status },
+        "body": if opaque { String::new() } else { resp_body },
+        "bodyBase64": if opaque { String::new() } else { resp_body_base64 },
         "url": current_url,
         "redirected": redirects_followed > 0,
-        "opaque": mode == "no-cors" && crossed_origin,
-        "headers": resp_headers,
+        "opaque": opaque,
+        "headers": script_headers,
     })
     .to_string())
 }
@@ -3608,10 +3995,10 @@ pub(crate) fn glob_match(pattern: &str, url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        cors_response_allows, cors_unsafe_request_header_names, glob_match,
-        is_cors_safelisted_content_type, is_cors_safelisted_request_header,
+        FetchCredentials, ObscuraState, cors_response_allows, cors_unsafe_request_header_names,
+        glob_match, is_cors_safelisted_content_type, is_cors_safelisted_request_header,
         parse_cors_header_list, preflight_allows_header, preflight_allows_method,
-        sanitize_redirect_headers, validate_fetch_url, FetchCredentials, ObscuraState,
+        sanitize_redirect_headers, validate_fetch_url,
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
@@ -3633,21 +4020,37 @@ mod tests {
         // keep the body header and any custom header.
         let mut cross = base();
         sanitize_redirect_headers(&mut cross, true, false);
-        assert!(!cross.contains_key("Authorization"), "Authorization must be stripped cross-origin");
-        assert!(!cross.contains_key("Cookie"), "explicit Cookie must be stripped cross-origin");
+        assert!(
+            !cross.contains_key("Authorization"),
+            "Authorization must be stripped cross-origin"
+        );
+        assert!(
+            !cross.contains_key("Cookie"),
+            "explicit Cookie must be stripped cross-origin"
+        );
         assert!(cross.contains_key("Content-Type"));
         assert!(cross.contains_key("X-Keep"));
 
         // Same-origin 301/302/303 GET downgrade: keep credentials, drop body headers.
         let mut downgrade = base();
         sanitize_redirect_headers(&mut downgrade, false, true);
-        assert!(downgrade.contains_key("Authorization"), "Authorization kept on same-origin redirect");
-        assert!(!downgrade.contains_key("Content-Type"), "Content-Type dropped on GET downgrade");
+        assert!(
+            downgrade.contains_key("Authorization"),
+            "Authorization kept on same-origin redirect"
+        );
+        assert!(
+            !downgrade.contains_key("Content-Type"),
+            "Content-Type dropped on GET downgrade"
+        );
 
         // Same-origin, method preserved: nothing stripped.
         let mut same = base();
         sanitize_redirect_headers(&mut same, false, false);
-        assert_eq!(same.len(), 4, "nothing stripped when same-origin and method preserved");
+        assert_eq!(
+            same.len(),
+            4,
+            "nothing stripped when same-origin and method preserved"
+        );
     }
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -3655,17 +4058,37 @@ mod tests {
 
     #[cfg(feature = "render")]
     use super::{
-        ensure_prepared_geometry, ensure_prepared_render, node_is_connected,
-        queue_retained_style_mutation, retained_style_mutation,
-        shadow_including_connected_nodes, MAX_PENDING_STYLE_MUTATIONS,
+        MAX_PENDING_STYLE_MUTATIONS, ensure_prepared_geometry, ensure_prepared_render,
+        node_is_connected, queue_retained_style_mutation, retained_style_mutation,
+        shadow_including_connected_nodes,
     };
     #[cfg(feature = "render")]
     use obscura_dom::ShadowRootMode;
 
     use super::read_body_capped;
-    use super::{pbkdf2_derive, push_capped, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
-    use super::intercept_fulfill_response;
-    use base64::{engine::general_purpose::STANDARD as FULFILL_BASE64, Engine as _};
+    use super::url_set_inner;
+    use super::{PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES, pbkdf2_derive, push_capped};
+    use super::{intercept_fulfill_response, visible_response_headers};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as FULFILL_BASE64};
+
+    // #1008: URL property setters must follow WHATWG — search/hash keep a bare
+    // delimiter as an empty component, and port parses the leading digits.
+    #[test]
+    fn url_setters_follow_whatwg_search_hash_and_port() {
+        // search = "?" keeps an empty query -> serializes with a trailing "?".
+        let r = url_set_inner("http://example.com/path", "search", "?").unwrap();
+        assert_eq!(r["href"], serde_json::json!("http://example.com/path?"));
+        // search = "" removes the query.
+        let r = url_set_inner("http://example.com/path?a=1", "search", "").unwrap();
+        assert_eq!(r["href"], serde_json::json!("http://example.com/path"));
+        // hash = "#" keeps an empty fragment.
+        let r = url_set_inner("http://example.com/path", "hash", "#").unwrap();
+        assert_eq!(r["href"], serde_json::json!("http://example.com/path#"));
+        // port = "8080abc" parses the leading digits -> 8080.
+        let r = url_set_inner("http://example.com/", "port", "8080abc").unwrap();
+        assert_eq!(r["port"], serde_json::json!("8080"));
+        assert_eq!(r["href"], serde_json::json!("http://example.com:8080/"));
+    }
 
     #[test]
     fn cors_request_header_safelist_checks_values() {
@@ -3695,10 +4118,7 @@ mod tests {
         assert!(is_cors_safelisted_request_header("Range", "bytes=500-"));
         assert!(!is_cors_safelisted_request_header("Range", "bytes=-500"));
         assert!(!is_cors_safelisted_request_header("Range", "bytes=500-499"));
-        assert!(!is_cors_safelisted_request_header(
-            "Range",
-            "bytes=0-1,4-5"
-        ));
+        assert!(!is_cors_safelisted_request_header("Range", "bytes=0-1,4-5"));
     }
 
     #[test]
@@ -3737,11 +4157,7 @@ mod tests {
 
     #[test]
     fn cors_preflight_permissions_follow_credentials_and_authorization_rules() {
-        assert!(preflight_allows_method(
-            &reqwest::Method::POST,
-            &[],
-            true
-        ));
+        assert!(preflight_allows_method(&reqwest::Method::POST, &[], true));
         assert!(preflight_allows_method(
             &reqwest::Method::DELETE,
             &["DELETE"],
@@ -3768,11 +4184,7 @@ mod tests {
             &["authorization"],
             true
         ));
-        assert!(!preflight_allows_header(
-            "Authorization",
-            &["*"],
-            false
-        ));
+        assert!(!preflight_allows_header("Authorization", &["*"], false));
         assert!(preflight_allows_header("X-Trace", &["*"], false));
         assert!(!preflight_allows_header("X-Trace", &["*"], true));
     }
@@ -3784,19 +4196,13 @@ mod tests {
             "access-control-allow-methods",
             "GET, DELETE".parse().unwrap(),
         );
-        headers.append(
-            "access-control-allow-methods",
-            "PATCH".parse().unwrap(),
-        );
+        headers.append("access-control-allow-methods", "PATCH".parse().unwrap());
         assert_eq!(
             parse_cors_header_list(&headers, "access-control-allow-methods"),
             Some(vec!["GET", "DELETE", "PATCH"])
         );
 
-        headers.append(
-            "access-control-allow-methods",
-            "@invalid".parse().unwrap(),
-        );
+        headers.append("access-control-allow-methods", "@invalid".parse().unwrap());
         assert!(parse_cors_header_list(&headers, "access-control-allow-methods").is_none());
     }
 
@@ -3804,7 +4210,9 @@ mod tests {
     // `bodyBase64`, not be silently corrupted by the lossy `body` text view.
     #[test]
     fn intercept_fulfill_carries_binary_body_as_base64() {
-        let raw = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFE, 0x00];
+        let raw = [
+            0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFE, 0x00,
+        ];
         let b64 = FULFILL_BASE64.encode(raw);
         let lossy = String::from_utf8_lossy(&raw).to_string();
         let result = intercept_fulfill_response(
@@ -3813,6 +4221,10 @@ mod tests {
             &lossy,
             &b64,
             "https://example.test/",
+            "https://example.test",
+            "cors",
+            FetchCredentials::SameOrigin,
+            false,
         );
         let out_b64 = result["bodyBase64"]
             .as_str()
@@ -3821,6 +4233,72 @@ mod tests {
             .decode(out_b64)
             .expect("bodyBase64 must be valid base64");
         assert_eq!(decoded, raw, "the exact bytes must survive via bodyBase64");
+    }
+
+    #[test]
+    fn intercepted_internal_load_keeps_cross_origin_body_private_but_usable() {
+        let public = intercept_fulfill_response(
+            200,
+            std::collections::HashMap::new(),
+            "script body",
+            "",
+            "https://cdn.example/script.js",
+            "https://page.example",
+            "no-cors",
+            FetchCredentials::SameOrigin,
+            false,
+        );
+        assert_eq!(public["status"], 0);
+        assert_eq!(public["body"], "");
+        assert_eq!(public["opaque"], true);
+
+        let internal = intercept_fulfill_response(
+            200,
+            std::collections::HashMap::new(),
+            "script body",
+            "",
+            "https://cdn.example/script.js",
+            "https://page.example",
+            "no-cors",
+            FetchCredentials::SameOrigin,
+            true,
+        );
+        assert_eq!(internal["status"], 200);
+        assert_eq!(internal["body"], "script body");
+        assert_eq!(internal["opaque"], false);
+    }
+
+    #[test]
+    fn response_headers_hide_cookies_and_unexposed_cross_origin_fields() {
+        let headers = std::collections::HashMap::from([
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("set-cookie".to_string(), "sid=secret; HttpOnly".to_string()),
+            ("x-secret".to_string(), "hidden".to_string()),
+            ("x-visible".to_string(), "shown".to_string()),
+            (
+                "access-control-expose-headers".to_string(),
+                "X-Visible, Set-Cookie".to_string(),
+            ),
+        ]);
+
+        let same_origin = visible_response_headers(&headers, false, FetchCredentials::SameOrigin);
+        assert!(!same_origin.contains_key("set-cookie"));
+        assert_eq!(
+            same_origin.get("x-secret").map(String::as_str),
+            Some("hidden")
+        );
+
+        let cross_origin = visible_response_headers(&headers, true, FetchCredentials::SameOrigin);
+        assert_eq!(
+            cross_origin.get("content-type").map(String::as_str),
+            Some("text/plain")
+        );
+        assert_eq!(
+            cross_origin.get("x-visible").map(String::as_str),
+            Some("shown")
+        );
+        assert!(!cross_origin.contains_key("x-secret"));
+        assert!(!cross_origin.contains_key("set-cookie"));
     }
 
     // SEC-002 / #705 — fetched_urls (and the like) must not grow without bound.
@@ -3855,7 +4333,13 @@ mod tests {
 
     #[test]
     fn pbkdf2_rejects_excessive_output_length() {
-        let err = pbkdf2_derive("SHA-256", b"pw", b"salt", 1_000, PBKDF2_MAX_OUTPUT_BYTES + 1)
+        let err = pbkdf2_derive(
+            "SHA-256",
+            b"pw",
+            b"salt",
+            1_000,
+            PBKDF2_MAX_OUTPUT_BYTES + 1,
+        )
             .expect_err("output length above the cap must be rejected");
         assert!(
             err.to_string().contains("length"),
@@ -3874,11 +4358,17 @@ mod tests {
     // buffer straight from an untrusted u32 length. Each must reject a length
     // above its fixed maximum before allocating, and still work for ordinary
     // inputs. See #910.
-    use super::{hkdf_derive, random_bytes, HKDF_MAX_OUTPUT_BYTES, RANDOM_BYTES_MAX};
+    use super::{HKDF_MAX_OUTPUT_BYTES, RANDOM_BYTES_MAX, hkdf_derive, random_bytes};
 
     #[test]
     fn hkdf_rejects_excessive_output_length() {
-        let err = hkdf_derive("SHA-256", b"ikm", b"salt", b"info", HKDF_MAX_OUTPUT_BYTES + 1)
+        let err = hkdf_derive(
+            "SHA-256",
+            b"ikm",
+            b"salt",
+            b"info",
+            HKDF_MAX_OUTPUT_BYTES + 1,
+        )
             .expect_err("output length above the cap must be rejected");
         assert!(
             err.to_string().contains("exceeds"),
@@ -3895,8 +4385,8 @@ mod tests {
 
     #[test]
     fn random_bytes_rejects_excessive_length() {
-        let err = random_bytes(RANDOM_BYTES_MAX + 1)
-            .expect_err("a draw above the cap must be rejected");
+        let err =
+            random_bytes(RANDOM_BYTES_MAX + 1).expect_err("a draw above the cap must be rejected");
         assert!(
             err.to_string().contains("exceeds"),
             "error should name the length cap: {err}"
@@ -3908,7 +4398,6 @@ mod tests {
         let buf = random_bytes(32).expect("an ordinary draw must succeed");
         assert_eq!(buf.len(), 32, "draw must return the requested length");
     }
-
 
     // SEC-005 / #581 — op_fetch_url must not buffer an unbounded response body.
     // read_body_capped streams the body and refuses anything larger than the
@@ -4129,11 +4618,15 @@ mod tests {
             .unwrap();
         let values = result.as_array().unwrap();
         assert!(
-            values[..3].iter().all(|value| value.as_f64() == Some(100.0)),
+            values[..3]
+                .iter()
+                .all(|value| value.as_f64() == Some(100.0)),
             "posted-task chains did not finish inside the 100ms pump: {result}",
         );
         assert!(
-            values[3].as_f64().is_some_and(|elapsed| elapsed >= 0.0 && elapsed < 75.0),
+            values[3]
+                .as_f64()
+                .is_some_and(|elapsed| elapsed >= 0.0 && elapsed < 75.0),
             "300 chained posted-task deliveries retained timer-wheel latency: {result}",
         );
     }
@@ -4232,7 +4725,7 @@ mod tests {
                 "posted-task-from-op-resolution",
                 r#"
                     globalThis.__postedFromOp = 0;
-                    Deno.core.ops.op_sleep(0).then(() => {
+                    __obscura_test_ops.op_sleep(0).then(() => {
                         const rearm = () => scheduler.postTask(() => {
                             __postedFromOp++;
                             if (__postedFromOp < 250) rearm();
@@ -4353,15 +4846,18 @@ mod tests {
         let host = dom.get_element_by_id("host").unwrap();
         let source = dom.get_element_by_id("source").unwrap();
         let child = dom.get_element_by_id("shadow-child").unwrap();
-        let root = dom
-            .attach_shadow_root(host, ShadowRootMode::Open)
-            .unwrap();
+        let root = dom.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
         dom.append_child(root, child);
 
         assert!(node_is_connected(&dom, child));
         assert!(shadow_including_connected_nodes(&dom).contains(&child));
         assert!(
-            retained_style_mutation(&dom, "set_attribute", &child.index().to_string(), "class\0changed")
+            retained_style_mutation(
+                &dom,
+                "set_attribute",
+                &child.index().to_string(),
+                "class\0changed"
+            )
                 .is_none(),
             "shadow mutations require a full scoped cascade"
         );
@@ -4635,7 +5131,7 @@ fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(),
 
 #[op2]
 #[string]
-fn op_get_cookies(scope: &mut v8::HandleScope, state: &OpState) -> String {
+fn op_get_cookies(scope: &mut v8::PinScope, state: &OpState) -> String {
     let gs = realm_state(scope, state);
     let gs = gs.borrow();
     let jar = match &gs.cookie_jar {
@@ -4650,7 +5146,7 @@ fn op_get_cookies(scope: &mut v8::HandleScope, state: &OpState) -> String {
 }
 
 #[op2(fast)]
-fn op_set_cookie(scope: &mut v8::HandleScope, state: &OpState, #[string] cookie_str: &str) {
+fn op_set_cookie(scope: &mut v8::PinScope, state: &OpState, #[string] cookie_str: &str) {
     let gs = realm_state(scope, state);
     let gs = gs.borrow();
     let jar = match &gs.cookie_jar {
@@ -4664,11 +5160,44 @@ fn op_set_cookie(scope: &mut v8::HandleScope, state: &OpState, #[string] cookie_
     jar.set_cookie_from_js(cookie_str, &url);
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SessionHistory {
+    pub urls: Vec<String>,
+    pub document_start: usize,
+    pub current: usize,
+}
+
+/// `"documentStart,current,length"` of the session history; length is 0 when
+/// this realm has none.
+#[op2]
+#[string]
+fn op_session_history(scope: &mut v8::PinScope, state: &OpState) -> String {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let history = &gs.session_history;
+    format!("{},{},{}", history.document_start, history.current, history.urls.len())
+}
+
+/// Queue a traversal to another document's session history entry. Returns
+/// false when the index is out of range.
+#[op2(fast)]
+fn op_history_traverse(scope: &mut v8::PinScope, state: &OpState, index: u32) -> bool {
+    let gs = realm_state(scope, state);
+    let mut gs = gs.borrow_mut();
+    let index = index as usize;
+    let Some(url) = gs.session_history.urls.get(index).cloned() else {
+        return false;
+    };
+    gs.pending_navigation = Some((url, "GET".to_string(), String::new()));
+    gs.pending_history_traversal = Some(index);
+    true
+}
+
 // A frame that navigates itself must not move the top document. Recording the
 // navigation against the calling realm keeps it inside that frame.
 #[op2(fast)]
 fn op_navigate(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     state: &OpState,
     #[string] url: &str,
     #[string] method: &str,
@@ -4733,7 +5262,9 @@ fn op_post_frame_message(
         );
         return;
     }
-    gs.pending_frame_message_bytes = gs.pending_frame_message_bytes.saturating_add(data_json.len());
+    gs.pending_frame_message_bytes = gs
+        .pending_frame_message_bytes
+        .saturating_add(data_json.len());
     gs.pending_frame_messages.push(PendingFrameMessage {
         target_frame_id,
         source_frame_id,
@@ -4750,7 +5281,7 @@ fn op_post_frame_message(
 /// and a snapshot-restored realm has none. This resolves an ordinary promise
 /// instead, and V8 reports the frame as the microtask context, so the ops a
 /// timer callback makes still find the frame's own document.
-#[op2(async)]
+#[op2]
 async fn op_sleep(#[number] millis: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 }
@@ -4763,7 +5294,7 @@ const MAX_PENDING_FRAME_BYTES: usize = 32 * 1024 * 1024;
 // id means the bounded native queue refused the document.
 #[op2(fast)]
 fn op_frame_document_ready(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     state: &OpState,
     #[string] url: &str,
     #[string] html: &str,
@@ -4823,7 +5354,7 @@ fn op_async_runtime_available() -> bool {
 fn op_posted_task(
     state: &OpState,
     frame_id: u32,
-    #[global] callback: v8::Global<v8::Function>,
+    #[scoped] callback: v8::Global<v8::Function>,
 ) -> f64 {
     let Some(owner) = posted_task_owner(state, frame_id) else {
         return INVALID_POSTED_TASK_GENERATION;
@@ -4842,11 +5373,14 @@ fn op_posted_task(
             }
             PostedTaskOwnerStatus::Generation(generation) => generation as f64,
         };
-        let scope = &mut v8::TryCatch::new(scope);
+        v8::tc_scope!(let scope, scope);
         let callback = v8::Local::new(scope, callback);
         let receiver = v8::undefined(scope).into();
         let current_generation = v8::Number::new(scope, current_generation);
-        if callback.call(scope, receiver, &[current_generation.into()]).is_none() {
+        if callback
+            .call(scope, receiver, &[current_generation.into()])
+            .is_none()
+        {
             let message = scope
                 .exception()
                 .map(|exception| exception.to_rust_string_lossy(scope))
@@ -4866,9 +5400,7 @@ enum PostedTaskOwnerStatus {
     Generation(u64),
 }
 
-fn posted_task_owner_status(
-    owner: &std::rc::Weak<RefCell<ObscuraState>>,
-) -> PostedTaskOwnerStatus {
+fn posted_task_owner_status(owner: &std::rc::Weak<RefCell<ObscuraState>>) -> PostedTaskOwnerStatus {
     let Some(owner) = owner.upgrade() else {
         return PostedTaskOwnerStatus::Gone;
     };
@@ -5100,7 +5632,7 @@ fn op_subtle_aes_ctr(
         _ => {
             return Err(crypto_err(
                 "AES-CTR supports counter lengths of 32, 64, or 128 bits",
-            ))
+            ));
         }
     }
     Ok(buf)
@@ -5329,18 +5861,31 @@ fn url_set_inner(href: &str, part: &str, value: &str) -> Option<serde_json::Valu
         "port" => {
             if value.is_empty() {
                 let _ = u.set_port(None);
-            } else if let Ok(p) = value.parse::<u16>() {
-                let _ = u.set_port(Some(p));
+            } else {
+                // WHATWG port-state parser consumes the leading digits and stops
+                // at the first non-digit, so "8080abc" sets port 8080.
+                let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(p) = digits.parse::<u16>() {
+                    let _ = u.set_port(Some(p));
+                }
             }
         }
         "pathname" => u.set_path(value),
         "search" => {
-            let q = value.strip_prefix('?').unwrap_or(value);
-            u.set_query(if q.is_empty() { None } else { Some(q) });
+            // WHATWG: a null query only for the empty string; a bare "?" is an
+            // empty (not null) query that serializes with a trailing "?".
+            if value.is_empty() {
+                u.set_query(None);
+            } else {
+                u.set_query(Some(value.strip_prefix('?').unwrap_or(value)));
+            }
         }
         "hash" => {
-            let f = value.strip_prefix('#').unwrap_or(value);
-            u.set_fragment(if f.is_empty() { None } else { Some(f) });
+            if value.is_empty() {
+                u.set_fragment(None);
+            } else {
+                u.set_fragment(Some(value.strip_prefix('#').unwrap_or(value)));
+            }
         }
         _ => {}
     }
@@ -5616,11 +6161,16 @@ fn op_canvas_register_surface(
     if !is_canvas {
         return false;
     }
-    let replacing = state.canvas_surfaces.get(&node).map(|surface| surface.pixels.len());
+    let replacing = state
+        .canvas_surfaces
+        .get(&node)
+        .map(|surface| surface.pixels.len());
     let retained_bytes = state
         .canvas_surfaces
         .values()
-        .try_fold(0usize, |total, surface| total.checked_add(surface.pixels.len()))
+        .try_fold(0usize, |total, surface| {
+            total.checked_add(surface.pixels.len())
+        })
         .and_then(|total| total.checked_sub(replacing.unwrap_or(0)))
         .and_then(|total| total.checked_add(expected));
     if retained_bytes.is_none_or(|bytes| bytes > MAX_CANVAS_SURFACE_BYTES) {
@@ -5666,12 +6216,21 @@ pub fn build_extension() -> Extension {
         op_script_try_start(),
         op_shadow_attach(),
         op_shadow_root_info(),
+        op_external_stylesheet_set(),
+        op_external_stylesheet_remove(),
+        op_external_stylesheet_get(),
+        op_stylesheet_generation(),
+        op_cssom_stylesheet_has(),
+        op_cssom_stylesheet_update(),
+        op_cssom_stylesheet_clear(),
         op_runtime_events_enabled(),
         op_console_msg(),
         op_fetch_url(),
         op_get_cookies(),
         op_set_cookie(),
         op_navigate(),
+        op_session_history(),
+        op_history_traverse(),
         op_frame_document_ready(),
         op_post_frame_message(),
         op_sleep(),
@@ -5707,9 +6266,11 @@ pub fn build_extension() -> Extension {
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());
+        ops.push(op_layout_hit_test());
         ops.push(op_resize_observer_measurements());
         ops.push(op_intersection_observer_measurements());
         ops.push(op_computed_style());
+        ops.push(op_set_hovered());
         ops.push(op_css_supports());
         ops.push(op_layout_metrics());
         ops.push(op_element_scroll_metrics());
@@ -5795,7 +6356,12 @@ fn op_waapi_create(state: &OpState, #[string] input: &str) -> bool {
     let shared = state.borrow::<SharedState>().clone();
     let mut state = shared.borrow_mut();
     let node = NodeId::new(input.node);
-    if state.dom.as_ref().and_then(|dom| dom.get_node(node)).is_none() {
+    if state
+        .dom
+        .as_ref()
+        .and_then(|dom| dom.get_node(node))
+        .is_none()
+    {
         return false;
     }
     let start_time_ms = waapi_document_time_ms(&state);
@@ -5816,14 +6382,20 @@ fn op_waapi_create(state: &OpState, #[string] input: &str) -> bool {
     } else {
         input.iterations
     };
-    state.animation_timeline.register_waapi(obscura_render::WaapiAnimation {
+    state
+        .animation_timeline
+        .register_waapi(obscura_render::WaapiAnimation {
         id: input.id,
         node,
-        keyframes: input.keyframes.into_iter().map(|frame| obscura_render::WaapiKeyframe {
+            keyframes: input
+                .keyframes
+                .into_iter()
+                .map(|frame| obscura_render::WaapiKeyframe {
             offset: frame.offset.clamp(0.0, 1.0),
             opacity: frame.opacity.map(|value| value.clamp(0.0, 1.0)),
             transform: frame.transform,
-        }).collect(),
+                })
+                .collect(),
         timing: obscura_render::AnimationTiming {
             duration_ms: input.duration,
             delay_ms: input.delay,
@@ -5844,12 +6416,7 @@ fn op_waapi_create(state: &OpState, #[string] input: &str) -> bool {
 
 #[cfg(feature = "render")]
 #[op2(fast)]
-fn op_waapi_control(
-    state: &OpState,
-    id: f64,
-    #[string] action: &str,
-    value: f64,
-) -> bool {
+fn op_waapi_control(state: &OpState, id: f64, #[string] action: &str, value: f64) -> bool {
     if !id.is_finite() || id < 0.0 {
         return false;
     }
@@ -5873,11 +6440,11 @@ fn op_waapi_control(
             obscura_render::WaapiPlayState::Running,
             document_time,
         ),
-        "currentTime" if value.is_finite() => state.animation_timeline.set_waapi_current_time(
-            id,
-            document_time,
-            value as f32,
-        ),
+        "currentTime" if value.is_finite() => {
+            state
+                .animation_timeline
+                .set_waapi_current_time(id, document_time, value as f32)
+        }
         _ => false,
     };
     if changed {
@@ -5932,6 +6499,8 @@ fn document_base_href(state: &ObscuraState) -> Option<String> {
 pub struct BaseUrlCache {
     activity_generation: u64,
     document_generation: u64,
+    #[cfg(feature = "render")]
+    task_generation: u64,
     url: String,
     resolved: Option<String>,
     raw_href: Option<String>,
@@ -5953,6 +6522,8 @@ fn base_values_memoized(state: &ObscuraState) -> (Option<String>, Option<String>
     *state.base_url_cache.borrow_mut() = Some(BaseUrlCache {
         activity_generation: state.activity_generation,
         document_generation: state.document_generation,
+        #[cfg(feature = "render")]
+        task_generation: state.animation_task_generation,
         url: state.url.clone(),
         resolved: resolved.clone(),
         raw_href: raw_href.clone(),
@@ -5973,21 +6544,26 @@ pub(crate) fn ensure_prepared_render(
     state: &mut ObscuraState,
 ) -> Option<&obscura_render::PreparedRender> {
     let base_url = document_base_url(state);
+    ensure_prepared_render_with_base_url(state, base_url)
+}
+
+#[cfg(feature = "render")]
+fn ensure_prepared_render_with_base_url(
+    state: &mut ObscuraState,
+    base_url: Option<String>,
+) -> Option<&obscura_render::PreparedRender> {
     let viewport = state.viewport;
     let render_media = state.render_media;
     let animation_sample = state.animation_sample;
     let incompatible = state.prepared_render.as_ref().is_some_and(|prepared| {
-        prepared.viewport() != viewport
-            || prepared.base_url() != base_url.as_deref()
+        prepared.viewport() != viewport || prepared.base_url() != base_url.as_deref()
     });
     let needs_rebuild = state.prepared_render.as_ref().map_or(true, |prepared| {
         incompatible || prepared.animation_sample() != animation_sample
     }) || !state.pending_style_mutations.is_empty();
     if needs_rebuild {
         if let Some(dom) = state.dom.as_ref() {
-            state
-                .animation_timeline
-                .materialize_start_candidates(dom);
+            state.animation_timeline.materialize_start_candidates(dom);
         }
         let previous = (!incompatible && render_media == obscura_render::CssMediaType::Screen)
             .then(|| state.prepared_render.take())
@@ -6048,10 +6624,7 @@ pub(crate) fn ensure_prepared_render(
         if animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime {
             state.animation_timeline.clear_start_candidates();
         }
-        let connected = state
-            .dom
-            .as_ref()
-            .map(shadow_including_connected_nodes);
+        let connected = state.dom.as_ref().map(shadow_including_connected_nodes);
         if let Some(connected) = connected {
             state
                 .animation_timeline
@@ -6063,15 +6636,25 @@ pub(crate) fn ensure_prepared_render(
     state.prepared_render.as_ref()
 }
 
+#[cfg(feature = "render")]
+fn document_base_url_for_javascript_task(state: &ObscuraState) -> Option<String> {
+    // CSSOM reads in one JS task share base resolution. Refresh next task
+    // as native DomTree edits need not increment the JS activity counter.
+    if state.base_url_cache.borrow().as_ref().is_some_and(|cached| {
+        cached.task_generation != state.animation_task_generation
+    }) {
+        *state.base_url_cache.borrow_mut() = None;
+    }
+    document_base_url_memoized(state)
+}
+
 /// Prepare enough state for a geometry-only CSSOM consumer. A forward sample
 /// with only paint effects may read the retained layout without resampling its
 /// styles. `animation_sample` on PreparedRender remains behind intentionally,
 /// making a later paint or computed-style consumer take the exact path above.
 #[cfg(feature = "render")]
-fn ensure_prepared_geometry(
-    state: &mut ObscuraState,
-) -> Option<&obscura_render::PreparedRender> {
-    let base_url = document_base_url(state);
+fn ensure_prepared_geometry(state: &mut ObscuraState) -> Option<&obscura_render::PreparedRender> {
+    let base_url = document_base_url_for_javascript_task(state);
     let reusable = state.pending_style_mutations.is_empty()
         && !state.animation_timeline.has_pending_start_candidates()
         && state.prepared_render.as_ref().is_some_and(|prepared| {
@@ -6083,7 +6666,7 @@ fn ensure_prepared_geometry(
     if reusable {
         return state.prepared_render.as_ref();
     }
-    ensure_prepared_render(state)
+    ensure_prepared_render_with_base_url(state, base_url)
 }
 
 #[cfg(feature = "render")]
@@ -6093,8 +6676,8 @@ pub(crate) fn sample_live_document_animations(state: &mut ObscuraState) {
     }
     state.animation_sampled_task_generation = state.animation_task_generation;
     let sample = obscura_render::AnimationSample::document(
-        (state.animation_timeline_origin.elapsed().as_secs_f64() * 1_000.0)
-            .min(f64::from(f32::MAX)) as f32,
+        (state.animation_timeline_origin.elapsed().as_secs_f64() * 1_000.0).min(f64::from(f32::MAX))
+            as f32,
     );
     if state.animation_sample == sample {
         return;
@@ -6102,15 +6685,15 @@ pub(crate) fn sample_live_document_animations(state: &mut ObscuraState) {
     if sample.time.milliseconds > state.animation_sample.time.milliseconds
         && state.animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime
         && state.pending_style_mutations.is_empty()
-        && state.prepared_render.as_mut().is_some_and(|prepared| {
-            prepared.advance_inactive_animation_sample_time(sample.time)
-        })
+        && state
+            .prepared_render
+            .as_mut()
+            .is_some_and(|prepared| prepared.advance_inactive_animation_sample_time(sample.time))
     {
         state.animation_sample = sample;
         return;
     }
-    let forward_document_sample =
-        sample.mode == obscura_render::AnimationSampleMode::DocumentTime
+    let forward_document_sample = sample.mode == obscura_render::AnimationSampleMode::DocumentTime
         && state.animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime
         && sample.time.milliseconds > state.animation_sample.time.milliseconds;
     state.animation_sample = sample;
@@ -6305,12 +6888,10 @@ fn load_image_metadata_without_page_transport(gs: &mut ObscuraState, node_id: No
     let Some(dom) = gs.dom.as_ref() else {
         return serde_json::json!({ "ok": false, "currentSrc": "" }).to_string();
     };
-    let Some((current_src, density, dimensions)) = gs.render_resources.image_element_metadata(
-        dom,
-        node_id,
-        viewport,
-        base_url.as_deref(),
-    ) else {
+    let Some((current_src, density, dimensions)) =
+        gs.render_resources
+            .image_element_metadata(dom, node_id, viewport, base_url.as_deref())
+    else {
         return serde_json::json!({
             "state": "error",
             "ok": false,
@@ -6334,22 +6915,18 @@ fn finish_async_image_metadata(
 ) -> String {
     let gs = shared.borrow();
     if gs.document_generation != document_generation {
-        return serde_json::json!({ "state": "stale", "currentSrc": expected_url })
-            .to_string();
+        return serde_json::json!({ "state": "stale", "currentSrc": expected_url }).to_string();
     }
     let Some(dom) = gs.dom.as_ref() else {
-        return serde_json::json!({ "state": "stale", "currentSrc": expected_url })
-            .to_string();
+        return serde_json::json!({ "state": "stale", "currentSrc": expected_url }).to_string();
     };
     if image_request_profile(dom, node_id) != request_profile {
-        return serde_json::json!({ "state": "stale", "currentSrc": expected_url })
-            .to_string();
+        return serde_json::json!({ "state": "stale", "currentSrc": expected_url }).to_string();
     }
     let Some((current_src, density, known, dimensions)) =
         profiled_cached_image_metadata(&gs, node_id)
     else {
-        return serde_json::json!({ "state": "stale", "currentSrc": expected_url })
-            .to_string();
+        return serde_json::json!({ "state": "stale", "currentSrc": expected_url }).to_string();
     };
     if current_src != expected_url {
         return serde_json::json!({ "state": "stale", "currentSrc": current_src }).to_string();
@@ -6362,7 +6939,7 @@ fn finish_async_image_metadata(
 /// navigation/URL/profile share one fetch, and completion revalidates both the
 /// document identity and responsive candidate before exposing lifecycle state.
 #[cfg(feature = "render")]
-#[op2(async)]
+#[op2]
 #[string]
 async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String {
     let shared = {
@@ -6392,9 +6969,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             return serde_json::json!({ "state": "stale", "currentSrc": "" }).to_string();
         }
         let profile = image_request_profile(dom, node_id);
-        let Some((selected_url, _, known, _)) =
-            profiled_cached_image_metadata(&gs, node_id)
-        else {
+        let Some((selected_url, _, known, _)) = profiled_cached_image_metadata(&gs, node_id) else {
             return serde_json::json!({ "state": "error", "ok": false, "currentSrc": "" })
                 .to_string();
         };
@@ -6450,7 +7025,8 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             waiters.push(sender);
             Some(receiver)
         } else {
-            gs.render_image_in_flight.insert(request_key.clone(), Vec::new());
+            gs.render_image_in_flight
+                .insert(request_key.clone(), Vec::new());
             None
         }
     };
@@ -6508,11 +7084,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             http_client
                 .as_ref()
                 .unwrap()
-                .fetch_resource_with_callbacks(
-                    parsed_url,
-                    resource_request,
-                    callbacks.as_deref(),
-                )
+                .fetch_resource_with_callbacks(parsed_url, resource_request, callbacks.as_deref())
                 .await
                 .ok()
         }
@@ -6570,10 +7142,7 @@ pub(crate) fn clamp_scroll_offset(state: &mut ObscuraState, requested: (f32, f32
 }
 
 #[cfg(feature = "render")]
-fn clamp_scroll_offset_for_geometry(
-    state: &mut ObscuraState,
-    requested: (f32, f32),
-) -> (f32, f32) {
+fn clamp_scroll_offset_for_geometry(state: &mut ObscuraState, requested: (f32, f32)) -> (f32, f32) {
     clamp_scroll_offset_for_consumer(state, requested, true)
 }
 
@@ -6646,6 +7215,7 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
             })
             .collect::<Vec<_>>();
         let viewport_fixed = prepared.viewport_fixed_nodes().contains(&nid);
+        let pointer_events_none = prepared.pointer_events_none(nid);
         return serde_json::json!({
             "x": rect.x,
             "y": rect.y,
@@ -6655,10 +7225,36 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
             "clientHeight": client_height,
             "clientRects": client_rects,
             "viewportFixed": viewport_fixed,
+            "pointerEventsNone": pointer_events_none,
         })
         .to_string();
     }
     String::new()
+}
+
+/// Renderer-backed CSSOM hit test. Returns the native node id or -1 when the
+/// point is outside the viewport or no rendered element contains it.
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_layout_hit_test(state: &OpState, x: f64, y: f64) -> i32 {
+    let shared = state.borrow::<SharedState>().clone();
+    let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
+    if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
+        return -1;
+    }
+    let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
+        return -1;
+    };
+    let Some(prepared) = gs.prepared_render.as_ref() else {
+        return -1;
+    };
+    let Some(dom) = gs.dom.as_ref() else {
+        return -1;
+    };
+    prepared
+        .hit_test(dom, scroll, x as f32, y as f32)
+        .map_or(-1, |id| id.index() as i32)
 }
 
 /// Measure every target in one ResizeObserver rendering opportunity.
@@ -6696,8 +7292,8 @@ fn op_resize_observer_measurements(state: &OpState, #[string] nids_json: String)
             .unwrap_or_else(|_| "[]".to_string());
     };
 
-    let style_value =
-        |snapshot: &std::collections::HashMap<&'static str, String>, name: &'static str| {
+    let style_value = |snapshot: &std::collections::HashMap<&'static str, String>,
+                       name: &'static str| {
             snapshot.get(name).cloned().unwrap_or_default()
         };
     let measurements = nids
@@ -6739,10 +7335,7 @@ fn op_resize_observer_measurements(state: &OpState, #[string] nids_json: String)
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_intersection_observer_measurements(
-    state: &OpState,
-    #[string] nids_json: String,
-) -> String {
+fn op_intersection_observer_measurements(state: &OpState, #[string] nids_json: String) -> String {
     let nids = serde_json::from_str::<Vec<u32>>(&nids_json).unwrap_or_default();
     if nids.is_empty() {
         return "[]".to_string();
@@ -6764,8 +7357,8 @@ fn op_intersection_observer_measurements(
             .unwrap_or_else(|_| "[]".to_string());
     };
 
-    let style_value =
-        |snapshot: &std::collections::HashMap<&'static str, String>, name: &'static str| {
+    let style_value = |snapshot: &std::collections::HashMap<&'static str, String>,
+                       name: &'static str| {
             snapshot.get(name).cloned().unwrap_or_default()
         };
     let measurements = nids
@@ -6792,21 +7385,51 @@ fn op_intersection_observer_measurements(
     serde_json::to_string(&measurements).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// One renderer-computed CSS snapshot for `getComputedStyle()`. Returning all
-/// supported properties together keeps a single JS style object to one native
-/// call and one use of the retained prepared layout.
+/// CSSOM snapshot and completeness flag. Non-geometric reads can resolve only
+/// the ancestor cascade while leaving layout damage pending for geometry/paint.
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
+fn op_computed_style(
+    state: &OpState,
+    #[string] nid_str: String,
+    #[string] pseudo: String,
+    #[string] property: String,
+) -> String {
     let shared = state.borrow::<SharedState>().clone();
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
-    let Some(prepared) = ensure_prepared_render(&mut gs) else {
+    let base_url = document_base_url_for_javascript_task(&gs);
+    let needs_layout = gs.prepared_render.as_ref().is_none_or(|prepared| {
+        prepared.viewport() != gs.viewport || prepared.base_url() != base_url.as_deref()
+            || prepared.animation_sample() != gs.animation_sample
+    }) || !gs.pending_style_mutations.is_empty();
+    if pseudo.is_empty() && needs_layout && gs.animation_timeline.waapi_nodes().is_empty() {
+        if let Some(snapshot) = gs.dom.as_ref().and_then(|dom| {
+            obscura_render::dom::computed_style_without_layout(
+                dom, nid, gs.viewport, gs.render_media, &gs.stylesheet_cache, &property,
+            )
+        }) {
+            return serde_json::json!([false, snapshot]).to_string();
+        }
+    }
+    let Some(prepared) = ensure_prepared_render_with_base_url(&mut gs, base_url) else {
         return String::new();
     };
+    if matches!(pseudo.as_str(), ":before" | "::before" | ":after" | "::after") {
+        let Some((content, display)) =
+            prepared.computed_pseudo_content(nid, pseudo.ends_with("before"))
+        else {
+            return String::new();
+        };
+        let content = content.map_or_else(
+            || "none".to_string(),
+            |value| serde_json::to_string(value).unwrap_or_else(|_| "none".to_string()),
+        );
+        return serde_json::json!([true, { "content": content, "display": display }]).to_string();
+    }
     let Some(snapshot) = prepared.computed_style(nid) else {
         return String::new();
     };
@@ -6818,7 +7441,23 @@ fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
     for (name, value) in custom {
         object.insert(name, serde_json::Value::String(value));
     }
-    serde_json::Value::Object(object).to_string()
+    serde_json::json!([true, object]).to_string()
+}
+
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_set_hovered(state: &OpState, nid: u32, frame_id: u32) {
+    let shared = frame_state(state, frame_id);
+    let mut state = shared.borrow_mut();
+    let changed = state.dom.as_ref().is_some_and(|dom| {
+        dom.set_hovered((nid != 0).then(|| NodeId::new(nid)))
+    });
+    if changed {
+        state.activity_generation = state.activity_generation.wrapping_add(1);
+        state.prepared_render = None;
+        state.pending_style_mutations.clear();
+        state.resolved_scroll = None;
+    }
 }
 
 /// Use the renderer's declaration parser as the single feature-query source

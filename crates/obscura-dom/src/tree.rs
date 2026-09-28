@@ -2,6 +2,7 @@ use html5ever::{LocalName, Namespace, Prefix, QualName};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(crate) u32);
@@ -248,6 +249,19 @@ pub struct DomTree {
     inner: RefCell<DomTreeInner>,
 }
 
+/// Host-fetched author CSS kept outside the page-visible DOM.
+///
+/// A linked stylesheet may participate in rendering even when the response is
+/// not origin-clean. Keeping those bytes here prevents a synthetic `<style>`
+/// node from exposing them through ordinary DOM APIs.
+#[derive(Clone, Debug, Default)]
+pub struct ExternalStylesheet {
+    pub sources: Vec<Arc<str>>,
+    pub origin_clean: bool,
+    /// CSSOM edits are rule-owned, never mutations of the owner's DOM text.
+    pub cssom_rules: Option<Vec<Arc<str>>>,
+}
+
 /// Live control state is separate from content attributes and serialization.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FormControlState {
@@ -262,6 +276,9 @@ pub(crate) struct DomTreeInner {
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
     form_controls: HashMap<NodeId, FormControlState>,
+    external_stylesheets: HashMap<NodeId, ExternalStylesheet>,
+    external_stylesheet_generation: u64,
+    hovered: Option<NodeId>,
     /// Shadow roots are arena nodes with their own child list. They are kept
     /// outside the ordinary parent links so light-tree traversal never crosses
     /// into a shadow tree by accident.
@@ -294,6 +311,9 @@ impl DomTree {
                 document: NodeId(0),
                 id_index: HashMap::new(),
                 form_controls: HashMap::new(),
+                external_stylesheets: HashMap::new(),
+                external_stylesheet_generation: 0,
+                hovered: None,
                 shadow_roots: HashMap::new(),
                 shadow_roots_by_host: HashMap::new(),
                 allow_declarative_shadow_roots: false,
@@ -304,6 +324,141 @@ impl DomTree {
 
     pub fn document(&self) -> NodeId {
         self.inner.borrow().document
+    }
+
+    pub fn replace_external_stylesheet(
+        &self,
+        owner: NodeId,
+        source: String,
+        origin_clean: bool,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner
+            .nodes
+            .get(owner.index())
+            .and_then(Option::as_ref)
+            .is_none()
+        {
+            return false;
+        }
+        inner.external_stylesheets.insert(
+            owner,
+            ExternalStylesheet {
+                sources: vec![Arc::from(source)],
+                origin_clean,
+                cssom_rules: None,
+            },
+        );
+        inner.external_stylesheet_generation = inner.external_stylesheet_generation.wrapping_add(1);
+        true
+    }
+
+    pub fn append_external_stylesheet(
+        &self,
+        owner: NodeId,
+        source: String,
+        origin_clean: bool,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner
+            .nodes
+            .get(owner.index())
+            .and_then(Option::as_ref)
+            .is_none()
+        {
+            return false;
+        }
+        let sheet = inner
+            .external_stylesheets
+            .entry(owner)
+            .or_insert_with(|| ExternalStylesheet {
+                sources: Vec::new(),
+                origin_clean: true,
+                cssom_rules: None,
+            });
+        sheet.sources.push(Arc::from(source));
+        sheet.origin_clean &= origin_clean;
+        inner.external_stylesheet_generation = inner.external_stylesheet_generation.wrapping_add(1);
+        true
+    }
+
+    pub fn remove_external_stylesheet(&self, owner: NodeId) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let removed = inner.external_stylesheets.remove(&owner).is_some();
+        if removed {
+            inner.external_stylesheet_generation = inner.external_stylesheet_generation.wrapping_add(1);
+        }
+        removed
+    }
+
+    pub fn external_stylesheet_generation(&self) -> u64 {
+        self.inner.borrow().external_stylesheet_generation
+    }
+
+    pub fn has_cssom_stylesheet(&self, owner: NodeId) -> bool {
+        self.inner.borrow().external_stylesheets.get(&owner)
+            .is_some_and(|sheet| sheet.cssom_rules.is_some())
+    }
+
+    pub fn update_cssom_stylesheet(
+        &self, owner: NodeId, index: usize, delete_count: usize,
+        rules: Vec<String>, reset: bool,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let Some(element) = inner.nodes.get(owner.index()).and_then(Option::as_ref)
+            .and_then(Node::as_element) else { return false };
+        if element.local.as_ref() != "style" { return false; }
+        let sheet = inner.external_stylesheets.entry(owner).or_insert_with(|| ExternalStylesheet {
+            origin_clean: true, ..ExternalStylesheet::default()
+        });
+        // Only inline owners reach this path. A cross-origin @import is kept
+        // in sources, but does not make the owner's own CSS rules opaque.
+        if reset {
+            sheet.cssom_rules = Some(rules.into_iter().map(Arc::from).collect());
+        } else {
+            let Some(existing) = sheet.cssom_rules.as_mut() else { return false };
+            if index > existing.len() || delete_count > existing.len() - index { return false; }
+            existing.splice(index..index + delete_count, rules.into_iter().map(Arc::from));
+        }
+        true
+    }
+
+    pub fn clear_cssom_stylesheet(&self, owner: NodeId) -> bool {
+        Self::clear_cssom_stylesheet_inner(&mut self.inner.borrow_mut(), owner)
+    }
+
+    fn clear_cssom_stylesheet_inner(inner: &mut DomTreeInner, owner: NodeId) -> bool {
+        let removed = inner.external_stylesheets.get_mut(&owner)
+            .is_some_and(|sheet| sheet.cssom_rules.take().is_some());
+        if removed {
+            inner.external_stylesheet_generation = inner.external_stylesheet_generation.wrapping_add(1);
+            if inner.external_stylesheets.get(&owner).is_some_and(|sheet| sheet.sources.is_empty()) {
+                inner.external_stylesheets.remove(&owner);
+            }
+        }
+        removed
+    }
+
+    fn invalidate_cssom_source(inner: &mut DomTreeInner, node: NodeId) {
+        if inner.external_stylesheets.is_empty() { return; }
+        let mut current = Some(node);
+        for _ in 0..inner.nodes.len() {
+            let Some(id) = current else { break };
+            Self::clear_cssom_stylesheet_inner(inner, id);
+            current = inner.nodes.get(id.index()).and_then(Option::as_ref).and_then(|node| node.parent);
+        }
+    }
+
+    pub fn external_stylesheet(&self, owner: NodeId) -> Option<ExternalStylesheet> {
+        self.inner
+            .borrow()
+            .external_stylesheets
+            .get(&owner)
+            .cloned()
+    }
+
+    pub fn external_stylesheets(&self) -> HashMap<NodeId, ExternalStylesheet> {
+        self.inner.borrow().external_stylesheets.clone()
     }
 
     pub fn form_control_state(&self, node: NodeId) -> Option<FormControlState> {
@@ -333,6 +488,29 @@ impl DomTree {
             .form_controls
             .get(&node)
             .is_some_and(|control| control.indeterminate)
+    }
+
+    pub fn set_hovered(&self, node: Option<NodeId>) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner.hovered == node {
+            return false;
+        }
+        inner.hovered = node;
+        true
+    }
+
+    pub fn is_hovered(&self, node: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        let mut current = inner.hovered;
+        while let Some(id) = current {
+            if id == node {
+                return true;
+            }
+            current = inner.nodes.get(id.index())
+                .and_then(|entry| entry.as_ref())
+                .and_then(|entry| entry.parent);
+        }
+        false
     }
 
     pub fn update_form_control_state(&self, node: NodeId, update: impl FnOnce(&mut FormControlState)) {
@@ -527,6 +705,7 @@ impl DomTree {
             .is_some_and(|node| node.first_child.is_none())
             && !inner.shadow_roots_by_host.contains_key(&root);
         if is_leaf {
+            if !connected { Self::clear_cssom_stylesheet_inner(inner, root); }
             if let Some(Some(node)) = inner.nodes.get_mut(root.index()) {
                 node.connected = connected;
             }
@@ -539,6 +718,7 @@ impl DomTree {
             if !seen.insert(node_id) {
                 continue;
             }
+            if !connected { Self::clear_cssom_stylesheet_inner(inner, node_id); }
             let (mut child, shadow_root) = match inner
                 .nodes
                 .get_mut(node_id.index())
@@ -647,6 +827,14 @@ impl DomTree {
         self.inner.borrow().nodes.get(id.index())?.clone()
     }
 
+    /// Read a node without copying its text or attributes. Drop the guard
+    /// before mutating this tree; use `get_node` when an owned snapshot is needed.
+    pub fn borrow_node(&self, id: NodeId) -> Option<std::cell::Ref<'_, Node>> {
+        std::cell::Ref::filter_map(self.inner.borrow(), |inner| {
+            inner.nodes.get(id.index())?.as_ref()
+        }).ok()
+    }
+
     pub fn with_node<F, R>(&self, id: NodeId, f: F) -> Option<R>
     where
         F: FnOnce(&Node) -> R,
@@ -660,6 +848,10 @@ impl DomTree {
         F: FnOnce(&mut Node) -> R,
     {
         let mut inner = self.inner.borrow_mut();
+        if inner.nodes.get(id.index()).and_then(Option::as_ref)
+            .is_some_and(|node| matches!(node.data, NodeData::Text { .. })) {
+            Self::invalidate_cssom_source(&mut inner, id);
+        }
         inner.nodes.get_mut(id.index())?.as_mut().map(f)
     }
 
@@ -720,6 +912,7 @@ impl DomTree {
         self.detach_for_reparent(child_id, child_connected && !parent_connected);
 
         let mut inner = self.inner.borrow_mut();
+        Self::invalidate_cssom_source(&mut inner, parent_id);
 
         let old_last = inner.nodes.get(parent_id.index())
             .and_then(|n| n.as_ref())
@@ -814,6 +1007,7 @@ impl DomTree {
             node.prev_sibling = prev_id;
             node.next_sibling = Some(existing_id);
         }
+        Self::invalidate_cssom_source(&mut inner, parent_id);
 
         if let Some(Some(node)) = inner.nodes.get_mut(existing_id.index()) {
             node.prev_sibling = Some(new_sibling_id);
@@ -848,6 +1042,7 @@ impl DomTree {
             Some(node) => (node.parent, node.prev_sibling, node.next_sibling),
             None => return,
         };
+        Self::invalidate_cssom_source(&mut inner, node_id);
         if disconnect && inner
             .nodes
             .get(node_id.index())
@@ -1117,12 +1312,12 @@ impl DomTree {
     /// only for HTML slots; same-local-name elements in other namespaces do
     /// not participate in the flattened tree.
     pub fn is_html_slot_element(&self, node: NodeId) -> bool {
-        self.get_node(node).is_some_and(|node| {
+        self.with_node(node, |node| {
             node.as_element().is_some_and(|name| {
                 name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
                     && name.local.as_ref() == "slot"
             })
-        })
+        }).unwrap_or(false)
     }
 
     /// Return the first slot to which `node` is assigned.
@@ -1132,26 +1327,23 @@ impl DomTree {
     /// the empty/default name. The first same-name slot in shadow-tree order
     /// wins, matching the HTML slot assignment algorithm.
     pub fn assigned_slot(&self, node: NodeId) -> Option<NodeId> {
-        let node_ref = self.get_node(node)?;
-        let parent = node_ref.parent?;
-        let name = if node_ref.is_element() {
-            node_ref.get_attribute("slot").unwrap_or("").to_owned()
-        } else if node_ref.text_content_of_text_node().is_some() {
-            String::new()
-        } else {
-            return None;
-        };
-        drop(node_ref);
-
+        let parent = self.with_node(node, |node| node.parent).flatten()?;
         let root = self.shadow_root(parent)?;
-        self.descendants(root).into_iter().find(|candidate| {
-            self.is_html_slot_element(*candidate)
-                && self
-                    .get_node(*candidate)
-                    .and_then(|slot| slot.get_attribute("name").map(str::to_owned))
-                    .unwrap_or_default()
-                    == name
-        })
+        self.with_node(node, |node| {
+            let name = if node.is_element() {
+                node.get_attribute("slot").unwrap_or("")
+            } else if node.text_content_of_text_node().is_some() {
+                ""
+            } else {
+                return None;
+            };
+            self.descendants(root).into_iter().find(|candidate| {
+                self.is_html_slot_element(*candidate)
+                    && self.with_node(*candidate, |slot| {
+                        slot.get_attribute("name").unwrap_or("") == name
+                    }).unwrap_or(false)
+            })
+        }).flatten()
     }
 
     /// Nodes directly assigned to an HTML slot. The first same-name slot wins;
@@ -1164,16 +1356,13 @@ impl DomTree {
         let root = self.containing_shadow_root(slot)?;
         let host = self.shadow_root_info(root)?.host;
         let name = self
-            .get_node(slot)
-            .and_then(|slot| slot.get_attribute("name").map(str::to_owned))
+            .with_node(slot, |slot| slot.get_attribute("name").unwrap_or("").to_owned())
             .unwrap_or_default();
         let is_same_name_slot = |candidate: NodeId| {
             self.is_html_slot_element(candidate)
                 && self
-                    .get_node(candidate)
-                    .and_then(|slot| slot.get_attribute("name").map(str::to_owned))
-                    .unwrap_or_default()
-                    == name
+                    .with_node(candidate, |slot| slot.get_attribute("name").unwrap_or("") == name)
+                    .unwrap_or(false)
         };
         if self
             .descendants(root)
@@ -1187,17 +1376,16 @@ impl DomTree {
             self.children(host)
                 .into_iter()
                 .filter(|candidate| {
-                    let Some(node) = self.get_node(*candidate) else {
-                        return false;
-                    };
-                    let candidate_name = if node.is_element() {
-                        node.get_attribute("slot").unwrap_or("")
-                    } else if node.text_content_of_text_node().is_some() {
-                        ""
-                    } else {
-                        return false;
-                    };
-                    candidate_name == name
+                    self.with_node(*candidate, |node| {
+                        let candidate_name = if node.is_element() {
+                            node.get_attribute("slot").unwrap_or("")
+                        } else if node.text_content_of_text_node().is_some() {
+                            ""
+                        } else {
+                            return false;
+                        };
+                        candidate_name == name
+                    }).unwrap_or(false)
                 })
                 .collect(),
         )
@@ -1609,7 +1797,8 @@ impl DomTree {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.borrow().nodes.iter().filter(|n| n.is_some()).count()
+        let inner = self.inner.borrow();
+        inner.nodes.len() - inner.free_list.len()
     }
 
     // Number of node slots (live plus freed), i.e. the same upper bound
@@ -1697,6 +1886,35 @@ impl Default for DomTree {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cssom_stylesheet_storage_is_released_when_owner_is_detached() {
+        let tree = DomTree::new();
+        for _ in 0..128 {
+            let parent = element(&tree, "div");
+            let owner = element(&tree, "style");
+            tree.append_child(tree.document(), parent);
+            tree.append_child(parent, owner);
+            assert!(tree.update_cssom_stylesheet(owner, 0, 0, vec![".x { width: 3px }".into()], true));
+            tree.detach(parent);
+        }
+        assert!(tree.external_stylesheets().is_empty(), "detached inline sheets retained native storage");
+    }
+
+    #[test]
+    fn cssom_inline_rules_survive_cross_origin_import_loading() {
+        let tree = DomTree::new();
+        let owner = element(&tree, "style");
+        tree.append_child(tree.document(), owner);
+        assert!(tree.append_external_stylesheet(owner, ".import { color: red }".into(), false));
+        assert!(tree.update_cssom_stylesheet(owner, 0, 0, vec![".own { width: 3px }".into()], true),
+            "a foreign import does not taint its inline owner's own rules");
+        assert!(tree.append_external_stylesheet(owner, ".late { color: blue }".into(), false));
+        let sheet = tree.external_stylesheet(owner).unwrap();
+        assert_eq!(sheet.cssom_rules.unwrap()[0].as_ref(), ".own { width: 3px }");
+        assert_eq!(sheet.sources.len(), 2);
+        assert!(!sheet.origin_clean);
+    }
+
     fn element(tree: &DomTree, local: &str) -> NodeId {
         tree.new_node(NodeData::Element {
             name: QualName::new(None, ns!(html), LocalName::from(local)),
@@ -1724,6 +1942,29 @@ mod tests {
         assert_eq!(tree.len(), 1);
         let node = tree.get_node(tree.document()).unwrap();
         assert!(node.is_document());
+    }
+
+    #[test]
+    fn live_node_count_does_not_scan_the_arena() {
+        let tree = DomTree::new();
+        let nodes: Vec<_> = (0..100_000)
+            .map(|_| tree.new_node(NodeData::Text { contents: String::new() }))
+            .collect();
+        assert_eq!(tree.len(), 100_001, "detached nodes are still live");
+        for &node in nodes.iter().step_by(2) {
+            tree.remove(node);
+            tree.remove(node);
+        }
+        assert_eq!(tree.len(), 50_001, "a repeated removal cannot free another slot");
+        for _ in 0..100 {
+            tree.new_node(NodeData::Text { contents: String::new() });
+        }
+        let started = std::time::Instant::now();
+        for _ in 0..10_000 {
+            assert_eq!(std::hint::black_box(&tree).len(), 50_101);
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(500),
+            "repeated live-node counts scanned the arena: {:?}", started.elapsed());
     }
 
     #[test]

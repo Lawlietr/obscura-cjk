@@ -531,6 +531,26 @@ fn inset_absolute_uses_nearest_positioned_ancestor() {
 }
 
 #[test]
+fn inset_absolute_fills_positioned_inline_flex_ancestor() {
+    let tree = parse_html(
+        r#"<body style="margin:0">
+          <div style="display:flex">
+            <div id="button" style="position:relative;display:inline-flex;width:115px;height:40px;padding:0 12px;box-sizing:border-box">
+              <a id="overlay" style="position:absolute;inset:unset;top:50%;left:50%;width:max(48px,100%);height:max(48px,100%);transform:translate(-50%,-50%)"></a>
+            </div>
+          </div>
+        </body>"#,
+    );
+    let layout = layout_dom(&tree, (1120.0, 780.0));
+    let button = layout.rects[&tree.get_element_by_id("button").unwrap()];
+    let overlay = layout.rects[&tree.get_element_by_id("overlay").unwrap()];
+
+    assert_eq!((button.width, button.height), (115.0, 40.0));
+    assert_eq!(overlay.width, 91.0);
+    assert_eq!(overlay.height, 48.0, "functional percentage height must use the 40px containing block");
+}
+
+#[test]
 fn absolute_auto_axes_preserve_static_position_after_reparenting() {
     let tree = parse_html(include_str!("../../../render-repros/absolute-static-position.html"));
     let layout = layout_dom(&tree, (900.0, 1000.0));
@@ -3485,6 +3505,36 @@ fn cyclic_descendant_percentages_do_not_inflate_a_flex_items_intrinsic_minimum()
             "the final reflow must resolve calc() against the 697px flex item: {child:?}"
         );
     }
+}
+
+#[test]
+fn cyclic_percentage_flex_row_keeps_its_intrinsic_content_width() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          #scroller { display:flex; width:768px }
+          #month { flex:0 0 auto; width:auto; max-width:336px; padding:0 24px }
+          #week { display:flex; width:100% }
+          .day { flex:1 0 48px; width:48px; height:48px }
+        </style>
+        <div id="scroller"><div id="month"><div><div id="week">
+          <div class="day"></div><div class="day"></div><div class="day"></div>
+          <div class="day"></div><div class="day"></div><div class="day"></div>
+          <div class="day"></div>
+        </div></div></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1000.0, 400.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+
+    assert_eq!(rect("week").width, 336.0, "percentage row: {:?}", rect("week"));
+    assert_eq!(
+        rect("month").width,
+        384.0,
+        "content width plus inline padding: {:?}",
+        rect("month")
+    );
 }
 
 /// Chromium resolves both spellings to the same 163px content width: the

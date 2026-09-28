@@ -96,6 +96,10 @@ enum Command {
         #[arg(long, default_value_t = obscura_cdp::DEFAULT_MAX_CONNECTIONS)]
         max_connections: usize,
 
+        /// Atomically publish the bound address after V8 initialization.
+        #[arg(long, value_name = "PATH")]
+        ready_file: Option<std::path::PathBuf>,
+
         /// Allow CDP clients to navigate to file:// URLs. Off by
         /// default so a CDP connection cannot read arbitrary local
         /// files. Enable only when serving local HTML for testing
@@ -339,8 +343,23 @@ fn effective_v8_flags(user: Option<&str>) -> String {
     }
 }
 
+const CLI_STACK_BYTES: usize = 512 * 1024 * 1024;
+
+fn main() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("obscura-main".to_string())
+        // V8 derives its stack guard from the current native thread. Deep but
+        // valid hostile documents can otherwise exhaust the platform's small
+        // default stack while the page realm is initialized. This reserves
+        // address space; pages are committed only as the stack is used.
+        .stack_size(CLI_STACK_BYTES)
+        .spawn(run_cli)?
+        .join()
+        .map_err(|_| anyhow::anyhow!("obscura main thread panicked"))?
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+async fn run_cli() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
@@ -413,6 +432,7 @@ async fn main() -> anyhow::Result<()> {
             user_agent,
             workers,
             max_connections,
+            ready_file,
             allow_file_access,
             storage_dir,
             font_dirs,
@@ -427,7 +447,12 @@ async fn main() -> anyhow::Result<()> {
                     .filter(|s| !s.is_empty())
             });
             configure_font_directories(&font_dirs)?;
-            print_banner(port);
+            if ready_file.is_some() && workers != 1 {
+                anyhow::bail!("--ready-file requires --workers 1");
+            }
+            if port != 0 {
+                print_banner(port);
+            }
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
             }
@@ -462,7 +487,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
             } else {
-                obscura_cdp::start_with_serve_options_and_limit(
+                obscura_cdp::start_with_serve_options_limit_and_ready_file(
                     port,
                     &host,
                     proxy,
@@ -472,6 +497,7 @@ async fn main() -> anyhow::Result<()> {
                     storage_dir,
                     args.allow_private_network,
                     max_connections,
+                    ready_file.as_deref(),
                 )
                 .await?;
             }
@@ -605,15 +631,33 @@ async fn run_multi_worker_serve(
     font_dirs: Vec<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt as _;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     let exe = std::env::current_exe()?;
+    // Claim the public port before starting children so another process cannot
+    // take it during worker startup.
+    let listener = TcpListener::bind((host.as_str(), port)).await?;
+    // Internal worker ports are implementation details. Asking the OS for
+    // free ports avoids assuming that every port adjacent to the public one is
+    // available (or that `port + workers` cannot overflow).
+    let mut reservations = Vec::with_capacity(workers as usize);
+    for _ in 0..workers {
+        let reservation = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        let worker_port = reservation.local_addr()?.port();
+        reservations.push((worker_port, reservation));
+    }
     let mut children = Vec::new();
+    let mut worker_ports = Vec::with_capacity(workers as usize);
 
-    for i in 0..workers {
-        let worker_port = port + 1 + i;
+    for (index, (worker_port, reservation)) in reservations.into_iter().enumerate() {
+        drop(reservation);
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("serve").arg("--port").arg(worker_port.to_string());
+        // Workers receive the client-facing Host header through the TCP
+        // load balancer. Let their CDP security gate accept that public port
+        // while it continues to reject foreign hosts and browser origins.
+        cmd.env("OBSCURA_CDP_FORWARDED_HOST", &host);
+        cmd.env("OBSCURA_CDP_FORWARDED_PORT", port.to_string());
         if let Some(ref p) = proxy {
             // Pass the proxy (which may embed credentials) via the environment,
             // not argv. A --proxy flag is visible in `ps`/`/proc/<pid>/cmdline`
@@ -634,41 +678,86 @@ async fn run_multi_worker_serve(
         cmd.stderr(std::process::Stdio::null());
 
         let child = cmd.spawn()?;
-        tracing::info!("Worker {} on port {}", i + 1, worker_port);
+        tracing::info!("Worker {} on port {}", index + 1, worker_port);
         children.push(child);
+        worker_ports.push(worker_port);
     }
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Wait only until every worker has bound its control port. The old fixed
+    // 500 ms sleep dominated multi-worker startup even when workers were ready
+    // in a few milliseconds.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    for (index, (child, &worker_port)) in children.iter_mut().zip(&worker_ports).enumerate() {
+        loop {
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!("worker {} exited during startup: {}", index + 1, status);
+            }
+            match TcpStream::connect(("127.0.0.1", worker_port)).await {
+                Ok(stream) => {
+                    drop(stream);
+                    break;
+                }
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                }
+                Err(error) => {
+                    return Err(error.into());
+                }
+            }
+        }
+    }
 
-    // Bind the load balancer to the requested host, not hardcoded loopback.
+    // The load balancer is bound to the requested host, not hardcoded loopback.
     // With --host 0.0.0.0 (e.g. in Docker) the single-worker path already binds
     // all interfaces; the multi-worker balancer must too, or the mapped port is
     // refused from outside the container (issue #336). Workers stay on loopback
     // and are only reached by the balancer.
-    let listener = TcpListener::bind((host.as_str(), port)).await?;
     tracing::info!("Load balancer on {}:{}, {} workers", host, port, workers);
 
-    let mut next_worker: u16 = 0;
+    let mut next_worker = 0usize;
 
     loop {
         let (client_stream, peer_addr) = listener.accept().await?;
-        let worker_port = port + 1 + (next_worker % workers);
+        if let Err(error) = client_stream.set_nodelay(true) {
+            tracing::warn!("client {} TCP_NODELAY failed: {}", peer_addr, error);
+        }
+        let worker_port = worker_ports[next_worker % worker_ports.len()];
         next_worker = next_worker.wrapping_add(1);
 
         tracing::debug!("Routing {} to worker port {}", peer_addr, worker_port);
 
         let mut peek_buf = [0u8; 4];
-        client_stream.peek(&mut peek_buf).await?;
+        match client_stream.peek(&mut peek_buf).await {
+            Ok(0) => continue,
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!("client {} closed before dispatch: {}", peer_addr, error);
+                continue;
+            }
+        }
 
         if &peek_buf == b"GET " {
             let mut full_peek = [0u8; 256];
-            let n = client_stream.peek(&mut full_peek).await?;
+            let n = match client_stream.peek(&mut full_peek).await {
+                Ok(n) => n,
+                Err(error) => {
+                    tracing::debug!("client {} closed before dispatch: {}", peer_addr, error);
+                    continue;
+                }
+            };
             let request_line = String::from_utf8_lossy(&full_peek[..n]);
 
             if request_line.contains("/json") {
                 let worker_addr = format!("127.0.0.1:{}", worker_port);
                 match tokio::net::TcpStream::connect(&worker_addr).await {
                     Ok(mut worker_stream) => {
+                        if let Err(error) = worker_stream.set_nodelay(true) {
+                            tracing::warn!(
+                                "worker {} TCP_NODELAY failed: {}",
+                                worker_addr,
+                                error
+                            );
+                        }
                         tokio::spawn(async move {
                             let std_stream = match client_stream.into_std() {
                                 Ok(s) => s,
@@ -713,6 +802,10 @@ async fn run_multi_worker_serve(
         tokio::spawn(async move {
             match tokio::net::TcpStream::connect(&worker_addr).await {
                 Ok(mut worker_stream) => {
+                    if let Err(error) = worker_stream.set_nodelay(true) {
+                        tracing::warn!("worker {} TCP_NODELAY failed: {}", worker_addr, error);
+                        return;
+                    }
                     let mut client = client_stream;
                     let _ = tokio::io::copy_bidirectional(&mut client, &mut worker_stream).await;
                 }
@@ -793,6 +886,10 @@ async fn run_fetch(
         allow_private_network,
     );
     context.obey_robots = obey_robots;
+    // The browser layer refuses file:// unless the context opts in. A local
+    // user running `obscura fetch file://...` on their own files is the
+    // intended case; only network-facing servers (serve, mcp) keep it off.
+    context.allow_file_access = true;
     let context = Arc::new(context);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
     // Keep the browser's end-to-end navigation ceiling aligned with the CLI

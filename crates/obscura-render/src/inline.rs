@@ -472,6 +472,15 @@ fn base_font_database(load_emoji: bool) -> &'static FontDatabase {
             .into_iter()
             .map(|id| (id, None, None, None)),
         );
+        // CJK/directory fallbacks come after the bundled faces so a page's
+        // own webfont still wins for CJK code points it covers. They live in
+        // the base database so the emoji and web-font derived databases
+        // inherit them without an extra load path.
+        for font in extra_fallback_fonts() {
+            for id in database.load_font_source(cosmic_text::fontdb::Source::Binary(font)) {
+                declarations.push((id, None, None, None));
+            }
+        }
         let loaded_families = register_loaded_faces(&database, declarations);
         database.set_sans_serif_family(FAMILY);
         (database, loaded_families)
@@ -987,8 +996,27 @@ pub struct TextEngine {
     loaded_families: HashMap<String, LoadedFamily>,
     swash: SwashCache,
     variable_swash: VariableSwashCache,
+    shape_templates: HashMap<String, Vec<ShapeTemplate>>,
+    shape_template_count: usize,
+    #[cfg(test)]
+    shape_template_hits: usize,
     items: Vec<InlineItem>,
     replaced: Vec<ReplacedItem>,
+}
+
+// Repeated labels, table cells, and list/card rows are common, and building
+// cosmic-text's attributed buffer for each identical run is measurable. Keep
+// only small templates and stop admitting entries once this per-layout cache
+// is full: memory stays bounded even for attacker-controlled page text.
+const SHAPE_TEMPLATE_LIMIT: usize = 64;
+const SHAPE_TEMPLATE_TEXT_LIMIT: usize = 256;
+
+struct ShapeTemplate {
+    font_size_bits: u32,
+    line_height_bits: u32,
+    wrap: Wrap,
+    attrs: SpanAttrs,
+    buffer: Buffer,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1416,6 +1444,10 @@ impl TextEngine {
             loaded_families,
             swash: SwashCache::new(),
             variable_swash: VariableSwashCache::new(),
+            shape_templates: HashMap::new(),
+            shape_template_count: 0,
+            #[cfg(test)]
+            shape_template_hits: 0,
             items: Vec::new(),
             replaced: Vec::new(),
         }
@@ -1735,7 +1767,31 @@ impl TextEngine {
         // ~invisible, matching the intent, and one page can never abort a worker.
         let cosmic_size = base_size.max(1.0);
         let metrics = Metrics::new(cosmic_size, line_h.max(1.0));
-        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        let cacheable_template = clip_fills.is_empty()
+            && owner_ranges.is_empty()
+            && owner_boxes.is_empty()
+            && boundary_events.is_empty()
+            && text_len <= SHAPE_TEMPLATE_TEXT_LIMIT
+            && spans.len() == 1;
+        let template_text = cacheable_template.then(|| spans[0].0.as_str());
+        let cached_buffer = template_text.and_then(|text| {
+            self.shape_templates.get(text).and_then(|templates| {
+                templates.iter().find_map(|template| {
+                    (template.font_size_bits == metrics.font_size.to_bits()
+                        && template.line_height_bits == metrics.line_height.to_bits()
+                        && template.wrap == layout_wrap
+                        && template.attrs == spans[0].1)
+                        .then(|| template.buffer.clone())
+                })
+            })
+        });
+        let template_hit = cached_buffer.is_some();
+        #[cfg(test)]
+        if template_hit {
+            self.shape_template_hits += 1;
+        }
+        let mut buffer =
+            cached_buffer.unwrap_or_else(|| Buffer::new(&mut self.font_system, metrics));
         // Install the used-layout mode now; intrinsic measurement temporarily
         // swaps to `min_content_wrap` below. Keeping those modes separate is
         // what prevents `overflow-wrap: break-word` from shrinking a
@@ -1781,13 +1837,30 @@ impl TextEngine {
             (text.as_str(), attrs.to_attrs(variation_index))
         });
         let defaults = Attrs::new().family(Family::Name(FAMILY));
-        buffer.set_rich_text(
-            &mut self.font_system,
-            rich,
-            &defaults,
-            Shaping::Advanced,
-            None,
-        );
+        if !template_hit {
+            buffer.set_rich_text(
+                &mut self.font_system,
+                rich,
+                &defaults,
+                Shaping::Advanced,
+                None,
+            );
+            if let Some(text) = template_text {
+                if self.shape_template_count < SHAPE_TEMPLATE_LIMIT {
+                    self.shape_templates
+                        .entry(text.to_owned())
+                        .or_default()
+                        .push(ShapeTemplate {
+                            font_size_bits: metrics.font_size.to_bits(),
+                            line_height_bits: metrics.line_height.to_bits(),
+                            wrap: layout_wrap,
+                            attrs: spans[0].1.clone(),
+                            buffer: buffer.clone(),
+                        });
+                    self.shape_template_count += 1;
+                }
+            }
+        }
 
         let marker_buffer = marker_attrs.map(|attrs| {
             let variation_index = attrs
@@ -2546,7 +2619,7 @@ fn collect_node_spans(
     c: &mut Collector,
     loaded_families: &HashMap<String, LoadedFamily>,
 ) {
-    let Some(node) = tree.get_node(cid) else {
+    let Some(node) = tree.borrow_node(cid) else {
         return;
     };
     match &node.data {
@@ -3239,7 +3312,7 @@ fn inline_child_ok(
     styles: &std::collections::HashMap<NodeId, LayoutStyle>,
     has_text: &mut bool,
 ) -> bool {
-    let Some(node) = tree.get_node(cid) else {
+    let Some(node) = tree.borrow_node(cid) else {
         return true;
     };
     match &node.data {
@@ -3971,6 +4044,32 @@ mod tests {
         different_descriptor.weight = Some((700, 700));
         assert!(
             cached_web_font_database(std::slice::from_ref(&different_descriptor), false).is_none()
+        );
+    }
+
+    #[test]
+    fn repeated_plain_text_reuses_the_attributed_buffer_template() {
+        let tree = obscura_dom::parse_html(
+            "<p id='first'>repeated label</p><p id='second'>repeated label</p>",
+        );
+        let first = tree.get_element_by_id("first").unwrap();
+        let second = tree.get_element_by_id("second").unwrap();
+        let style = LayoutStyle {
+            display: Display::Block,
+            font_size: Some(16.0),
+            line_height: Some(crate::LineHeight::Px(20.0)),
+            ..Default::default()
+        };
+        let styles = HashMap::from([(first, style.clone()), (second, style)]);
+        let mut engine = TextEngine::new();
+        let first_item = engine.try_build(&tree, first, &styles).unwrap();
+        let second_item = engine.try_build(&tree, second, &styles).unwrap();
+
+        assert_eq!(engine.shape_template_count, 1);
+        assert_eq!(engine.shape_template_hits, 1);
+        assert_eq!(
+            engine.measure(first_item, Some(120.0)),
+            engine.measure(second_item, Some(120.0))
         );
     }
 

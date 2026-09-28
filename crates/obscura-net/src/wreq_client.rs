@@ -15,15 +15,15 @@ use tokio::sync::RwLock;
 use url::Url;
 
 #[cfg(feature = "stealth")]
-use crate::cookies::CookieJar;
-#[cfg(feature = "stealth")]
 use crate::client::{
-    CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
-    ResourceRequest, Response, SsrfGuardResolver, cors_required, env_allows_private_network,
-    fetch_file_url, is_forbidden_ip, redirect_taints_origin, request_fetch_site,
-    request_referrer, response_too_large, serialized_request_origin, validate_cors_response,
-    validate_request_mode, validate_url,
+    cors_required, env_allows_private_network, fetch_file_url, is_forbidden_ip,
+    redirect_taints_origin, request_fetch_site, request_referrer, response_too_large,
+    same_site_context, serialized_request_origin, validate_cors_response, validate_request_mode,
+    validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
+    ResourceRequest, Response, SsrfGuardResolver,
 };
+#[cfg(feature = "stealth")]
+use crate::cookies::{CookieJar, SameSiteContext};
 
 /// The wreq half of [`SsrfGuardResolver`]. `validate_url` only inspects the
 /// host *string*, so on its own it lets a public name that resolves inward
@@ -71,6 +71,19 @@ pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Win32";
 pub const STEALTH_UA_PLATFORM: &str = "Windows";
 #[cfg(feature = "stealth")]
 pub const STEALTH_UA_PLATFORM_VERSION: &str = "15.0.0";
+
+#[cfg(feature = "stealth")]
+fn tracker_blocking_enabled(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim),
+        Some(value) if matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+    )
+}
+
+#[cfg(feature = "stealth")]
+fn is_tracker_blocked(url: &Url, block_trackers: bool) -> bool {
+    block_trackers && url.host_str().is_some_and(crate::blocklist::is_blocked)
+}
 
 #[cfg(feature = "stealth")]
 fn wreq_response_header_value<'a>(
@@ -174,6 +187,7 @@ async fn send_get_with_connection_reset_retry(
 pub struct StealthHttpClient {
     client: wreq::Client,
     allow_private_network: bool,
+    pub block_trackers: bool,
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
@@ -250,6 +264,9 @@ impl StealthHttpClient {
         StealthHttpClient {
             client,
             allow_private_network,
+            block_trackers: tracker_blocking_enabled(
+                std::env::var("OBSCURA_BLOCK_TRACKERS").ok().as_deref(),
+            ),
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -292,17 +309,15 @@ impl StealthHttpClient {
 
         let mut current_url = url.clone();
 
-        if let Some(host) = current_url.host_str() {
-            if crate::blocklist::is_blocked(host) {
-                tracing::debug!("Blocked tracker: {}", current_url);
-                return Ok(Response {
-                    status: 0,
-                    url: current_url,
-                    headers: HashMap::new(),
-                    body: Vec::new(),
-                    redirected_from: Vec::new(),
-                });
-            }
+        if is_tracker_blocked(&current_url, self.block_trackers) {
+            tracing::debug!("Blocked tracker: {}", current_url);
+            return Ok(Response {
+                status: 0,
+                url: current_url,
+                headers: HashMap::new(),
+                body: Vec::new(),
+                redirected_from: Vec::new(),
+            });
         }
 
         let mut redirects = Vec::new();
@@ -331,7 +346,14 @@ impl StealthHttpClient {
             let request_origin = serialized_request_origin(&request, redirect_tainted);
 
             let cookie_header = if request.sends_credentials_to(&current_url) {
-                self.cookie_jar.get_cookie_header(&current_url)
+                self.cookie_jar.get_cookie_header_in_context(
+                    &current_url,
+                    same_site_context(
+                        &request,
+                        &current_url,
+                        request.mode == crate::RequestMode::Navigate,
+                    ),
+                )
             } else {
                 String::new()
             };
@@ -449,17 +471,37 @@ impl StealthHttpClient {
         send_cookies: bool,
         store_cookies: bool,
     ) -> Result<Response, ObscuraNetError> {
-        if let Some(host) = url.host_str() {
-            if crate::blocklist::is_blocked(host) {
-                tracing::debug!("Blocked tracker: {}", url);
-                return Ok(Response {
-                    status: 0,
-                    url: url.clone(),
-                    headers: HashMap::new(),
-                    body: Vec::new(),
-                    redirected_from: Vec::new(),
-                });
-            }
+        self.send_single_with_context(
+            method,
+            url,
+            headers,
+            body,
+            send_cookies.then_some(SameSiteContext::SameSite),
+            store_cookies,
+        )
+        .await
+    }
+
+    /// One request with an explicit cookie site context. Scripted fetch/XHR
+    /// uses this so Strict and Lax cookies cannot leak cross-site.
+    pub async fn send_single_with_context(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        cookie_context: Option<SameSiteContext>,
+        store_cookies: bool,
+    ) -> Result<Response, ObscuraNetError> {
+        if is_tracker_blocked(url, self.block_trackers) {
+            tracing::debug!("Blocked tracker: {}", url);
+            return Ok(Response {
+                status: 0,
+                url: url.clone(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+                redirected_from: Vec::new(),
+            });
         }
 
         let req_method = method
@@ -467,8 +509,8 @@ impl StealthHttpClient {
             .map_err(|e| ObscuraNetError::Network(format!("invalid method '{}': {}", method, e)))?;
         let mut req = self.client.request(req_method, url.as_str());
 
-        if send_cookies {
-            let cookie_header = self.cookie_jar.get_cookie_header(url);
+        if let Some(context) = cookie_context {
+            let cookie_header = self.cookie_jar.get_cookie_header_in_context(url, context);
             if !cookie_header.is_empty() {
                 req = req.header("cookie", &cookie_header);
             }
@@ -535,7 +577,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use url::Url;
 
-    use super::{StealthHttpClient, send_get_with_connection_reset_retry};
+    use super::{
+        StealthHttpClient, is_tracker_blocked, send_get_with_connection_reset_retry,
+        tracker_blocking_enabled,
+    };
     use crate::client::{ObscuraNetError, SsrfGuardResolver};
     use crate::cookies::CookieJar;
     use wreq::dns::{Name, Resolve};
@@ -564,6 +609,118 @@ mod tests {
     }
 
     const PLAIN_BODY: &str = "<!DOCTYPE html><html><body><p id=\"mark\">gzip ok</p></body></html>";
+
+    #[test]
+    fn tracker_blocking_environment_defaults_to_enabled() {
+        for value in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("true"),
+            Some("yes"),
+            Some("on"),
+            Some("invalid"),
+        ] {
+            assert!(
+                tracker_blocking_enabled(value),
+                "{value:?} must leave tracker blocking enabled"
+            );
+        }
+        for value in [
+            Some("0"), Some("false"), Some(" NO "), Some("off"), Some(" FALSE "),
+        ] {
+            assert!(
+                !tracker_blocking_enabled(value),
+                "{value:?} must disable tracker blocking"
+            );
+        }
+    }
+
+    #[test]
+    fn tracker_blocking_respects_host_and_setting() {
+        let url = Url::parse("https://www.google-analytics.com/collect").unwrap();
+
+        assert!(is_tracker_blocked(&url, true));
+        assert!(!is_tracker_blocked(&url, false));
+        assert!(!is_tracker_blocked(
+            &Url::parse("https://example.com/").unwrap(), true,
+        ));
+        assert!(!is_tracker_blocked(
+            &Url::parse("file:///tmp/page.html").unwrap(), true,
+        ));
+    }
+
+    #[test]
+    fn tracker_blocking_constructor_reads_environment() {
+        let client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        let expected = tracker_blocking_enabled(
+            std::env::var("OBSCURA_BLOCK_TRACKERS").ok().as_deref(),
+        );
+        assert_eq!(client.block_trackers, expected);
+    }
+
+    async fn assert_tracker_blocking_request(scripted: bool) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let mut client = StealthHttpClient::with_proxy(
+            Arc::new(CookieJar::new()),
+            Some(&proxy),
+            true,
+        );
+        let url = Url::parse("http://www.google-analytics.com/collect").unwrap();
+        let headers = std::collections::HashMap::new();
+
+        client.block_trackers = true;
+        let blocked = if scripted {
+            client.send_single("GET", &url, &headers, &[], false, false)
+                .await
+        } else {
+            client.fetch(&url).await
+        }.expect("blocked tracker returns an empty response");
+        assert_eq!(blocked.status, 0);
+        assert!(blocked.body.is_empty());
+        assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await.is_err());
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await.expect("request reaches local proxy").unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut buffer = [0u8; 1024];
+                let count = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer))
+                    .await.expect("request headers arrive").unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            assert!(String::from_utf8(request).unwrap().starts_with(
+                "GET http://www.google-analytics.com/collect HTTP/1.1\r\n",
+            ));
+            stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .await.unwrap();
+        });
+
+        client.block_trackers = false;
+        let allowed = if scripted {
+            client.send_single("GET", &url, &headers, &[], false, false)
+                .await
+        } else {
+            client.fetch(&url).await
+        }.expect("disabled blocking allows the request");
+        assert_eq!(allowed.status, 200);
+        assert_eq!(allowed.body, b"ok");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tracker_blocking_navigation_request() {
+        assert_tracker_blocking_request(false).await;
+    }
+
+    #[tokio::test]
+    async fn tracker_blocking_scripted_request() {
+        assert_tracker_blocking_request(true).await;
+    }
 
     // gzip (level 9) of PLAIN_BODY, hardcoded so the fixture needs no
     // compression dependency. A wrong byte fails the assert below.
@@ -634,6 +791,7 @@ mod tests {
         let client = StealthHttpClient {
             client: wreq::Client::builder().no_proxy().build().unwrap(),
             allow_private_network: true,
+            block_trackers: true,
             cookie_jar: Arc::new(CookieJar::new()),
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -684,7 +842,7 @@ mod tests {
     #[tokio::test]
     async fn stealth_client_decodes_gzip_response() {
         let port = gzip_fixture().await;
-        let client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
 
         let resp = client.fetch(&url).await.expect("fixture must be reachable");

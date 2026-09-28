@@ -84,6 +84,8 @@ pub struct CdpContext {
     /// Sessions that called Runtime.enable. Console and exception events are
     /// page-scoped but only delivered to these subscribers.
     pub runtime_enabled_sessions: HashSet<String>,
+    /// Page.setLifecycleEventsEnabled subscriptions, independent of Runtime.
+    pub(crate) lifecycle_enabled_sessions: HashSet<String>,
     // Legacy direct-embedder configuration. Protocol-created worlds live only
     // in `page_isolated_worlds`, so this vector does not grow with page churn.
     pub isolated_worlds: Vec<String>,
@@ -188,6 +190,7 @@ impl CdpContext {
             preload_scripts: Vec::new(),
             binding_sessions: HashMap::new(),
             runtime_enabled_sessions: HashSet::new(),
+            lifecycle_enabled_sessions: HashSet::new(),
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
@@ -345,6 +348,7 @@ impl CdpContext {
         }
         for session_id in &removed_sessions {
             self.runtime_enabled_sessions.remove(session_id);
+            self.lifecycle_enabled_sessions.remove(session_id);
         }
         if let Some(context_ids) = self.page_contexts.remove(id) {
             for context_id in context_ids {
@@ -673,7 +677,6 @@ fn is_v8_free_method(method: &str) -> bool {
             | "Page.getFrameTree"
             | "Page.setDownloadBehavior"
             | "Page.setLifecycleEventsEnabled"
-            | "Page.addScriptToEvaluateOnNewDocument"
             | "Page.removeScriptToEvaluateOnNewDocument"
             | "Page.setInterceptFileChooserDialog"
             | "Page.getNavigationHistory"
@@ -814,13 +817,10 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     };
 
     #[cfg(feature = "render")]
-    if result.is_ok() && domains::page::command_can_change_screencast_frame(&req.method) {
-        if let Err(error) = domains::page::queue_screencast_frame(ctx, &req.session_id, false) {
-            // Frame delivery is an asynchronous side effect in Chromium; it
-            // must not rewrite an otherwise successful command response.
-            tracing::warn!(method = %req.method,
-                "could not produce command-driven screencast frame: {error}");
-        }
+    if result.is_ok()
+        && domains::page::command_can_change_screencast_frame(&req.method)
+    {
+        domains::page::schedule_screencast_frame(ctx, &req.session_id);
     }
 
     // Stop the per-command watchdog. If it fired (the handler held V8 past the
@@ -865,7 +865,7 @@ pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
     }
 
     let mut page_to_sessions: HashMap<&str, Vec<&str>> = HashMap::new();
-    for session_id in &ctx.runtime_enabled_sessions {
+    for session_id in ctx.runtime_enabled_sessions.union(&ctx.lifecycle_enabled_sessions) {
         if let Some(page_id) = ctx.sessions.get(session_id) {
             page_to_sessions
                 .entry(page_id.as_str())
@@ -883,8 +883,25 @@ pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
         };
         let execution_context_id = ctx.default_context_id(&page_id).unwrap_or(1);
         for runtime_event in runtime_events {
+            let subscribers = if matches!(&runtime_event, obscura_js::ops::RuntimeEvent::DocumentLifecycle { .. }) {
+                &ctx.lifecycle_enabled_sessions
+            } else {
+                &ctx.runtime_enabled_sessions
+            };
             for session_id in sessions {
+                if !subscribers.contains(*session_id) {
+                    continue;
+                }
                 let (method, params) = match &runtime_event {
+                    obscura_js::ops::RuntimeEvent::DocumentLifecycle { name, timestamp } => (
+                        "Page.lifecycleEvent",
+                        json!({
+                            "frameId": ctx.pages.iter().find(|page| page.id == page_id).map(|page| &page.frame_id),
+                            "loaderId": ctx.current_loader_ids.get(&page_id),
+                            "name": name,
+                            "timestamp": timestamp,
+                        }),
+                    ),
                     obscura_js::ops::RuntimeEvent::Console(event) => (
                         "Runtime.consoleAPICalled",
                         json!({
@@ -1203,6 +1220,83 @@ mod tests {
         assert!(err.message.contains("Unknown domain"));
     }
 
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_only_runtime_calls_do_not_force_screencast_frames() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+
+        let start = CdpRequest {
+            id: 2,
+            method: "Page.startScreencast".into(),
+            params: json!({}),
+            session_id: Some(session_id.clone()),
+        };
+        let response = dispatch(&start, &mut ctx).await;
+        assert!(response.error.is_none(), "start failed: {:?}", response.error);
+        ctx.pending_events.clear();
+
+        let evaluate = CdpRequest {
+            id: 3,
+            method: "Runtime.evaluate".into(),
+            params: json!({"expression": "document.title", "returnByValue": true}),
+            session_id: Some(session_id),
+        };
+        let response = dispatch(&evaluate, &mut ctx).await;
+        assert!(response.error.is_none(), "evaluate failed: {:?}", response.error);
+        assert!(
+            ctx.pending_events
+                .iter()
+                .all(|event| event.method != "Page.screencastFrame"),
+            "a read-only runtime call must not synchronously rasterize a frame"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutating_commands_schedule_screencast_after_the_command_response() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id.clone());
+
+        let response = dispatch(
+            &CdpRequest {
+                id: 2,
+                method: "Page.startScreencast".into(),
+                params: json!({}),
+                session_id: session.clone(),
+            },
+            &mut ctx,
+        )
+        .await;
+        assert!(response.error.is_none(), "start failed: {:?}", response.error);
+        ctx.pending_events.clear();
+
+        let response = dispatch(
+            &CdpRequest {
+                id: 3,
+                method: "Emulation.setDefaultBackgroundColorOverride".into(),
+                params: json!({"color": {"r": 20, "g": 40, "b": 60}}),
+                session_id: session.clone(),
+            },
+            &mut ctx,
+        )
+        .await;
+        assert!(response.error.is_none(), "override failed: {:?}", response.error);
+        assert!(ctx.pending_events.is_empty(), "frame must not delay the command response");
+        assert!(ctx.screencasts[&session_id].autonomous_frame_pending);
+
+        crate::domains::page::pump_screencast_frames(&mut ctx).await;
+        assert!(ctx
+            .pending_events
+            .iter()
+            .any(|event| event.method == "Page.screencastFrame"));
+    }
+
     #[tokio::test]
     async fn send_message_to_target_unwraps_inner_call() {
         let mut ctx = CdpContext::new();
@@ -1268,4 +1362,5 @@ mod tests {
         let err = resp.error.expect("malformed inner messages must error");
         assert_eq!(err.code, -32700);
     }
+
 }

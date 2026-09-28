@@ -67,11 +67,9 @@ EXPOSE 9222
 
 # Bind to 0.0.0.0 *inside the container*: a container-loopback bind is
 # unreachable through `-p`, so this is required for the port to work at all.
-# It is not a licence to expose the port — publish to host loopback
-# (`-p 127.0.0.1:9222:9222`) unless something in front of it enforces auth.
+# It is not a licence to expose the port. Non-loopback binds require
+# OBSCURA_CDP_TOKEN; publish to host loopback as an additional boundary.
 # The native binary still defaults to 127.0.0.1.
 #
-# The CDP control plane has no authentication: anything that can reach this
-# port can drive the browser. Network isolation is the control.
 ENTRYPOINT ["/obscura"]
 CMD ["serve", "--port", "9222", "--host", "0.0.0.0"]

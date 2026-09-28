@@ -19,14 +19,22 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
 > fork 特有文件。完整計劃：
 > [design/upstream-rebase-20260929.md](design/upstream-rebase-20260929.md)
 
-- [ ] Phase 0: Pre-checks（磁碟 >= 14 GB、remotes、upstream fetch）
-- [ ] Phase 1: `git checkout -b rebase-upstream-20260929 upstream/main`
-- [ ] Phase 2: Cherry-pick `d0712cb`（CJK）— 預期 `inline.rs` / `paint.rs` 衝突
-- [ ] Phase 3: Cherry-pick `c9af5de`（fork 引用）或手動複製
-- [ ] Phase 4: 複製 fork 特有文件（AGENTS.md、TODO.md、design/、docs/ 等）
-- [ ] Phase 5: Release build（`render,cjk`）
-- [ ] Phase 6: 全量 nextest + CJK fixture + SVG filter + 障礙課程
-- [ ] Phase 7: Push + 清理 `merge-wave2-security-render` 分支
+- [x] Phase 0: Pre-checks（磁碟 14 GB、remotes、upstream fetch）
+- [x] Phase 1: `git checkout -b rebase-upstream-20260929 upstream/main`
+- [x] Phase 2: Cherry-pick `d0712cb`（CJK）— 4 檔衝突全解：`inline.rs`
+      （fallback 注入移入 `base_font_database`）、`paint.rs`（`decode_font_bytes`
+      對齊 `Arc` 回傳型別）、`render/Cargo.toml`（保留 `obscura-ssrf` + 加 `cjk`
+      feature）、`AGENTS.md`（採 upstream 側）
+- [x] Phase 3: Cherry-pick `c9af5de`（fork 引用）— 3 檔衝突採 fork 版本
+- [x] Phase 4: 複製 fork 特有文件（design/ 7 檔、CJK docs、README_ZH、
+      compose example、dependabot、docker/release workflows）
+- [x] Phase 5: Release build（`render,cjk`，2m44s，148MB）
+- [x] Phase 6: 全量 nextest **1885 passed / 5 skipped / 0 failed** + CJK
+      fixture 截圖 55KB 無豆腐 + 障礙課程 **32/33**（2026-09-29）
+- [x] Phase 7: Push `rebase-upstream-20260929` 到 origin
+- [x] 開 PR（PR #1，保留回滾空間）
+- [x] 清理 `merge-wave2-security-render` 分支（本地 + 遠端，2026-09-29 刪除）
+- [ ] PR #1 合併到 main + 重新 release（v0.3.0-cjk 或類似，基於 0.412）
 - [ ] 抽驗 cjk-stealth 變體 smoke test（#831 動了 wreq，本機無 cmake
       無法本地建置驗證）— 原 v0.2.1-cjk 項，合併至此
 
