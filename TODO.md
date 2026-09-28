@@ -32,8 +32,9 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
 - [x] Phase 6: 全量 nextest **1885 passed / 5 skipped / 0 failed** + CJK
       fixture 截圖 55KB 無豆腐 + 障礙課程 **32/33**（2026-09-29）
 - [x] Phase 7: Push `rebase-upstream-20260929` 到 origin
-- [ ] 開 PR 或 force-push 到 main（由用戶決定）
-- [ ] 清理 `merge-wave2-security-render` 分支（本地 + 遠端）
+- [x] 開 PR（PR #1，保留回滾空間）
+- [x] 清理 `merge-wave2-security-render` 分支（本地 + 遠端，2026-09-29 刪除）
+- [ ] PR #1 合併到 main + 重新 release（v0.3.0-cjk 或類似，基於 0.412）
 - [ ] 抽驗 cjk-stealth 變體 smoke test（#831 動了 wreq，本機無 cmake
       無法本地建置驗證）— 原 v0.2.1-cjk 項，合併至此
 

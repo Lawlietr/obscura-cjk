@@ -1,7 +1,11 @@
 # Upstream Rebase: re-baseline on upstream/main (deno_core 0.350 → 0.412)
 
 > 本文檔是完整實施計劃，讓接手的 agent 不需任何事前準備即可執行。
-> 日期：2026-09-29。狀態：待執行。
+> 日期：2026-09-29。狀態：已執行完成（2026-09-29）。
+> 實際執行結果：4 個 CJK commit 衝突 + 3 個 fork-refs 衝突全數按计划解決；
+> `inline.rs` 的 fallback 注入點因 upstream 重構移入 `base_font_database`
+>（比计划预估的更簡潔）。驗證：1885 passed / 5 skipped / 0 failed，
+> 障礙課程 32/33。結果在 `rebase-upstream-20260929` 分支，PR #1 待合併。
 
 ## 背景
 

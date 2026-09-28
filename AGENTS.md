@@ -164,8 +164,8 @@ never touch `Cargo.toml`. The V8/deno family (`v8`, `deno-core`, `deno-*`)
 is excluded from routine updates on purpose, since upgrading it changes the
 V8 ABI and requires a manual review plus the full regression gate; only
 security advisories may produce PRs against those crates. Note: upstream
-already moved to deno_core 0.412 (2026-09-19); the fork will adopt it via
-the planned re-baseline on upstream/main (see known issues and
+moved to deno_core 0.412 on 2026-09-19; the fork adopts it via the
+re-baseline on upstream/main in PR #1 (see known issues and
 design/upstream-rebase-20260929.md).
 
 ## Before you finish
@@ -267,18 +267,17 @@ screenshots or reports.
 
 ## Known issues
 
-- **deno_core version divergence with upstream (0.350 vs 0.412).**
+- **deno_core re-baseline in flight (0.350 -> 0.412), PR #1.**
   Upstream `df8b058` (2026-09-19) upgraded deno_core from 0.350 to 0.412
-  and rewrote the V8 scope API (`PinScope` replacing `HandleScope`), the
-  bootstrap bridge (`__obscuraCore` closure replacing `Deno.core.ops`
-  direct access), and `runtime.rs` (333 lines). The 78 subsequent upstream
-  commits all use the new API. The fork main still pins 0.350 because the
-  last upstream merge (`694c8e1`, 2026-09-17) predates the upgrade.
-  The `merge-wave2-security-render` branch attempted to merge the upstream
-  changes into the 0.350 base and fails to compile; it should not be used.
-  Plan: re-baseline on `upstream/main` and cherry-pick the fork's two code
-  commits (CJK font `d0712cb`, fork references `c9af5de`).
-  Full plan: [design/upstream-rebase-20260929.md](design/upstream-rebase-20260929.md).
+  and rewrote the V8 scope API (`PinScope` replacing `HandleScope`) and the
+  bootstrap bridge (`__obscuraCore` closure). The fork main still pins 0.350
+  until PR #1 merges: the `rebase-upstream-20260929` branch re-bases the
+  fork on `upstream/main` and cherry-picks the two fork code commits (CJK
+  font `d0712cb`, fork references `c9af5de`); verified with a full
+  `render,cjk` build, 1885-passing nextest suite, and a 32/33 obstacle
+  course (2026-09-29). Do not branch from the old main base for new work
+  until the PR merges; the broken `merge-wave2-security-render` branch was
+  deleted. Plan: [design/upstream-rebase-20260929.md](design/upstream-rebase-20260929.md).
 - **`observer-intersection` obstacle course stage fails (32/33 pass).**
   Expected `'io:50'`, got `''`. Root cause: Obscura headless mode does not
   scroll, so the IntersectionObserver callback on the sentinel element fires
