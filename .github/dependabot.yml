@@ -1,0 +1,73 @@
+# Dependabot configuration.
+#
+# Complements the passive cargo-deny checks in ci.yml (deny.toml): cargo-deny
+# gates vulnerability/license/ban status at merge time, Dependabot drives
+# lockfile and version updates proactively.
+#
+# This workspace has ~460 crates in Cargo.lock, most of them transitive.
+# The strategy is deliberately quiet:
+#   - routine updates are lockfile-only and merged into one weekly PR, so
+#     CI cost (V8 full build per PR check run) stays at ~1 run/week;
+#   - the V8/deno family is excluded from routine updates. Those upgrades
+#     touch V8 ABI/compilation and must be reviewed by hand, in a dedicated
+#     change with the full regression gate (nextest + obstacle course).
+#     Security advisories for them still get their own PRs below.
+version: 2
+
+updates:
+  # Cargo: lockfile-only routine updates
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    rebase-strategy: "auto"
+    groups:
+      routine:
+        # One PR for all routine transitive/direct lockfile bumps.
+        # Heavy dependencies below are carved out via excludes.
+        applies-to: "version-updates"
+        patterns:
+          - "*"
+        exclude-patterns:
+          # V8/deno family: ABI-sensitive, upgrade by hand only.
+          - "v8"
+          - "deno-core"
+          - "deno-*"
+        # No update-type filter: with lockfile: true even major bumps only
+        # rewrite Cargo.lock, so folding them into the one weekly PR keeps
+        # CI at a single run per week.
+    # Lockfile updates only: do not open PRs editing Cargo.toml versions.
+    # Version bumps of real dependencies are done deliberately.
+    lockfile: true
+
+  # Cargo: security advisories, kept separate from routine noise
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    rebase-strategy: "auto"
+    security-advisories:
+      enabled: true
+      # Security fixes for the V8/deno family also get reviewed PRs;
+      # this is the only time Dependabot may touch those entries.
+    groups:
+      security:
+        applies-to: "security-updates"
+        patterns:
+          - "*"
+
+  # GitHub Actions workflows (low churn, cheap CI)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    rebase-strategy: "auto"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
