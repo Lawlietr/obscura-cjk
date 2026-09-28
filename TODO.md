@@ -6,26 +6,40 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
 
 ## 待辦
 
-### 低優先級（可選）｜React hydration 靜默未完成 — 事件處理器全死、點擊無效（2026-09-22 問題回報，translate 專案實測）
+### 【最高優先級】｜Upstream Rebase：基於 upstream/main 重建（deno_core 0.350 → 0.412）（2026-09-29 評估）
 
-> 下游專案採兩階段策略：Obscura 負責截圖 + 只讀 DOM 探測（SSR 內容不受
-> 影響），「點擊 → 斷言狀態改變」類驗證改走真 Chromium（Playwright）。
-> Obscura 定位維持 scraping/只讀自動化，WebSocket 支援非核心需求。
-> 症狀、環境、懷疑方向（ws/HMR、Origin/Referer）與最小重現建議：
-> [design/hydration-bug-report.md](design/hydration-bug-report.md)
+> **背景：** Upstream `df8b058`（9/19）把 deno_core 從 0.350 升到 0.412，
+> 此後 78 commits 都基於新 API。Fork 最近一次 upstream merge（`694c8e1`,
+> 9/17）在此之前，所以 fork main 仍固定在 0.350。
+> `merge-wave2-security-render` 分支嘗試合併 upstream 變更但無法編譯
+>（API 全面不兼容），不應使用。
+>
+> **策略：** 從 `upstream/main` 建立新分支，cherry-pick fork 的 2 個
+> 程式碼 commits（`d0712cb` CJK 字型 + `c9af5de` fork 引用），再複製
+> fork 特有文件。完整計劃：
+> [design/upstream-rebase-20260929.md](design/upstream-rebase-20260929.md)
 
-- [ ] （可選）最小重現：純 React 19 單頁（非 Next）在 Obscura 能否 hydrate
-- [ ] （可選）驗證 production build 是否同受影響
-- [ ] （可選）定位：與 Playwright 對照 `/_next/*` dev 資源 headers 與 ws 生命週期
-- [ ] （可選）修復 + 回歸（需實作頁面級 WebSocket，屬獨立功能，非 fork regression）
+- [ ] Phase 0: Pre-checks（磁碟 >= 14 GB、remotes、upstream fetch）
+- [ ] Phase 1: `git checkout -b rebase-upstream-20260929 upstream/main`
+- [ ] Phase 2: Cherry-pick `d0712cb`（CJK）— 預期 `inline.rs` / `paint.rs` 衝突
+- [ ] Phase 3: Cherry-pick `c9af5de`（fork 引用）或手動複製
+- [ ] Phase 4: 複製 fork 特有文件（AGENTS.md、TODO.md、design/、docs/ 等）
+- [ ] Phase 5: Release build（`render,cjk`）
+- [ ] Phase 6: 全量 nextest + CJK fixture + SVG filter + 障礙課程
+- [ ] Phase 7: Push + 清理 `merge-wave2-security-render` 分支
+- [ ] 抽驗 cjk-stealth 變體 smoke test（#831 動了 wreq，本機無 cmake
+      無法本地建置驗證）— 原 v0.2.1-cjk 項，合併至此
 
-### 高優先級｜上游合併 #2（2026-09-17，`694c8e1`，71 commits since `727cc46`）
+### 中優先級｜上游合併 #2 剩餘關卡（2026-09-17，`694c8e1`）
+
+> 注意：上游合併 #2 的 deno_core 版本（0.350）已過時，upstream 已升到
+> 0.412。剩餘關卡（release build + 障礙課程）應在 rebase 完成後跑，
+> 不必在舊 base 上重跑。
 
 - [x] 合併後回歸（nextest）：`render,cjk` 九 crate 全量 **1691 passed /
       4 skipped / 0 failed**（render 601/1、js+net 611/0、cdp+dom+cli+
       browser+mcp 479/3），2026-09-17 重跑。
-- [ ] 合併後回歸（剩餘關卡）：release build（`render,cjk`）+ 障礙課程 32/33。
-      障礙課程自 2026-09-17 合併後尚未重跑。
+- [x] ~~合併後回歸（剩餘關卡）~~ → 移至 rebase 完成後統一跑。
 - [x] **CJK 截檢（2026-09-17）。** `target/release/obscura`（`render,cjk`
       建置，139MB）跑 `cjk-fallback.html`：text dump 繁/簡/日/混排字元全數
       正確還原；截圖 55KB 無豆腐框，字距與行高跟實字形 advance。`extra_fallback_fonts`
@@ -60,6 +74,19 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
 - [ ] 後續維護：升級後視需要同步清理 `deny.toml` 的 ignore 清單
       （RUSTSEC ID 綁定 transitive 版本，cargo-deny CI 會提示）。
 - 細節：[design/dependabot.md](design/dependabot.md)
+
+### 低優先級（可選）｜React hydration 靜默未完成 — 事件處理器全死、點擊無效（2026-09-22 問題回報，translate 專案實測）
+
+> 下游專案採兩階段策略：Obscura 負責截圖 + 只讀 DOM 探測（SSR 內容不受
+> 影響），「點擊 → 斷言狀態改變」類驗證改走真 Chromium（Playwright）。
+> Obscura 定位維持 scraping/只讀自動化，WebSocket 支援非核心需求。
+> 症狀、環境、懷疑方向（ws/HMR、Origin/Referer）與最小重現建議：
+> [design/hydration-bug-report.md](design/hydration-bug-report.md)
+
+- [ ] （可選）最小重現：純 React 19 單頁（非 Next）在 Obscura 能否 hydrate
+- [ ] （可選）驗證 production build 是否同受影響
+- [ ] （可選）定位：與 Playwright 對照 `/_next/*` dev 資源 headers 與 ws 生命週期
+- [ ] （可選）修復 + 回歸（需實作頁面級 WebSocket，屬獨立功能，非 fork regression）
 
 ### 低優先級｜Leaflet 功能補齊（2026-09-16 問題回報，Leaflet 1.9.4 + `obscura-cjk:merged-local` 實測）
 
@@ -116,6 +143,7 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
 - [x] **v0.2.1-cjk release（2026-09-17）。** tag 推送後 release 上線；
       本機 compose 已切回 GHCR `latest`，容器重建後 MCP smoke test
       （navigate / evaluate / CJK / screenshot / close）全數通過。
+      注意：此 release 基於 deno_core 0.350；rebase 完成後需重新 release。
 - [x] **v0.2.0-cjk 上游大合併（2026-09-07）。** 自分叉點 `c1380190`
       起 114 commits（~40 PR，+9482/−1056 行，44 檔）；3 個衝突全數
       按預先評估處理。
@@ -207,5 +235,8 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
   release）
 - 最新 tag：`v0.2.1-cjk`（2026-09-17 推送；本機 compose 已跟隨 GHCR
   `latest` 驗證通過）
-- 上游 `h4ckf0r0day/obscura` 目前未設 remote，僅歷史與 Apache-2.0
-  授權歸屬參考
+- `upstream` → `h4ckf0r0day/obscura`（已設 remote，2026-09-28 確認）
+- 上游 deno_core 0.412（`df8b058`, 9/19）；fork main 仍 0.350；
+  差異 80 commits。rebase 計劃：
+  [design/upstream-rebase-20260929.md](design/upstream-rebase-20260929.md)
+- `merge-wave2-security-render` 已損壞（無法編譯），不應使用
