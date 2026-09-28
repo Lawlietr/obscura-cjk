@@ -677,13 +677,11 @@ fn publish_ready_file(path: &Path, address: SocketAddr) -> anyhow::Result<()> {
         uuid::Uuid::new_v4()
     ));
     let result = (|| -> std::io::Result<()> {
-        let mut opts = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true);
+        opts.create_new(true);
         #[cfg(unix)]
-        {
-            opts.mode(0o600);
-        }
+        opts.mode(0o600);
         let mut file = opts.open(&temporary)?;
         file.write_all(&record)?;
         file.sync_all()?;
