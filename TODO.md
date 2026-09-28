@@ -34,7 +34,7 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
 - [x] Phase 7: Push `rebase-upstream-20260929` 到 origin
 - [x] 開 PR（PR #1，保留回滾空間）
 - [x] 清理 `merge-wave2-security-render` 分支（本地 + 遠端，2026-09-29 刪除）
-- [ ] PR #1 合併到 main + 重新 release（v0.3.0-cjk 或類似，基於 0.412）
+- [x] PR #1 合併到 main + 重新 release（`v0.3.0-cjk` tag @ `abc059a`，2026-09-28 推送）
 - [ ] 抽驗 cjk-stealth 變體 smoke test（#831 動了 wreq，本機無 cmake
       無法本地建置驗證）— 原 v0.2.1-cjk 項，合併至此
 
@@ -245,10 +245,10 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦與完成進度追蹤。
 - 工作分支：`main`（追蹤 `origin/main`）
 - 首個 tag：`v0.1.0-cjk` @ `84c7223`（2026-08-24 推送，觸發首次
   release）
-- 最新 tag：`v0.2.1-cjk`（2026-09-17 推送；本機 compose 已跟隨 GHCR
-  `latest` 驗證通過）
+- 最新 tag：`v0.3.0-cjk`（2026-09-28 推送，deno_core 0.412 基底；
+  本機 compose 已跟隨 GHCR `latest` 驗證通過）
 - `upstream` → `h4ckf0r0day/obscura`（已設 remote，2026-09-28 確認）
-- 上游 deno_core 0.412（`df8b058`, 9/19）；fork main 仍 0.350；
-  差異 80 commits。rebase 計劃：
+- fork main 已 rebase 到 upstream/main（deno_core 0.412，84 commits
+  吸收），2026-09-28 完成。計劃：
   [design/upstream-rebase-20260929.md](design/upstream-rebase-20260929.md)
 - `merge-wave2-security-render` 已損壞（無法編譯），不應使用

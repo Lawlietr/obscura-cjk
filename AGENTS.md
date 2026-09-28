@@ -163,10 +163,9 @@ lockfile-only by design (`lockfile: true`): they rewrite `Cargo.lock` but must
 never touch `Cargo.toml`. The V8/deno family (`v8`, `deno-core`, `deno-*`)
 is excluded from routine updates on purpose, since upgrading it changes the
 V8 ABI and requires a manual review plus the full regression gate; only
-security advisories may produce PRs against those crates. Note: upstream
-moved to deno_core 0.412 on 2026-09-19; the fork adopts it via the
-re-baseline on upstream/main in PR #1 (see known issues and
-design/upstream-rebase-20260929.md).
+security advisories may produce PRs against those crates. The fork is
+now on deno_core 0.412 (re-baselined on upstream/main, 2026-09-28;
+see design/upstream-rebase-20260929.md).
 
 ## Before you finish
 
@@ -266,18 +265,6 @@ public documentation, stage them, or commit them. Do not commit generated
 screenshots or reports.
 
 ## Known issues
-
-- **deno_core re-baseline in flight (0.350 -> 0.412), PR #1.**
-  Upstream `df8b058` (2026-09-19) upgraded deno_core from 0.350 to 0.412
-  and rewrote the V8 scope API (`PinScope` replacing `HandleScope`) and the
-  bootstrap bridge (`__obscuraCore` closure). The fork main still pins 0.350
-  until PR #1 merges: the `rebase-upstream-20260929` branch re-bases the
-  fork on `upstream/main` and cherry-picks the two fork code commits (CJK
-  font `d0712cb`, fork references `c9af5de`); verified with a full
-  `render,cjk` build, 1885-passing nextest suite, and a 32/33 obstacle
-  course (2026-09-29). Do not branch from the old main base for new work
-  until the PR merges; the broken `merge-wave2-security-render` branch was
-  deleted. Plan: [design/upstream-rebase-20260929.md](design/upstream-rebase-20260929.md).
 - **`observer-intersection` obstacle course stage fails (32/33 pass).**
   Expected `'io:50'`, got `''`. Root cause: Obscura headless mode does not
   scroll, so the IntersectionObserver callback on the sentinel element fires
