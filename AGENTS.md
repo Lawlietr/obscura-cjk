@@ -274,19 +274,16 @@ screenshots or reports.
   and never triggers the expected scroll-based callback. Fixture comments
   claim targets are treated as intersecting, but they are not. This is an
   inherent headless-mode limitation.
-- **SVG static geometry APIs are missing.** `SVGElement` in `bootstrap.js`
-  is an empty class, so `createSVGRect()` and friends return
-  `undefined`. Map libraries that call them (e.g. Leaflet) break; test
-  pages inject a polyfill. Fix is tracked in TODO.md (shim-layer only,
-  no layout data needed).
-- **CSSOM View client offset getters are missing.** `clientLeft` and
-  siblings are not implemented, so libraries that convert synthetic
-  click coordinates through the box model (e.g. Leaflet) compute NaN.
-  Verify click handlers by firing library events directly (e.g.
-  `layer.fire('click')`) instead of relying on coordinate-dependent
-  paths. Fix is tracked in TODO.md; `op_layout_geometry` already carries
-  the padding-box sizes and the batch measurement op already returns
-  border/padding values, so the payload and a JS getter are enough.
+- **SVG static geometry APIs are missing.** The SVG class hierarchy in
+  `bootstrap.js` exists (`SVGElement`, `SVGGraphicsElement`,
+  `SVGGeometryElement`, `SVGPathElement`, `SVGSVGElement`), but
+  `SVGSVGElement.createSVGRect()` and the other SVG 1.1 factories return
+  `undefined`, so Leaflet's `Browser.svg` probe fails and its vector
+  renderer comes back null. Test pages inject a polyfill. Also missing:
+  `transform.baseVal`, `getCTM`/`getScreenCTM`, `getTotalLength`/
+  `getPointAtLength`. `getBBox()` exists but is a zero-valued stub, so it
+  yields fake measurements rather than an error. Fix is tracked in TODO.md
+  (shim-layer only, no layout data needed).
 
 ## Gotchas
 

@@ -35,18 +35,19 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦追蹤。
 
 ### 低優先級｜Leaflet 功能補齊（2026-09-16）
 
-> 建議順序 A → B → C → D/E → F 決策 → G。A、B、F、G 互相獨立；
+> 建議順序 C → D → E → F 決策 → G。F、G 獨立；
 > SVG 鏈有依賴 C → D → E。
 
-- [ ] **（A）CSSOM View 盒模型 getter**（`clientLeft` 等，Leaflet 點擊
-      座標換算出 NaN）。~25 行。細節：
-      [design/cssom-view-box-geometry.md](design/cssom-view-box-geometry.md)
-- [ ] **（B）MCP `browser_console_messages` 接線**（目前死欄位）。
-      細節：[design/mcp-console-capture.md](design/mcp-console-capture.md)
 - [ ] **（C）SVG factory 方法（最小層）**：`createSVGRect` 等，解鎖
       Leaflet 功能偵測。細節：[design/svg-dom-api.md](design/svg-dom-api.md)
 - [ ] **（D）SVG shape class + `instanceof` 映射**。依賴 C。
+      upstream PR h4ckf0r0day/obscura#1112（「define the missing concrete
+      SVG element interfaces」，已 merged）會隨 upstream 同步進來；
+      同步後先探測殘留缺口再決定要不要自己補。
 - [ ] **（E）SVG animated transform + `getTotalLength` 等**。依賴 D。
+      `getTotalLength` 已有 upstream open PR h4ckf0r0day/obscura#1204
+      （native Rust geometry）可考慮 cherry-pick；`transform.baseVal`
+      仍需自己做。
 - [ ] **（F）`getBBox` 處理決策**：快速回 `DOMException` vs 讀真實幾何。
 - [ ] **（G）`getCTM` / `getScreenCTM`**：需 layout 資料，預估 2–4 天。
 
@@ -66,6 +67,18 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦追蹤。
 - `upstream` → `h4ckf0r0day/obscura`
 - fork main 已 rebase 到 upstream/main（deno_core 0.412），2026-09-28 完成。
   計劃：[design/upstream-rebase-20260929.md](design/upstream-rebase-20260929.md)
+
+### 已完成，僅存設計記錄
+
+- **CSSOM View 盒模型 getter**（`clientLeft` / `clientTop` /
+  `clientWidth` / `clientHeight`）已上線：`bootstrap.js` 的 getter 讀
+  `op_layout_geometry`（同步 upstream 後改走批次 op
+  `op_layout_box_metrics`）。設計記錄：
+  [design/cssom-view-box-geometry.md](design/cssom-view-box-geometry.md)
+- **MCP `browser_console_messages`** 已接線：`obscura-mcp/src/lib.rs` 的
+  `tool_console_messages()` 讀 `take_pending_console_messages()`，建頁時
+  `set_console_messages_enabled(true)`，並有 nextest 覆蓋。
+  設計記錄：[design/mcp-console-capture.md](design/mcp-console-capture.md)
 
 ### 已記錄在 AGENTS.md（無需再跟）
 

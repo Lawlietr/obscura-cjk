@@ -1,25 +1,18 @@
 # CSSOM View 盒模型 getter（clientLeft / clientTop / ...）
 
-待辦追蹤見 `TODO.md`「待辦」節。背景：自動化 Leaflet 地圖頁時
-發現頁面 JS 讀取 `clientLeft` 等取得 `undefined`；Leaflet 用它換算
-點擊座標時算出 NaN，地圖點擊定位失誤。真實瀏覽器無此問題，目前
-test page 以 polyfill 規避。
+> 狀態：已實作。本文件是設計記錄，非待辦。
+> 背景：自動化 Leaflet 地圖頁時發現頁面 JS 讀取 `clientLeft` 等取得
+> `undefined`；Leaflet 用它換算點擊座標時算出 NaN。真實瀏覽器無此問題。
 
-## 現況
+## 實作位置
 
-- `clientLeft` / `clientTop` / `clientRight` / `clientBottom` 未
-  實作（頁面 JS 讀取 `undefined`）。
-- 資料幾乎已就位：
-  - `op_layout_geometry`（`obscura-js/src/ops.rs` ~L5273）已回傳
-    `clientWidth` / `clientHeight`（padding box）。
-  - batch op `op_resize_observer_measurements` 已回傳 computed
-    style 的 border / padding 值（同一模式可照抄）。
-
-## 修法（估計 0.5–1 天含測試）
-
-- Rust：geometry payload 加 border width 欄位（~10 行）。
-- JS：`bootstrap.js` 端 getter（~15 行）。
-- 補完後 test page 的 polyfill 可移除。
+- `crates/obscura-js/js/bootstrap.js`：`get clientTop` / `get clientLeft`
+  （讀 computed style 的 border width）、`get clientWidth` /
+  `get clientHeight`（經 `_renderClientMetrics()` 讀
+  `op_layout_geometry` 的 padding box），另有 `offsetWidth` /
+  `offsetHeight` / `offsetTop` / `offsetLeft` / `offsetParent`。
+- upstream 已把單元素 op 換成批次測量 op `op_layout_box_metrics`（同一次
+  回 client/offset 四值），同步 upstream/main 後自動取得。
 
 ## 規範邊界（CSSOM View）
 
@@ -30,5 +23,5 @@ test page 以 polyfill 規避。
 
 ## 相鄰缺口
 
-見 `design/svg-dom-api.md`：SVG 向量層停用與本項點擊座標 NaN
-是 Leaflet 地圖頁的兩個獨立斷點，都補完後該類頁面才能完整可用。
+SVG 層缺口見 `design/svg-dom-api.md`：Leaflet 地圖頁的兩個獨立斷點，
+盒模型 getter 已補完，SVG factory（`createSVGRect`）仍是斷點。
