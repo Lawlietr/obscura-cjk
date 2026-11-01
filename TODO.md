@@ -179,10 +179,14 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦追蹤。
   `NotSupportedError`（與 `v0.3.0-cjk` 一致，確認撤回到乾淨狀態）。
 
 - 2026-11-01 發布 `v0.4.1-cjk`：annotated tag（tag 物件 `fe6e36a`）打在
-  `main` 的 `72c1f5d`。這是把 `v0.4.0-cjk` 因為 audit 擋下而缺少的
-  ECDSA P-256 補回來，版號用 patch：對 `v0.4.0-cjk` 的差異只有「依賴升到已修補線
-  \ + `publish-manifest` success，`:0.4.1-cjk` 與 `:latest` 同 digest
-  `sha256:b1049b55…`，而 `:0.4.0-cjk` 的 digest 沒有被動到。
+  `main` 的 `72c1f5d`。版號用 patch 的理由：對 `v0.4.0-cjk` 的差異只有
+  「依賴升到已修補線」與「加回本來就要上線的功能」兩件事，沒有新的功能世代；
+  下一輪 upstream 同步才進 `0.5.0`。
+  公開發布狀態：`PR / Core` 在 `72c1f5d` success（四個 config 全 build + 測試、
+  33/33 障礙課程）；Release run 的 `Audit release dependencies` 第一次就
+  success，五個 target build 與 publish 全 success，10 個資產 116–123 MB；
+  Docker run 的兩平台 build 與 `publish-manifest` 都 success，`:0.4.1-cjk` 與
+  `:latest` 同 digest `sha256:b1049b55…`，而 `:0.4.0-cjk` 的 digest 沒有被動到。
   映像 smoke test（用公開發布的映像跑）：`obscura --version` 為 `0.4.1-cjk`；
   頁內 ECDSA `sigBytes=64`、篡改驗證 false、`spki=91`、`pkcs8=138`、pkcs8 匯入後
   交叉驗證 true、JWK 帶 `d`；CJK fixture 截圖與 `v0.4.0-cjk` 的基準
