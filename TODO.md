@@ -155,6 +155,20 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦追蹤。
   Chromium 對齊）；`navigator.geolocation` 在沒有 `OBSCURA_GEOLOCATION` 時改回
   PERMISSION_DENIED（#1228）；`elementsFromPoint` 依 paint order 回傳（#848）。
 
+- 2026-11-01 發布 `v0.4.0-cjk`：annotated tag（tag 物件 `561b065`）打在
+  `main` 的 `2b40dcf`。第一次打的 tag 被 `release.yml` 的 `cargo deny check
+  advisories` 擋下（RUSTSEC-2026-0387），因此撤回 #1308（`a2159e9`）、刪掉舊 tag
+  重打。Docker 那一條是在 `publish-manifest` 建立 `:0.4.0-cjk` 與 `:latest` 之前
+  就被取消，所以 `:latest` 從未指向壞 build。
+  公開發布狀態：GitHub Release 10 個資產（5 個 target × `cjk` 與 `cjk-stealth`，
+  117–123 MB）；GHCR `:0.4.0-cjk` 與 `:latest` 同一 digest
+  `sha256:11640ff0…`；映像內 `obscura --version` 為 `0.4.0-cjk`（版本字串由 tag
+  決定，`Cargo.toml` 不需改）。
+  映像 smoke test（用公開發布的映像跑）：CJK fixture 截圖與本機驗證過的 build
+  完全相同（55557 bytes、24234 個非白像素、239 種灰階）；
+  `getTotalLength=120`；`crypto.subtle` 的 ECDSA 與 ECDH 都是
+  `NotSupportedError`（與 `v0.3.0-cjk` 一致，確認撤回到乾淨狀態）。
+
 ### 已評估，不做
 
 - upstream PR h4ckf0r0day/obscura#786（"recheck moving intersection
