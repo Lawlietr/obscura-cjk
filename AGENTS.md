@@ -193,6 +193,48 @@ security advisories may produce PRs against those crates. The fork is
 now on deno_core 0.412 (re-baselined on upstream/main, 2026-09-28;
 see design/upstream-rebase-20260929.md).
 
+## Releasing
+
+Tags follow the fork line `vMAJOR.MINOR.PATCH-cjk`. The current release is
+`v0.4.0-cjk`. Bare `vMAJOR.MINOR.PATCH` names belong to upstream: upstream's own
+tags already live in this repository's tag namespace, so a bare tag published
+here would produce two different builds under one version name. The fork line has
+no 1.x stability contract, so visible behaviour changes (render defaults,
+hit-test order) go into a minor bump.
+
+Push order:
+
+1. `git push origin <sync-branch>` first. That leaves a remote rollback point.
+2. `git push origin HEAD:main` with an explicit refspec. Never use
+   `--follow-tags` or `--tags`. Upstream tags `v0.2.4` through `v0.2.6` are
+   ancestors of main, and `v0.2.6` is annotated, so `--follow-tags` would publish
+   them. Both publishing workflows trigger on any `v*` tag, and `docker.yml`
+   retags `:latest` on every tag push. A stray upstream tag therefore republishes
+   `ghcr.io/lawlietr/obscura-cjk:latest` from an upstream commit that has no
+   `cjk` feature and none of the fork patches.
+3. Wait for the `PR / Core` job on main, then create the tag. That job is the
+   only gate that builds `render,stealth` and runs the stealth transport tests, and
+   a host without `cmake` cannot build BoringSSL locally.
+4. `git tag -a vMAJOR.MINOR.PATCH-cjk -F notes.txt <sha>` and then
+   `git push origin vMAJOR.MINOR.PATCH-cjk`. `release.yml` runs `cargo deny
+   check advisories` first, then builds five targets in `render,cjk` and
+   `render,cjk,stealth`. `docker.yml` pushes `:<version>` plus `:latest`.
+5. Keep upstream tags out of the local namespace: `git config
+   remote.upstream.tagOpt --no-tags`. Existing upstream tags can stay; they are
+   useful for `git diff v0.2.5..v0.2.6` style comparisons.
+
+`PR / Policy` runs only on `pull_request`, and it executes the `pr_policy.py` of
+the base revision. A branch that adds a new `vendor/` directory therefore fails
+that check until the `APPROVED_VENDOR_SNAPSHOTS` entry already exists on main.
+Upstream syncs go straight to main instead of through a pull request for this
+reason.
+
+The release version string comes from the tag. `crates/obscura-cli/build.rs`
+reads `OBSCURA_VERSION`, then `GITHUB_REF_NAME`, then `.git_archival.txt`. The
+workspace `version = "0.1.0"` in the root `Cargo.toml` is not a release version
+and stays unchanged; a local build reports `0.1.0-dev+<sha>`, where `<sha>` is
+the revision that was checked out while the build script ran.
+
 ## Before you finish
 
 For any code change:
@@ -340,6 +382,17 @@ screenshots or reports.
   toward ~8 GB. Check `df -h /` for >= ~12 GB free before starting and poll it
   during the run; the release-dist build previously filled the disk and was
   killed mid-compile.
+- **`target/release` is the whole disk story on this host, and it is cache, not
+  cruft.** After one upstream sync round (release build plus the full nextest run
+  in `render,cjk`), `target/release` measured 8.9 GB on disk: the V8 rlib appears
+  twice at ~185 MB, `gn_out/obj/librusty_v8.a` is 178 MB, and the link outputs are
+  unstripped at ~149 MB each, including 155 MB test binaries. Nothing in it
+  predated that round, so there was no stale revision to prune. `cargo clean
+  --release` reclaims it in a few seconds; `df` on this ZFS host lags a few
+  seconds behind the delete. The cost of cleaning is a V8 recompile (about five
+  minutes) and the 12 GB free requirement again. Copy `target/release/obscura` and
+  `obscura-worker` out first if later `OBSCURA_BIN` or `BASELINE_BIN` runs still
+  need them.
 - **Known limitation — React hydration may silently never complete** (reported
   2026-09-22 from the `translate` project; full report:
   [design/hydration-bug-report.md](design/hydration-bug-report.md), TODO.md
