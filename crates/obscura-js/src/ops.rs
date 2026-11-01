@@ -7446,8 +7446,10 @@ fn ec_curve(curve: &str) -> Result<(), deno_error::JsErrorBox> {
 }
 
 fn ec_public_material(public: &p256::PublicKey) -> Vec<u8> {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
-    public.to_encoded_point(false).as_bytes().to_vec()
+    // elliptic-curve 0.14 renamed ToEncodedPoint/to_encoded_point to
+    // ToSec1Point/to_sec1_point; the old names still exist but are deprecated.
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    public.to_sec1_point(false).as_bytes().to_vec()
 }
 
 fn ec_private_material(secret: &p256::SecretKey) -> Vec<u8> {
@@ -7460,7 +7462,10 @@ fn ec_secret(material: &[u8]) -> Result<p256::SecretKey, deno_error::JsErrorBox>
     let scalar = material
         .get(..EC_P256_SCALAR_LEN)
         .ok_or_else(|| crypto_err("not an EC private key"))?;
-    p256::SecretKey::from_bytes(scalar.into()).map_err(crypto_err)
+    // elliptic-curve 0.14 keeps only the slice form of this constructor; it does
+    // the same length check and the same scalar range check as the old
+    // from_bytes(&FieldBytes) call did.
+    p256::SecretKey::from_slice(scalar).map_err(crypto_err)
 }
 
 fn ec_public(material: &[u8]) -> Result<p256::PublicKey, deno_error::JsErrorBox> {
@@ -7502,8 +7507,15 @@ fn ec_import(curve: &str, format: &str, data: &[u8]) -> Result<Vec<u8>, deno_err
             // The ECPrivateKey's own curve parameters, when present, must name
             // the same curve as the PrivateKeyInfo's (which SecretKey::try_from checks).
             use p256::pkcs8::AssociatedOid;
-            let info = p256::pkcs8::PrivateKeyInfo::try_from(data).map_err(crypto_err)?;
-            let ec_key = sec1::EcPrivateKey::try_from(info.private_key).map_err(crypto_err)?;
+            // pkcs8 0.11 made PrivateKeyInfo generic over the parameter, key and
+            // public-key fields, so name the borrowed form that elliptic-curve
+            // 0.14 implements TryFrom for. That impl asserts the AlgorithmIdentifier
+            // pair (id-ecPublicKey plus the curve OID), as before.
+            let info = p256::pkcs8::PrivateKeyInfoRef::try_from(data).map_err(crypto_err)?;
+            // The OCTET STRING now comes back as an OctetStringRef, while sec1 0.8
+            // decodes from a byte slice.
+            let ec_key =
+                sec1::EcPrivateKey::try_from(info.private_key.as_bytes()).map_err(crypto_err)?;
             if let Some(parameters) = ec_key.parameters {
                 if parameters.named_curve() != Some(p256::NistP256::OID) {
                     return Err(crypto_err("the ECPrivateKey names another curve"));
