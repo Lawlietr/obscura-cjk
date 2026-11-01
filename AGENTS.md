@@ -113,7 +113,10 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
   any host fonts or page webfonts. It is off by default to keep the base
   binary ~30 MB smaller; the Dockerfile and the recommended builds enable it.
   Only Regular weight is embedded (bold CJK is not synthesized) and Hangul is
-  not covered; see the font-directory escape hatch below.
+  not covered; see the font-directory escape hatch below. Unstyled text renders
+  in the UA default serif face (Liberation Serif), matching Chromium: the
+  bundled Noto CJK faces are fallbacks for the ideographs only, so a page that
+  sets no `font-family` still mixes serif Latin with CJK glyphs.
 - **Font directory (opt-in):** `OBSCURA_FONTS_DIR` (env) or the global CLI
   flag `--fonts <PATH>` (valid before or after the subcommand, forwarded to
   scrape workers) adds a directory of extra font files as fallback faces after
@@ -126,6 +129,21 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
   on `serve` and `mcp` (recursive, pure sfnt only, set before the first
   render). See `docs/CJK-and-custom-fonts.md` ("Two font-directory
   mechanisms").
+- **Upstream CJK watch (standing check, every upstream sync).** Upstream has
+  no CJK support: no `cjk` feature, no CJK font asset, no fallback logic, and
+  its only mechanism is `--font-dir` on `serve`/`mcp` (operator-supplied font
+  directory). Upstream issue #606 (Chinese text missing from screenshots) and
+  PR #991 (CJK font fallback) are still open as of 2026-11-01. The fork's
+  embedded Noto Sans CJK faces are what make CJK render in the font-free
+  `debian:12-slim` image (0 font files in the image). Whenever an upstream
+  change touches fonts, the `vendor/cosmic-text` fallback lists, `--font-dir`,
+  or PDF font embedding, check upstream's CJK state and report it before
+  writing any fork-side CJK code. Baseline evidence and the checklist:
+  `TODO.md` ("上游 CJK 現況基線").
+- **Do not duplicate upstream work.** If upstream ships or accepts a CJK
+  mechanism (embedded faces, a `cjk` feature, or a font-directory design that
+  fits the fork's container), adopt theirs and delete the fork-side patch
+  rather than maintaining two implementations.
 - **Iterating on one crate? Scope it:** `cargo build -p obscura-cli`. A bare
   `cargo build` can re-link the whole workspace; the V8 compile is the cost, so
   avoid touching it when you don't need to.
@@ -272,16 +290,18 @@ public documentation, stage them, or commit them. Do not commit generated
 screenshots or reports.
 
 ## Known issues
-- **SVG static geometry APIs are missing.** The SVG class hierarchy in
+- **SVG static geometry APIs are partially missing.** The SVG class hierarchy in
   `bootstrap.js` exists (`SVGElement`, `SVGGraphicsElement`,
-  `SVGGeometryElement`, `SVGPathElement`, `SVGSVGElement`), but
+  `SVGGeometryElement`, `SVGPathElement`, `SVGSVGElement`) and
+  `getTotalLength()` is implemented natively (`obscura-js/src/svg_geometry.rs`,
+  upstream PR #1204, see `docs/SVG-geometry.md`). Still missing:
   `SVGSVGElement.createSVGRect()` and the other SVG 1.1 factories return
   `undefined`, so Leaflet's `Browser.svg` probe fails and its vector
-  renderer comes back null. Test pages inject a polyfill. Also missing:
-  `transform.baseVal`, `getCTM`/`getScreenCTM`, `getTotalLength`/
-  `getPointAtLength`. `getBBox()` exists but is a zero-valued stub, so it
-  yields fake measurements rather than an error. Fix is tracked in TODO.md
-  (shim-layer only, no layout data needed).
+  renderer comes back null; test pages inject a polyfill. Also missing:
+  `transform.baseVal`, `getCTM`/`getScreenCTM`, `getPointAtLength`.
+  `getBBox()` exists but is a zero-valued stub, so it yields fake
+  measurements rather than an error. Fix is tracked in TODO.md (shim-layer
+  only, no layout data needed).
 
 ## Gotchas
 

@@ -21,6 +21,32 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦追蹤。
       （RUSTSEC ID 綁定 transitive 版本，cargo-deny CI 會提示）。
 - 細節：[design/dependabot.md](design/dependabot.md)
 
+### 追蹤｜上游 CJK 現況（每次 upstream sync 必查，優先級高）
+
+> 規則：上游一旦出現 CJK 相關變化（新 `cjk` feature、內嵌 CJK 字型、
+> Han fallback 邏輯、`--font-dir` 範圍擴大、PDF 字型嵌入、
+> `vendor/cosmic-text` fallback 清單改動），**要先回報並優先採用上游做法**，
+> 不要兩邊各實作一份。
+
+- [ ] 每次同步 upstream 後重跑下方檢查，並在有任何變化時明確回報
+      （變更是什麼、影響哪個變體、要不要把 fork patch 改成上游實作）。
+- [ ] 盯 upstream issue #606（screenshot 顯示不出中文，OPEN）與
+      PR #991（table/select DOM APIs + CJK font fallback，OPEN）。
+- [ ] 若上游接受我們的 CJK fallback 形式（opt-in feature + OFL face），
+      就改用上游版並刪掉 fork 的 `inline.rs` 注入路徑與 assets。
+
+基線證據（2026-11-01，fork HEAD 當時 = upstream 8534b40 同步後）：
+
+| 檢查項 | 上游狀況 |
+|---|---|
+| `cjk` feature | 無（`obscura-render` features 只有 `default`/`paint`） |
+| 內嵌 CJK face | 無；`crates/obscura-render/assets/` 只有 Liberation/DejaVu/Noto Emoji |
+| cmap 覆蓋 `中/文/テ/ス` | liberation-sans、dejavu-sans、noto-color-emoji 皆 0/4 |
+| 上游自己的 Han/CJK fallback 代碼 | 無；`Noto Sans CJK` 只出現在 vendored cosmic-text 的 family 對照表 |
+| 官方 CJK 解法 | `--font-dir`（僅 `serve`/`mcp`，遞迴、只收 sfnt、每 process 首次渲染前一次） |
+| 部署基底 | `debian:12-slim` 內 **0 個字型檔**，`load_system_fonts()` 掃不到東西 |
+| 我們發布的映像 | 映像內 **0 個字型檔**，但仍繪出 CJK（glyph 來自 binary 內嵌 face） |
+
 ### 中優先級｜PDF 可選取文字（upstream open PR #1391）
 
 > fork 目前 `Page.printToPDF` 是純 raster（`obscura-browser/src/pdf.rs`
@@ -58,10 +84,10 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦追蹤。
 
 - [ ] **（C）SVG factory 方法（最小層）**：`createSVGRect` 等，解鎖
       Leaflet 功能偵測。細節：[design/svg-dom-api.md](design/svg-dom-api.md)
-- [ ] **（E）SVG animated transform + `getTotalLength` 等**。依賴 C。
-      `getTotalLength` 已有 upstream open PR h4ckf0r0day/obscura#1204
-      （native Rust geometry）可考慮 cherry-pick；`transform.baseVal`
-      仍需自己做。
+- [ ] **（E）SVG animated transform + `getPointAtLength` 等**。依賴 C。
+      `getTotalLength` 已隨 upstream PR h4ckf0r0day/obscura#1204 上線
+      （fork `crates/obscura-js/src/svg_geometry.rs`，`docs/SVG-geometry.md`）；
+      `transform.baseVal` 與 `getPointAtLength` 仍需自己做。
 - [ ] **（F）`getBBox` 處理決策**：快速回 `DOMException` vs 讀真實幾何。
 - [ ] **（G）`getCTM` / `getScreenCTM`**：需 layout 資料，預估 2–4 天。
 
@@ -86,6 +112,21 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦追蹤。
   `cli/src/main.rs` worker env、`render/src/paint.rs` SVG font DB）。
   deno_core 維持 0.412。驗證：release nextest `render,cjk` 2460 passed /
   5 skipped / 0 failed；release build（`render,cjk`）乾淨；障礙課程 33/33。
+
+- 2026-11-01（第二輪同步 + 揀選）：同一分支再 `git merge upstream/main`
+  （upstream `8534b40`：zstd 壓縮依賴的安全修補，新增 `vendor/wreq-util`，
+  **0 個衝突**），接著套用 17 個 upstream PR（共 18 個 commit，#766 是 2 個、#1204 附帶的第二個是空的 CI commit 已略過）：#1052、#1332、#1366、
+  #1397、#1401、#1380、#1285、#1257、#766、#763、#1277、#1228、#1318、
+  #848（該 PR 的分支含 merge commit，改用 `git merge --squash` 一次套用）、
+  #1301、#1308、#1204。`[patch.crates-io]` 已由上游改成直接 path 依賴取代，
+  `vendor/taffy` 與 `vendor/cosmic-text` 現在與上游完全一致（我們的 grid
+  shrink-to-fit 修正與 variable-font 座標修補已被上游的 vendor 吸收）。
+  驗證：nextest（`render,cjk`）2505 passed / 0 failed / 5 skipped；release
+  build（`render,cjk`）乾淨（僅 1 個 upstream 自帶的 dead-code 警告）；障礙課程 33/33（median 3054.6 ms，同步前
+  基準 3064.6 ms，差 0.3%，在 ±10% 噪音地板內）。
+  本輪帶進的行為變化：初始 `font-family` 現在解析為 serif（#763，與
+  Chromium 對齊）；`navigator.geolocation` 在沒有 `OBSCURA_GEOLOCATION` 時改回
+  PERMISSION_DENIED（#1228）；`elementsFromPoint` 依 paint order 回傳（#848）。
 
 ### 已評估，不做
 
