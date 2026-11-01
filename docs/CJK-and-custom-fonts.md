@@ -75,7 +75,7 @@ interchangeable:
 | | `--fonts` / `OBSCURA_FONTS_DIR` | `--font-dir` |
 | --- | --- | --- |
 | Origin | fork | upstream |
-| Where it applies | Global flag; `fetch`, `serve`, `scrape`, `mcp` | `serve` subcommand only |
+| Where it applies | Global flag; `fetch`, `serve`, `scrape`, `mcp` | `serve` and `mcp` subcommands |
 | When it is read | Per request / per worker | Once, before the first render of the process |
 | Scan | Non-recursive, filename-sorted | Recursive (enters subdirectories), filename-sorted |
 | Accepted files | `ttf`/`otf`/`ttc`/`woff`/`woff2` | Pure sfnt only: `ttf`/`otf`/`ttc`/`otc` (woff/woff2 skipped) |
@@ -85,6 +85,6 @@ Both add fallback faces to the font database after the bundled set and are
 opt-in: layout then depends on the directory contents, breaking
 bundled-faces-only determinism. Use `--fonts`/`OBSCURA_FONTS_DIR` for quick
 per-request additions (including `scrape`/`mcp`). Use `--font-dir` when running
-`obscura serve` and you need a whole tree of fonts loaded once for the CDP
-session; pass it **before** the first page renders, or it refuses with
+`obscura serve` or `obscura mcp` and you need a whole tree of fonts loaded once
+for the session; pass it **before** the first page renders, or it refuses with
 "Font directories must be configured before the first render".

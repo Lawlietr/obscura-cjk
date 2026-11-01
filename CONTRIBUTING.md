@@ -79,11 +79,16 @@ runs each test in its own process, which is the only supported way.
 
 The authoritative behavioral gate is the **obstacle course** in the companion
 repo [`obscura-benchmark`](https://github.com/h4ckf0r0day/obscura-benchmark)
-(33 capability and speed stages; 32/33 pass — see Known Issues below):
+(33 capability and speed stages; 33/33 pass):
 
 ```bash
 OBSCURA_BIN=./target/release/obscura python3 obstacle-course/run.py --runs 1 --warmup 0
 ```
+
+The clone must be at or after the 2026-10-03 IntersectionObserver fixture fix
+(that repo's PR #8). An older clone runs a pre-fix fixture that demands
+repeated callbacks for an unchanged intersecting target, which no
+spec-compliant engine produces, and reports a false failure.
 
 It serves local fixtures, so it is deterministic and offline.
 
@@ -132,13 +137,10 @@ also preserve non-render automation behavior and the no-render build.
 
 ## Known issues
 
-- **`observer-intersection` obstacle course stage fails (32/33 pass).**
-  Expected `'io:50'`, got `''`. Root cause: Obscura headless mode does not
-  scroll, so the IntersectionObserver callback on the sentinel element fires
-  only once (when the page loads). The sentinel remains below the viewport
-  and never triggers the expected scroll-based callback. Fixture comments
-  claim targets are treated as intersecting, but they are not. This is an
-  inherent headless-mode limitation.
+None open. Before treating an obstacle-course failure as an engine defect,
+check that the `obscura-benchmark` clone is current: the pre-2026-10-03
+`observer-intersection` fixture demanded repeated callbacks for an unchanged
+intersecting target, and upstream replaced it (that repo's PR #8).
 
 ## Before you open a PR
 
@@ -147,7 +149,7 @@ For any code change:
 1. `cargo nextest run --release --features render` passes for the crates you touched.
 2. The full render-feature nextest command above passes.
 3. `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render` compiles clean.
-4. The obstacle course still reports **33/33**.
+4. The obstacle course reports **33/33** against an up-to-date clone.
 5. **Performance is a hard constraint.** Obscura is roughly 12x faster and uses
    about 6x less memory than headless Chrome on framework pages. Keep native
    Rust fast paths and add a JS fallback only for real spec edge cases. If your
