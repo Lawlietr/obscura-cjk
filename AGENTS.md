@@ -219,7 +219,20 @@ Push order:
    `git push origin vMAJOR.MINOR.PATCH-cjk`. `release.yml` runs `cargo deny
    check advisories` first, then builds five targets in `render,cjk` and
    `render,cjk,stealth`. `docker.yml` pushes `:<version>` plus `:latest`.
-5. Keep upstream tags out of the local namespace: `git config
+5. Watch the `Audit release dependencies` job first. `release.yml` gates its build
+   on that job, but `docker.yml` has no audit gate, so one tag push can publish
+   images and retag `:latest` while the GitHub Release fails. If the audit fails,
+   cancel the Docker run at once with
+   `gh run cancel -R Lawlietr/obscura-cjk <run-id>`, which stops the
+   `publish-manifest` job before it creates `:<version>` and `:latest`. Then fix
+   the dependency, push the fix to main, wait for `PR / Core`, and recreate the
+   tag. The per-platform tags `:<version>-amd64` and `:<version>-arm64` are
+   pushed before any manifest exists; a later run overwrites them, so they need no
+   manual cleanup.
+6. Do not answer a new advisory by adding it to `deny.toml`. That ignore list is
+   only for unmaintained notices, per the comment at the top of the file. A real
+   vulnerability has to be cleared by dependency work.
+7. Keep upstream tags out of the local namespace: `git config
    remote.upstream.tagOpt --no-tags`. Existing upstream tags can stay; they are
    useful for `git diff v0.2.5..v0.2.6` style comparisons.
 
@@ -367,6 +380,10 @@ screenshots or reports.
   break the IO timing tests. `svg_font_database_with_fallbacks()` (separate
   OnceLock) is only built when a page actually contains inline SVG text.
   Verify with the `svg` nextest filter after touching this area.
+- **`gh` resolves to the wrong remote.** This repository has two remotes, and the
+  `gh` CLI defaults to `h4ckf0r0day/obscura`, not the fork. Every `gh` command must
+  carry `-R Lawlietr/obscura-cjk`. Without it, `gh run list` shows upstream's runs
+  and `gh run cancel` fails with "could not find any workflow run".
 - **`canAccessOpener` must be in every `TargetInfo` payload**, or strict CDP
   clients (chromiumoxide) panic.
 - **The DOM reparenting guards in `tree.rs` are load-bearing.** `append_child` /

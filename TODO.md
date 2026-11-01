@@ -5,6 +5,33 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦追蹤。
 
 ## 待辦
 
+### 高優先級｜ECDSA P-256 已撤回，待 p256 0.14 遷移後帶回
+
+- [ ] 2026-11-01：upstream PR #1308 以 cherry-pick 進入 fork（`c7f7be9`）之後，
+      `v0.4.0-cjk` 的 release workflow 被 `cargo deny check advisories` 擋下：
+      **RUSTSEC-2026-0387**（`crypto-bigint` 0.5.5，原本設計成 constant-time 的
+      運算改為依秘密值分支：減法、零位元計數、除法、Montgomery 乘法、
+      `UintRef` 比較、`BoxedMontyForm::invert`）。鏈路為 `p256` →
+      `elliptic-curve` 0.13.8 → `crypto-bigint` 0.5.5，由 `obscura-js` 的
+      WebCrypto P-256 路徑直接可達。advisory 只修補 `>= 0.7.6`，
+      0.5 線沒有可移植的修補版。
+- [ ] 撤回 commit：`a2159e9`（`git revert c7f7be9`）。撤回後 `Cargo.lock` 內的
+      `p256` / `elliptic-curve` / `crypto-bigint` 全部消失（grep = 0）；
+      `bootstrap.js` 回到只剩兩處既有的 `"ECDSA"` 正規化字串，與 `v0.3.0-cjk`
+      完全相同。
+- [ ] 帶回的做法（已查證）：改用 `p256 = "0.14"`。查 crates.io index 結果：
+      `elliptic-curve 0.14.3` 的依賴清單已不含 `crypto-bigint`（改使用 `bigint`），
+      連帶需要 `ecdsa-core ^0.17`、`primeorder ^0.14`、`sha2 ^0.11`、
+      `serdect ^0.4`。要改 `ops.rs` 的 EC 輔助層（`SecretKey::from_bytes` 與
+      `from_slice`、`PrivateKeyInfo`、`AssociatedOid`、pkcs8 的讀寫、`ecdsa` 的
+      `PrehashSigner` 與 `PrehashVerifier`）以及 `webcrypto_tests.rs`。
+- [ ] upstream #1308 目前仍是 OPEN（最後更新 2026-10-25），仍使用 0.13 線；
+      upstream main 不含 `p256`，所以 upstream 自己的 audit 碰不到這條。若未來
+      同步時 upstream 帶入未修補的 `p256`，同一條 advisory 會在我們這邊再度失敗，
+      屆時優先處理。
+- [ ] 驗證提醒：本機未安裝 `cargo-deny`，改完依賴後只能靠 CI 的 audit job，
+      或先 `cargo install cargo-deny` 再本地預驗。
+
 ### 中優先級｜cjk-stealth smoke test
 
 - [ ] 抽驗 `cjk-stealth` 變體 smoke test（#831 動了 wreq，本機無 cmake
