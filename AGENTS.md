@@ -19,6 +19,18 @@ tags remain available for rollback. The repo ships
 `docker-compose.yaml`), which follows `latest` and is the canonical deployment
 (MCP mode with the recommended security hardening); `docker compose up -d`
 from the repo root is the default way to run it.
+
+A moving `:latest` tag hides what is actually serving. `docker compose up -d` does
+not re-pull, and it only recreates the container when the compose manifest
+changes, so following `latest` can leave an old build answering MCP requests for
+weeks: this host ran `0.3.0-cjk` for three weeks after `0.4.0-cjk` and
+`0.4.1-cjk` shipped, and the tool list a coding agent sees stayed one release
+behind. Pin a versioned tag in the local compose file, or add
+`pull_policy: always` if you want the moving tag. Verify with
+`docker exec <container> /obscura --version`, or read `serverInfo.version` from
+the MCP `initialize` response. After an upgrade, MCP clients must reconnect to
+see added tools (`/reload` in pi).
+
 For local development, build from the repo's `Dockerfile`
 (`docker build -t obscura-cjk .`). Standalone examples for reference:
 
