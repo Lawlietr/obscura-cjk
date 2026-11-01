@@ -27081,8 +27081,8 @@ mod tests {
     /// permissions.query reported "prompt", a combination Chrome cannot
     /// produce. Without OBSCURA_GEOLOCATION nothing grants the permission, so
     /// the call has to fail the way Chrome fails it.
-    #[test]
-    fn geolocation_denies_without_configured_coordinates() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn geolocation_denies_without_configured_coordinates() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
@@ -27109,6 +27109,9 @@ mod tests {
             "no callback may run synchronously, and no position may come \
              back while the permission is undecided"
         );
+        // The shim resolves the permission through the microtask queue, so the
+        // state only becomes visible once the event loop has been pumped.
+        rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(
             rt.evaluate("globalThis.__perm").unwrap(),
             serde_json::json!("prompt"),
@@ -27119,8 +27122,8 @@ mod tests {
     /// The denial has to reach the page: the error callback fires with
     /// PERMISSION_DENIED (1), which is what Chrome reports, and no success
     /// callback ever runs.
-    #[test]
-    fn geolocation_reports_permission_denied_to_the_page() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn geolocation_reports_permission_denied_to_the_page() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
@@ -27134,6 +27137,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!("armed"));
+        // The denial is delivered as a microtask, like Chrome's async callback.
+        rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(
             rt.evaluate("globalThis.__geo").unwrap(),
             serde_json::json!("1:User denied Geolocation"),
@@ -27143,8 +27148,8 @@ mod tests {
 
     /// OBSCURA_GEOLOCATION is the operator granting the permission, so the two
     /// surfaces have to agree in the other direction as well.
-    #[test]
-    fn geolocation_grants_when_coordinates_are_configured() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn geolocation_grants_when_coordinates_are_configured() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.set_geolocation(40.7128, -74.006);
         let result = rt
@@ -27162,6 +27167,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!("armed"));
+        rt.run_event_loop_bounded(100).await.unwrap();
         let perm = rt.evaluate("globalThis.__perm").unwrap();
         let pos = rt.evaluate("globalThis.__geo").unwrap();
         assert_eq!(

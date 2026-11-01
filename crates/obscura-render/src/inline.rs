@@ -5840,7 +5840,11 @@ gamma</div>"#,
             cjk_glyphs >= 4,
             "ideographs must shape with a bundled CJK face, only {cjk_glyphs} did: {glyphs:?}"
         );
-        let latin_ids: std::collections::HashSet<_> = engine.loaded_families["liberation sans"]
+        // Upstream resolves the initial `font-family` to the UA default serif
+        // face, so unstyled Latin text here shapes with Liberation Serif. The
+        // point of the assertion is that the ideographs taking the bundled CJK
+        // face must not drag the Latin clusters onto it too.
+        let latin_ids: std::collections::HashSet<_> = engine.loaded_families["liberation serif"]
             .faces
             .iter()
             .filter_map(|face| face.font_id)
@@ -5851,7 +5855,7 @@ gamma</div>"#,
                 .filter(|(id, _)| latin_ids.contains(id))
                 .count()
                 >= 3,
-            "latin clusters must keep shaping with Liberation Sans: {glyphs:?}"
+            "latin clusters must keep shaping with the bundled serif face: {glyphs:?}"
         );
     }
 
