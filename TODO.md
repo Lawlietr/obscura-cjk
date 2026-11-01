@@ -170,13 +170,28 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦追蹤。
   重打。Docker 那一條是在 `publish-manifest` 建立 `:0.4.0-cjk` 與 `:latest` 之前
   就被取消，所以 `:latest` 從未指向壞 build。
   公開發布狀態：GitHub Release 10 個資產（5 個 target × `cjk` 與 `cjk-stealth`，
-  117–123 MB）；GHCR `:0.4.0-cjk` 與 `:latest` 同一 digest
-  `sha256:11640ff0…`；映像內 `obscura --version` 為 `0.4.0-cjk`（版本字串由 tag
-  決定，`Cargo.toml` 不需改）。
+  117–123 MB）；GHCR `:0.4.0-cjk` 的 digest 是 `sha256:11640ff0…`（`:latest`
+  當時也指向它，後來已改指 `0.4.1-cjk`）；映像內 `obscura --version` 為
+  `0.4.0-cjk`（版本字串由 tag 決定，`Cargo.toml` 不需改）。
   映像 smoke test（用公開發布的映像跑）：CJK fixture 截圖與本機驗證過的 build
   完全相同（55557 bytes、24234 個非白像素、239 種灰階）；
   `getTotalLength=120`；`crypto.subtle` 的 ECDSA 與 ECDH 都是
   `NotSupportedError`（與 `v0.3.0-cjk` 一致，確認撤回到乾淨狀態）。
+
+- 2026-11-01 發布 `v0.4.1-cjk`：annotated tag（tag 物件 `fe6e36a`）打在
+  `main` 的 `72c1f5d`。這是把 `v0.4.0-cjk` 因為 audit 擋下而缺少的
+  ECDSA P-256 補回來，版號用 patch：對 `v0.4.0-cjk` 的差異只有「依賴升到已修補線
+  \ + `publish-manifest` success，`:0.4.1-cjk` 與 `:latest` 同 digest
+  `sha256:b1049b55…`，而 `:0.4.0-cjk` 的 digest 沒有被動到。
+  映像 smoke test（用公開發布的映像跑）：`obscura --version` 為 `0.4.1-cjk`；
+  頁內 ECDSA `sigBytes=64`、篡改驗證 false、`spki=91`、`pkcs8=138`、pkcs8 匯入後
+  交叉驗證 true、JWK 帶 `d`；CJK fixture 截圖與 `v0.4.0-cjk` 的基準
+  **sha256 相同**（55557 bytes、24234 個非白像素、sha256 `4bec3bd908fc3f58…`）。
+  本機閘門：`cargo deny check` exit 0、nextest 2505 passed / 0 failed、
+  障礙課程 33/33（median 3040.1 ms）。
+  本機 binary cache 也跟著更新：保留 `obscura-0.4.1-cjk` 與
+  `obscura-worker-0.4.1-cjk`，刪掉從未發布的 p256 0.13 build，避免之後做
+  `BASELINE_BIN` 對照時誤用。
 
 ### 已評估，不做
 
