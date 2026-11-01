@@ -9,7 +9,7 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦追蹤。
 
 - [x] 做法：`git revert a2159e9` 先把 upstream PR #1308 的原始 commit 帶回
       （fork 的 `90e1607`，保留 upstream 作者資訊），再把 `p256` 從 0.13 升到
-      0.14遷移 commit 是 fork 的 `649e381`
+      0.14。遷移 commit 是 fork 的 `649e381`，
       “fix(js): move the ECDSA stack to p256 0.14 so the release audit passes”。
 - [x] elliptic-curve 0.14 的三處 API 差異（都在 `crates/obscura-js/src/ops.rs`）：
       `ToEncodedPoint` / `to_encoded_point` 改名為 `ToSec1Point` /
