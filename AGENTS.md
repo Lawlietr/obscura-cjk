@@ -380,6 +380,23 @@ screenshots or reports.
   break the IO timing tests. `svg_font_database_with_fallbacks()` (separate
   OnceLock) is only built when a page actually contains inline SVG text.
   Verify with the `svg` nextest filter after touching this area.
+- **Never re-resolve the whole lockfile to add a dependency.** `cargo
+  generate-lockfile` (or a bare `cargo update`) re-resolves every requirement: it
+  moved 214 packages in one attempt here, including the reqwest/hyper/rustls set,
+  and two `obscura-js` `read_body_capped` tests then failed against their own
+  loopback HTTP server with `hyper::Error(UnexpectedMessage)`. That is a false
+  failure about unrelated code, not a regression to chase. Instead, edit the
+  requirement in the crate's `Cargo.toml` and let `cargo check` update only the
+  affected subtree, then diff the lock's name/version sets to confirm the scope (29
+  packages for the p256 0.14 move, all inside the RustCrypto EC stack). If the tree
+  did drift, `git checkout HEAD -- Cargo.lock` and redo it.
+- **Pin `p256` to the 0.14 line.** The 0.13 line resolves elliptic-curve 0.13.8,
+  which links `crypto-bigint` 0.5.5, and that version is flagged by
+  RUSTSEC-2026-0387 with no backport for the 0.5 line. The 0.14 line resolves
+  `crypto-bigint` 0.7.10, the patched line (`>= 0.7.6`), so
+  `release.yml`'s audit gate passes. Pre-check locally with
+  `cargo deny check` (cargo-deny 0.20.2 prebuilt binary installed at
+  `~/.cargo/bin/cargo-deny`).
 - **`gh` resolves to the wrong remote.** This repository has two remotes, and the
   `gh` CLI defaults to `h4ckf0r0day/obscura`, not the fork. Every `gh` command must
   carry `-R Lawlietr/obscura-cjk`. Without it, `gh run list` shows upstream's runs

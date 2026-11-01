@@ -5,32 +5,41 @@ Obscura CJK fork (`Lawlietr/obscura-cjk`) 待辦追蹤。
 
 ## 待辦
 
-### 高優先級｜ECDSA P-256 已撤回，待 p256 0.14 遷移後帶回
+### 已完成｜ECDSA P-256 以 p256 0.14 帶回（2026-11-01）
 
-- [ ] 2026-11-01：upstream PR #1308 以 cherry-pick 進入 fork（`c7f7be9`）之後，
-      `v0.4.0-cjk` 的 release workflow 被 `cargo deny check advisories` 擋下：
-      **RUSTSEC-2026-0387**（`crypto-bigint` 0.5.5，原本設計成 constant-time 的
-      運算改為依秘密值分支：減法、零位元計數、除法、Montgomery 乘法、
-      `UintRef` 比較、`BoxedMontyForm::invert`）。鏈路為 `p256` →
-      `elliptic-curve` 0.13.8 → `crypto-bigint` 0.5.5，由 `obscura-js` 的
-      WebCrypto P-256 路徑直接可達。advisory 只修補 `>= 0.7.6`，
-      0.5 線沒有可移植的修補版。
-- [ ] 撤回 commit：`a2159e9`（`git revert c7f7be9`）。撤回後 `Cargo.lock` 內的
-      `p256` / `elliptic-curve` / `crypto-bigint` 全部消失（grep = 0）；
-      `bootstrap.js` 回到只剩兩處既有的 `"ECDSA"` 正規化字串，與 `v0.3.0-cjk`
-      完全相同。
-- [ ] 帶回的做法（已查證）：改用 `p256 = "0.14"`。查 crates.io index 結果：
-      `elliptic-curve 0.14.3` 的依賴清單已不含 `crypto-bigint`（改使用 `bigint`），
-      連帶需要 `ecdsa-core ^0.17`、`primeorder ^0.14`、`sha2 ^0.11`、
-      `serdect ^0.4`。要改 `ops.rs` 的 EC 輔助層（`SecretKey::from_bytes` 與
-      `from_slice`、`PrivateKeyInfo`、`AssociatedOid`、pkcs8 的讀寫、`ecdsa` 的
-      `PrehashSigner` 與 `PrehashVerifier`）以及 `webcrypto_tests.rs`。
-- [ ] upstream #1308 目前仍是 OPEN（最後更新 2026-10-25），仍使用 0.13 線；
-      upstream main 不含 `p256`，所以 upstream 自己的 audit 碰不到這條。若未來
-      同步時 upstream 帶入未修補的 `p256`，同一條 advisory 會在我們這邊再度失敗，
-      屆時優先處理。
-- [ ] 驗證提醒：本機未安裝 `cargo-deny`，改完依賴後只能靠 CI 的 audit job，
-      或先 `cargo install cargo-deny` 再本地預驗。
+- [x] 做法：`git revert a2159e9` 先把 upstream PR #1308 的原始 commit 帶回
+      （fork 的 `90e1607`，保留 upstream 作者資訊），再把 `p256` 從 0.13 升到
+      0.14遷移 commit 是 fork 的 `649e381`
+      “fix(js): move the ECDSA stack to p256 0.14 so the release audit passes”。
+- [x] elliptic-curve 0.14 的三處 API 差異（都在 `crates/obscura-js/src/ops.rs`）：
+      `ToEncodedPoint` / `to_encoded_point` 改名為 `ToSec1Point` /
+      `to_sec1_point`（舊名還在，但只是 deprecation 轉接）；
+      `SecretKey::from_bytes(&FieldBytes)` 只剩 `from_slice(&[u8])`，長度與
+      scalar 範圍檢查相同；pkcs8 0.11 把 `PrivateKeyInfo` 變成三個型別參數，
+      借用形式是 `PrivateKeyInfoRef`，而且 `private_key` 變成 `OctetStringRef`
+      （要 `.as_bytes()`）。曲線檢查沒有變弱：
+      `TryFrom<PrivateKeyInfoRef>` 仍會驗證 AlgorithmIdentifier 的
+      `id-ecPublicKey` 與曲線 OID 這一對。
+- [x] 事實修正：`p256 0.14` **仍然**帶 `crypto-bigint`，但解析到 **0.7.10**，
+      也就是 RUSTSEC-2026-0387 的已修補線（advisory 的 `patched = [">= 0.7.6"]`，
+      見 RustSec advisory-db 的 `crates/crypto-bigint/RUSTSEC-2026-0387.md`）。
+      「0.14 的依賴清單已不含 crypto-bigint」是錯的推測，正確理由是版本落在
+      修補線。因此不該用 deny.toml 的 ignore 清單因應，而是把依賴升到修補線。
+- [x] 依賴範圍控制：只讓 29 個套件變動，全部在 RustCrypto 的 EC 堆疊
+      （`p256`、`elliptic-curve`、`ecdsa`、`signature`、`der`、`pkcs8`、`sec1`、
+      `spki`、`primeorder`、`rfc6979`、`base16ct`、`const-oid`、`crypto-bigint`，
+      另有 `digest` / `sha2` / `hmac` / `block-buffer` / `crypto-common` /
+      `cpufeatures` 因為 p256 拉新 digest 堆疊而出現 0.10 與 0.11 並存；
+      `deny.toml` 的 `multiple-versions = "warn"` 不會擋）。
+- [x] 驗證：`cargo deny check` exit 0（advisories、bans、licenses、sources 四項全過，
+      只有 duplicate 的 warning）；`cargo nextest run --release --features render,cjk`
+      2505 passed / 0 failed / 5 skipped（含 RFC 6979 向量、SPKI/PKCS#8/raw 往返與
+      壞 key 拒絕）；障礙課程 33/33（median 3040.1 ms）；頁內實測
+      `sigBytes=64`、篡改驗證 false、`spki=91`、`pkcs8=138`、pkcs8 匯入後交叉驗證
+      true、JWK 帶 `d`。
+- [x] 本機已安裝 `cargo-deny 0.20.2`（prebuilt musl build，在
+      `~/.cargo/bin/cargo-deny`），推 tag 前可先 `cargo deny check` 預驗，省一次
+      CI 往返。
 
 ### 中優先級｜cjk-stealth smoke test
 
