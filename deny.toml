@@ -37,6 +37,12 @@ allow = [
 ]
 confidence-threshold = 0.8
 
+# jpeg-encoder ports libjpeg code and carries the Independent JPEG Group
+# license in addition to MIT OR Apache-2.0. Allow IJG for that crate only.
+[[licenses.exceptions]]
+allow = ["IJG"]
+crate = "jpeg-encoder"
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

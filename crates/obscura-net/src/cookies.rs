@@ -149,7 +149,7 @@ impl CookieJar {
             None => return,
         };
 
-        let source_is_secure = url.scheme() == "https";
+        let source_is_secure = is_secure_cookie_context(url);
         if (secure && !source_is_secure) || (same_site == "None" && !secure) {
             return;
         }
@@ -203,7 +203,7 @@ impl CookieJar {
     pub fn get_cookie_header_in_context(&self, url: &Url, context: SameSiteContext) -> String {
         let host = url.host_str().unwrap_or("");
         let path = url.path();
-        let is_secure = url.scheme() == "https";
+        let is_secure = is_secure_cookie_context(url);
         let cookies = self.read_jar();
         if cookies.is_empty() {
             return String::new();
@@ -362,7 +362,7 @@ impl CookieJar {
     pub fn get_js_visible_cookies(&self, url: &Url) -> String {
         let host = url.host_str().unwrap_or("");
         let path = url.path();
-        let is_secure = url.scheme() == "https";
+        let is_secure = is_secure_cookie_context(url);
         let cookies = self.read_jar();
 
         let now = std::time::SystemTime::now()
@@ -469,7 +469,7 @@ impl CookieJar {
             None => return,
         };
 
-        let source_is_secure = url.scheme() == "https";
+        let source_is_secure = is_secure_cookie_context(url);
         if (secure && !source_is_secure) || (same_site == "None" && !secure) {
             return;
         }
@@ -755,6 +755,29 @@ fn cookie_prefix_allows(name: &str, secure: bool, has_domain_attr: bool, path: O
 
 fn is_public_suffix(domain: &str) -> bool {
     psl::suffix_str(domain).is_some_and(|suffix| suffix.eq_ignore_ascii_case(domain))
+}
+
+/// Chromium treats HTTP loopback origins as secure for cookie purposes. Keep
+/// the exception host-scoped so ordinary cleartext origins still cannot set,
+/// read, or send `Secure` cookies.
+fn is_secure_cookie_context(url: &Url) -> bool {
+    if url.scheme() == "https" {
+        return true;
+    }
+    if url.scheme() != "http" {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Domain(host)) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .get(host.len().saturating_sub(".localhost".len())..)
+                    .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".localhost"))
+        }
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
 }
 
 /// RFC 6265bis secure-overlay protection: an insecure response must not replace
@@ -1066,6 +1089,28 @@ mod tests {
         let http_url = Url::parse("http://example.com/").unwrap();
         let header = jar.get_cookie_header_same_site(&http_url);
         assert!(header.is_empty());
+    }
+
+    #[test]
+    fn secure_cookies_work_on_http_loopback_origins() {
+        for origin in [
+            "http://localhost/",
+            "http://app.localhost/",
+            "http://127.0.0.1/",
+            "http://[::1]/",
+        ] {
+            let url = Url::parse(origin).unwrap();
+
+            let response_jar = CookieJar::new();
+            response_jar.set_cookie("server=1; Secure; Path=/", &url);
+            assert_eq!(response_jar.get_cookie_header_same_site(&url), "server=1");
+            assert_eq!(response_jar.get_js_visible_cookies(&url), "server=1");
+
+            let script_jar = CookieJar::new();
+            script_jar.set_cookie_from_js("script=1; Secure; Path=/", &url);
+            assert_eq!(script_jar.get_cookie_header_same_site(&url), "script=1");
+            assert_eq!(script_jar.get_js_visible_cookies(&url), "script=1");
+        }
     }
 
     #[test]

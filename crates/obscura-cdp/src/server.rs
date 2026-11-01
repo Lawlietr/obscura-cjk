@@ -4,9 +4,10 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::net::TcpStream;
@@ -21,6 +22,13 @@ use crate::dispatch::{self, CdpContext};
 // must be bounded so a stalled navigation cannot OOM the process. When the cap
 // is reached we return an explicit error response rather than silently dropping.
 const MAX_DEFERRED_MESSAGES: usize = 256;
+
+struct PendingRuntimeReply {
+    id: u64,
+    session_id: Option<String>,
+    reply_tx: mpsc::UnboundedSender<String>,
+    evaluation: crate::domains::runtime::DeferredEvaluation,
+}
 
 // The WS-stream forwarding channel must also be bounded: if the LocalSet
 // (CDP processor + nav tasks) stalls, the accept thread keeps pushing
@@ -522,7 +530,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
         storage_dir,
         allow_private_network,
     );
-    bctx.allow_file_access = allow_file_access;
+    bctx.set_allow_file_access(allow_file_access);
     let shared_ctx = Arc::new(bctx);
     // Persistence is deliberately separate from the connection template.
     // Cookie deltas are merged here, but new connections always clone the
@@ -653,7 +661,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
     }
-    persistence_ctx.save_cookies();
+    persistence_ctx.save_storage();
     Ok(())
 }
 
@@ -677,12 +685,11 @@ fn publish_ready_file(path: &Path, address: SocketAddr) -> anyhow::Result<()> {
         uuid::Uuid::new_v4()
     ));
     let result = (|| -> std::io::Result<()> {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true);
-        opts.create_new(true);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
-        opts.mode(0o600);
-        let mut file = opts.open(&temporary)?;
+        options.mode(0o600);
+        let mut file = options.open(&temporary)?;
         file.write_all(&record)?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)
@@ -723,13 +730,22 @@ fn publish_ready_file(path: &Path, address: SocketAddr) -> anyhow::Result<()> {
 fn cap_malloc_arenas() {
     #[cfg(target_env = "gnu")]
     {
+        // Pin the mmap threshold. glibc otherwise raises it (up to 32 MiB) each
+        // time a large mmapped block is freed, so later large buffers (response
+        // bodies, render surfaces, V8 backing stores) land in the arena and
+        // fragment it. Skipped when the operator tuned it.
+        if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none() {
+            const M_MMAP_THRESHOLD: libc::c_int = -3;
+            // SAFETY: mallopt is thread-safe; called once here before any
+            // connection thread exists.
+            unsafe { libc::mallopt(M_MMAP_THRESHOLD, 1 << 20) };
+        }
         if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
             return;
         }
         // M_ARENA_MAX is not exported by the libc crate.
         const M_ARENA_MAX: libc::c_int = -8;
-        // SAFETY: mallopt is thread-safe; called once here before any
-        // connection thread exists.
+        // SAFETY: as above.
         if unsafe { libc::mallopt(M_ARENA_MAX, 2) } != 1 {
             warn!("mallopt(M_ARENA_MAX) failed; memory will scale with peak concurrency");
         }
@@ -741,8 +757,9 @@ fn cap_malloc_arenas() {
 /// A connection owns its pages, DOMs, render buffers, and V8 isolates. Dropping
 /// those objects releases the allocations, but glibc normally keeps the freed
 /// pages mapped for reuse, so a server that becomes idle can retain its peak RSS
-/// indefinitely (#873). Trimming only when this is the final live connection
-/// avoids imposing a process-wide allocator pause on active clients.
+/// indefinitely (#873). Trimming is a process-wide allocator pause, so callers
+/// go through `release_connection_memory`, which rate-limits it while other
+/// connections are live.
 fn release_idle_connection_memory() {
     #[cfg(target_env = "gnu")]
     {
@@ -752,6 +769,31 @@ fn release_idle_connection_memory() {
             libc::malloc_trim(0);
         }
     }
+}
+
+/// Trim after a connection closes: always when it was the last one, otherwise
+/// at most every `BUSY_TRIM_INTERVAL_MS` so a busy worker (which never reaches
+/// zero connections) still returns the closed connection's free heap pages
+/// instead of holding its peak RSS for days.
+fn release_connection_memory(idle: bool) {
+    static LAST_TRIM_MS: AtomicU64 = AtomicU64::new(0);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1;
+    if claim_connection_memory_trim(&LAST_TRIM_MS, now, idle) {
+        release_idle_connection_memory();
+    }
+}
+
+fn claim_connection_memory_trim(last_trim: &AtomicU64, now: u64, idle: bool) -> bool {
+    const BUSY_TRIM_INTERVAL_MS: u64 = 5_000;
+    // Claim the interval atomically; a delayed closer cannot roll its timestamp back.
+    last_trim.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        if idle || last == 0 || now.saturating_sub(last) >= BUSY_TRIM_INTERVAL_MS {
+            Some(now.max(last))
+        } else {
+            None
+        }
+    }).is_ok()
 }
 
 /// Run each connection's `cdp_processor` (with its own `CdpContext` and pages)
@@ -855,17 +897,18 @@ fn run_connection(
             };
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                let mut processor = tokio::task::spawn_local(cdp_processor(
+                // Run the processor in the connection future. A self-waking
+                // LocalSet task can run 61 times before Tokio services I/O,
+                // starving fetch under a continuously ready page scheduler.
+                let processor = cdp_processor(
                     msg_rx, default_context, shutdown_notify,
-                ));
+                );
+                tokio::pin!(processor);
                 tokio::select! {
                     _ = &mut processor => {}
-                    _ = io_done_rx => {
-                        // A disconnected client must cancel an in-flight
-                        // navigation/evaluation rather than wait its deadline.
-                        processor.abort();
-                        let _ = processor.await;
-                    }
+                    // Dropping the processor cancels an in-flight command.
+                    // Detached navigation tasks are dropped with the LocalSet.
+                    _ = io_done_rx => {}
                 }
             });
             let _ = io_stop_tx.send(());
@@ -887,13 +930,12 @@ fn run_connection(
                     &initial_cookies,
                     &persisted_context.cookie_jar.get_all_cookies(),
                 );
-                persistence_context.save_cookies();
+                persistence_context.save_storage();
             }
 
             drop(persisted_context);
-            if slot_guard.release() == Some(0) {
-                release_idle_connection_memory();
-            }
+            let idle = slot_guard.release() == Some(0);
+            release_connection_memory(idle);
         });
 
     // The closure never ran, so its `SlotGuard` never existed: release the
@@ -1182,7 +1224,7 @@ async fn cdp_processor(
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
-    let mut intercepted_paused: HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>> = HashMap::new();
+    let mut intercepted_paused: HashMap<String, PausedIntercept> = HashMap::new();
 
     // Issue #19 follow-up: messages deferred from inside
     // `process_with_interception` because routing them through
@@ -1213,8 +1255,27 @@ async fn cdp_processor(
     let mut runtime_pump_armed = false;
     let mut runtime_pump_error_streak = 0_u8;
     let mut idle_pages = HashSet::new();
+    let mut pending_runtime = Vec::<PendingRuntimeReply>::new();
 
     loop {
+        let mut index = 0;
+        while index < pending_runtime.len() {
+            if !pending_runtime[index].evaluation.ready(&mut ctx) { index += 1; continue; }
+            let pending = pending_runtime.remove(index);
+            let _guard = ctx.v8_lock.clone().lock_owned().await;
+            let result = pending.evaluation.finish(&mut ctx, &pending.session_id).await;
+            idle_pages.clear();
+            runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
+            dispatch::drain_runtime_events(&mut ctx);
+            dispatch::drain_binding_calls(&mut ctx);
+            dispatch::drain_frame_events(&mut ctx);
+            forward_pending_events(&mut ctx, Some(&pending.reply_tx));
+            let response = match result {
+                Ok(value) => crate::types::CdpResponse::success(pending.id, value, pending.session_id),
+                Err(error) => crate::types::CdpResponse::error(pending.id, -32000, error, pending.session_id),
+            };
+            if let Ok(json) = serde_json::to_string(&response) { let _ = pending.reply_tx.send(json); }
+        }
         // Drain any deferred messages from the previous interception window
         // before pulling new ones off the wire. Each is processed with no
         // nav-task spawn_local in flight, so this connection's only entered
@@ -1224,6 +1285,7 @@ async fn cdp_processor(
         } else {
             let screencast_active = has_active_screencast(&ctx);
             let has_intercept_rx = intercept_rx.is_some();
+            let evaluation_deadline = pending_runtime.iter().map(|pending| pending.evaluation.deadline).min();
             tokio::select! {
                 biased;
                 msg = rx.recv() => match msg {
@@ -1234,6 +1296,12 @@ async fn cdp_processor(
                     tracing::info!("Shutdown signal received (connection processor)");
                     break;
                 },
+                _ = async {
+                    match evaluation_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => None,
                 pump_result = pump_live_page_event_loop(&mut ctx, &mut idle_pages), if runtime_pump_armed => {
                     match pump_result {
                         Ok(reached_idle) => {
@@ -1245,7 +1313,6 @@ async fn cdp_processor(
                             runtime_pump_armed = runtime_pump_error_streak <= 3
                                 && ctx.pages.iter().any(|page| page.has_js());
                             tracing::warn!("autonomous page task failed: {error}");
-                            tokio::task::yield_now().await;
                         }
                     }
                     service_live_page_render_resources(&mut ctx);
@@ -1279,6 +1346,9 @@ async fn cdp_processor(
                         idle_pages.clear();
                         runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
                     }
+                    // Ready page tasks must not keep this root future running
+                    // indefinitely while Tokio's network tasks wait to run.
+                    tokio::task::yield_now().await;
                     None
                 },
                 Some(intercepted) = async {
@@ -1289,10 +1359,14 @@ async fn cdp_processor(
                     }
                 }, if has_intercept_rx => {
                     if let Some(reply_tx) = connection_reply_tx.as_ref() {
+                        let route = pending_runtime.iter()
+                            .find(|pending| pending.evaluation.page_id == intercepted.page_id)
+                            .and_then(|pending| ctx.pages.iter().find(|page| page.id == intercepted.page_id)
+                                .map(|page| (page.id.as_str(), page.frame_id.as_str(), pending.session_id.clone())));
                         emit_intercepted_request(
                             intercepted,
                             &ctx,
-                            None,
+                            route,
                             reply_tx,
                             &mut intercepted_paused,
                         );
@@ -1350,12 +1424,11 @@ async fn cdp_processor(
                     let fetch_was_resolved = cdp_msg.text.contains("Fetch.")
                         && handle_fetch_resolution(
                             &cdp_msg.text,
-                            &mut ctx,
                             &cdp_msg.reply_tx,
                             &mut intercepted_paused,
                         );
                     if !fetch_was_resolved {
-                        process_cdp_message(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx).await;
+                        process_cdp_message_with_pending(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, Some(&mut pending_runtime)).await;
                     }
                 }
             }
@@ -1390,18 +1463,30 @@ async fn cdp_processor(
     let _ = &ctx;
 }
 
+struct PausedIntercept {
+    resolver: tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
+    main_document: bool,
+}
+
+// Native document requests use Page's page-id.counter namespace. Frame documents
+// fetched by JavaScript use fetch-N and must not become the top-level loader.
+fn is_main_document_intercept(request: &obscura_js::ops::InterceptedRequest, page_id: &str) -> bool {
+    request.page_id == page_id && request.resource_type == "Document"
+        && request.request_id.strip_prefix(page_id).is_some_and(|suffix| suffix.starts_with('.'))
+}
+
 fn emit_intercepted_request(
     intercepted: obscura_js::ops::InterceptedRequest,
     ctx: &CdpContext,
     navigating_page: Option<(&str, &str, Option<String>)>,
     reply_tx: &mpsc::UnboundedSender<String>,
-    intercepted_paused: &mut HashMap<
-        String,
-        tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
-    >,
+    intercepted_paused: &mut HashMap<String, PausedIntercept>,
 ) {
     // Navigation temporarily removes its Page from ctx. Other pages can still
     // have requests queued on the same channel, so never infer their owner.
+    let loader = navigating_page.as_ref()
+        .filter(|(page_id, _, _)| is_main_document_intercept(&intercepted, page_id))
+        .map(|_| intercepted.request_id.clone());
     let route = navigating_page
         .filter(|(page_id, _, _)| *page_id == intercepted.page_id)
         .map(|(_, frame_id, session_id)| (frame_id, session_id))
@@ -1410,6 +1495,20 @@ fn emit_intercepted_request(
             let (session_id, _) = ctx.sessions.iter().find(|(_, page_id)| **page_id == page.id)?;
             Some((page.frame_id.as_str(), Some(session_id.clone())))
         });
+    let observers = route.as_ref().map_or_else(Vec::new, |(_, session_id)| {
+        crate::domains::page::network_observer_sessions(ctx, &intercepted.page_id, session_id)
+    });
+    emit_routed_intercepted_request(intercepted, route, loader.as_deref(), &observers, reply_tx, intercepted_paused);
+}
+
+fn emit_routed_intercepted_request(
+    intercepted: obscura_js::ops::InterceptedRequest,
+    route: Option<(&str, Option<String>)>,
+    loader: Option<&str>,
+    observers: &[String],
+    reply_tx: &mpsc::UnboundedSender<String>,
+    intercepted_paused: &mut HashMap<String, PausedIntercept>,
+) {
     let Some((frame_id, session_id)) = route else {
         let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail {
             reason: "Aborted".into(),
@@ -1436,8 +1535,8 @@ fn emit_intercepted_request(
         "method": "Network.requestWillBeSent",
         "params": {
             "requestId": intercepted.request_id,
-            "loaderId": "",
-            "documentURL": "",
+            "loaderId": loader.unwrap_or(""),
+            "documentURL": if loader.is_some() { intercepted.url.as_str() } else { "" },
             "request": request,
             "timestamp": now,
             "wallTime": now,
@@ -1448,6 +1547,11 @@ fn emit_intercepted_request(
         "sessionId": session_id,
     });
     let _ = reply_tx.send(request_will_be_sent.to_string());
+    for observer in observers {
+        let mut event = request_will_be_sent.clone();
+        event["sessionId"] = json!(observer);
+        let _ = reply_tx.send(event.to_string());
+    }
 
     let request_paused = json!({
         "method": "Fetch.requestPaused",
@@ -1464,11 +1568,18 @@ fn emit_intercepted_request(
         "sessionId": session_id,
     });
     let _ = reply_tx.send(request_paused.to_string());
-    intercepted_paused.insert(intercepted.request_id, intercepted.resolver);
+    intercepted_paused.insert(intercepted.request_id, PausedIntercept {resolver: intercepted.resolver, main_document: loader.is_some()});
 }
 
 async fn pump_live_page_event_loop(
     ctx: &mut CdpContext,
+    idle_pages: &mut HashSet<String>,
+) -> Result<bool, String> {
+    pump_page_event_loops(ctx.pages.iter_mut(), idle_pages).await
+}
+
+pub(crate) async fn pump_page_event_loops<'a>(
+    pages: impl Iterator<Item = &'a mut obscura_browser::Page>,
     idle_pages: &mut HashSet<String>,
 ) -> Result<bool, String> {
     use std::future::Future;
@@ -1479,9 +1590,11 @@ async fn pump_live_page_event_loop(
     // A completed turn can emit events even when it leaves its page idle.
     // Publish it now, then omit idle pages until a command schedules new work;
     // otherwise an idle peer would keep a waiting connection spinning.
-    let mut turns: Vec<_> = ctx.pages.iter_mut()
-        .filter(|page| page.has_js() && !idle_pages.contains(&page.id))
-        .map(|page| (page.id.clone(), Box::pin(page.run_autonomous_event_loop_turn())))
+    let mut turns: Vec<_> = pages.filter_map(|page| {
+            if page.has_pending_indexed_db_notifications() { idle_pages.remove(&page.id); }
+            if !page.has_js() || idle_pages.contains(&page.id) { return None; }
+            Some((page.id.clone(), Box::pin(page.run_autonomous_event_loop_turn())))
+        })
         .collect();
     std::future::poll_fn(|cx| {
         let mut all_idle = true;
@@ -1660,52 +1773,97 @@ pub(crate) fn parse_cdp_headers(params: &serde_json::Value) -> Option<HashMap<St
 
 fn handle_fetch_resolution(
     text: &str,
-    _ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    intercepted_paused: &mut HashMap<String, PausedIntercept>,
 ) -> bool {
     if let Ok(req) = serde_json::from_str::<CdpRequest>(text) {
         let method = req.method.as_str();
+        if !matches!(method, "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest") {
+            return false;
+        }
         let request_id = req.params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
         tracing::info!("INTERCEPTION resolution: {} for {}, paused_count={}", method, request_id, intercepted_paused.len());
 
-        if let Some(resolver) = intercepted_paused.remove(request_id) {
+        if intercepted_paused.contains_key(request_id) {
             tracing::info!("INTERCEPTION resolved: {}", request_id);
+            // Build the resolution before taking the pause. A malformed command
+            // is answered with an error and the request stays paused, so a
+            // corrected answer on the same requestId still drives the fetch --
+            // taking the pause first would wedge the request on a client typo.
             let resolution = match method {
-                "Fetch.continueRequest" => obscura_js::ops::InterceptResolution::Continue {
+                "Fetch.continueRequest" => {
                     // Honor the client's overrides (Playwright route.continue,
                     // Puppeteer request.continue). op_fetch_url applies each and
                     // re-validates a rewritten URL through the SSRF gate. Leaving
                     // these None silently sent the request unmodified (issue #365).
-                    url: req.params.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    method: req.params.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    headers: parse_cdp_headers(&req.params),
-                    body: req.params.get("postData").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                },
+                    match decode_optional_binary(&req.params, "postData", "continueRequest postData") {
+                        Ok(body) => Ok(obscura_js::ops::InterceptResolution::Continue {
+                            url: req.params.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            method: req.params.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            headers: parse_cdp_headers(&req.params),
+                            body,
+                        }),
+                        Err(message) => Err(message),
+                    }
+                }
                 "Fetch.fulfillRequest" => {
                     let status = req.params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
                     let raw_body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
-                    // `body` is a lossy text view; `body_base64` carries the CDP
-                    // body (already base64) through unchanged so op_fetch_url can
-                    // hand JS the exact bytes for a binary fulfill (#912).
-                    let body = decode_base64(raw_body);
-                    let body_base64 = raw_body.to_string();
-                    let headers = req.params.get("responseHeaders")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|h| {
-                            Some((h.get("name")?.as_str()?.to_string(), h.get("value")?.as_str()?.to_string()))
-                        }).collect())
-                        .unwrap_or_default();
-                    obscura_js::ops::InterceptResolution::Fulfill { status, headers, body, body_base64 }
+                    let mut headers = HashMap::new();
+                    if let Some(arr) = req.params.get("responseHeaders").and_then(|value| value.as_array()) {
+                        for header in arr {
+                            let (Some(name), Some(value)) = (header.get("name").and_then(|v| v.as_str()), header.get("value").and_then(|v| v.as_str())) else { continue; };
+                            if name.eq_ignore_ascii_case("set-cookie") {
+                                headers.entry("set-cookie".into()).and_modify(|cookies: &mut String| {
+                                    cookies.push('\n'); cookies.push_str(value);
+                                }).or_insert_with(|| value.to_string());
+                            } else { headers.insert(name.to_string(), value.to_string()); }
+                        }
+                    }
+                    // Validate before consuming the pause; keep exact bytes for JS.
+                    match decode_optional_binary(&req.params, "body", "fulfillRequest body") {
+                        Ok(bytes) => Ok(obscura_js::ops::InterceptResolution::Fulfill {
+                            status,
+                            headers,
+                            body: String::from_utf8_lossy(&bytes.unwrap_or_default()).to_string(),
+                            body_base64: raw_body.to_string(),
+                        }),
+                        Err(message) => Err(message),
+                    }
                 }
                 "Fetch.failRequest" => {
                     let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string();
-                    obscura_js::ops::InterceptResolution::Fail { reason }
+                    Ok(obscura_js::ops::InterceptResolution::Fail { reason })
                 }
                 _ => return false,
             };
-            let _ = resolver.send(resolution);
-            let resp = crate::types::CdpResponse::success(req.id, json!({}), req.session_id);
+            let resp = match resolution {
+                Ok(resolution) => {
+                    let resolver = intercepted_paused
+                        .remove(request_id)
+                        .expect("the pause was present a few lines above and nothing else can take it");
+                    let main_document = resolver.main_document;
+                    if resolver.resolver.send(resolution).is_ok() && method == "Fetch.failRequest" && !main_document {
+                        let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed");
+                        let mut error_text = String::from("net::ERR_");
+                        for (index, ch) in reason.chars().enumerate() {
+                            if index > 0 && ch.is_ascii_uppercase() { error_text.push('_'); }
+                            error_text.push(ch.to_ascii_uppercase());
+                        }
+                        let _ = reply_tx.send(json!({
+                            "method": "Network.loadingFailed", "sessionId": req.session_id,
+                            "params": {"requestId": request_id, "type": "Fetch", "errorText": error_text,
+                                "canceled": reason == "Aborted",
+                                "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default().as_secs_f64()},
+                        }).to_string());
+                    }
+                    crate::types::CdpResponse::success(req.id, json!({}), req.session_id)
+                }
+                // -32602 is the invalid-params code; the pause is deliberately left
+                // in place so the client can answer this requestId again.
+                Err(message) => crate::types::CdpResponse::error(req.id, -32602, message, req.session_id),
+            };
             if let Ok(json) = serde_json::to_string(&resp) {
                 let _ = reply_tx.send(json);
             }
@@ -1721,7 +1879,7 @@ async fn process_with_interception(
     reply_tx: &mpsc::UnboundedSender<String>,
     rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
     intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    intercepted_paused: &mut HashMap<String, PausedIntercept>,
     deferred: &mut std::collections::VecDeque<ServerMessage>,
     send_command_response: bool,
 ) {
@@ -1788,7 +1946,7 @@ async fn process_with_interception(
     let nav_method = req.params.get("__method").and_then(|v| v.as_str()).unwrap_or("GET").to_string();
     let nav_body = req.params.get("__body").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-    let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
+    let preload_scripts = ctx.preload_sources_for_page(&page_id);
 
     if let Some(tx) = &ctx.intercept_tx {
         page.set_intercept_tx(tx.clone());
@@ -1796,9 +1954,17 @@ async fn process_with_interception(
 
     let session_for_events = req.session_id.clone();
     let frame_id = page.frame_id.clone();
-    let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+    let initial_loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+    let mut loader_id = initial_loader_id.clone();
+    let mut document_request_started = false;
 
-    let (nav_done_tx, mut nav_done_rx) = mpsc::channel::<(obscura_browser::Page, Result<(), String>)>(1);
+    let previous_url = page.url.clone();
+    let previous_lifecycle = page.lifecycle;
+    let navigation_url = url_owned.clone();
+    let navigation_method = nav_method.clone();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let mut cancel_tx = Some(cancel_tx);
+    let (nav_done_tx, mut nav_done_rx) = mpsc::channel::<(obscura_browser::Page, Result<(), String>, bool)>(1);
     let nav_v8_lock = ctx.v8_lock.clone();
 
     tokio::task::spawn_local(async move {
@@ -1812,20 +1978,25 @@ async fn process_with_interception(
         // must run BEFORE the page's own scripts (CDP contract). Hand them
         // to the page so navigate_single can inject them at the right point.
         page.set_preload_scripts(preload_scripts);
-        let result = if !send_command_response {
-            page.navigate_from_document(&url_owned, &nav_method, &nav_body).await
-        } else if nav_method == "POST" && !nav_body.is_empty() {
-            page.navigate_with_wait_post(&url_owned, wait_until, &nav_method, &nav_body).await
-        } else {
-            page.navigate_with_wait(&url_owned, wait_until).await
-        }
-        .map_err(|e| e.to_string());
+        let (result, cancelled) = tokio::select! {
+            result = async {
+                if !send_command_response {
+                    page.navigate_from_document(&url_owned, &nav_method, &nav_body).await
+                } else if nav_method == "POST" && !nav_body.is_empty() {
+                    page.navigate_with_wait_post(&url_owned, wait_until, &nav_method, &nav_body).await
+                } else {
+                    page.navigate_with_wait(&url_owned, wait_until).await
+                }
+            } => (result.map_err(|e| e.to_string()), false),
+            _ = cancel_rx => (Err("net::ERR_ABORTED".into()), true),
+        };
         drop(_v8_guard);
-        let _ = nav_done_tx.send((page, result)).await;
+        let _ = nav_done_tx.send((page, result, cancelled)).await;
     });
 
     let navigate_result: Result<(), String>;
     let page_back: Option<obscura_browser::Page>;
+    let cancelled: bool;
 
     // Issue #19 follow-up (PR #36 maintainer's fetch-intercept repro):
     // While the spawned nav task is executing V8 (potentially parked on
@@ -1851,9 +2022,10 @@ async fn process_with_interception(
         let has_irx = intercept_rx.is_some();
 
         tokio::select! {
-            Some((returned_page, result)) = nav_done_rx.recv() => {
+            Some((returned_page, result, was_cancelled)) = nav_done_rx.recv() => {
                 page_back = Some(returned_page);
                 navigate_result = result;
+                cancelled = was_cancelled;
                 break;
             }
             Some(intercepted) = async {
@@ -1863,6 +2035,10 @@ async fn process_with_interception(
                     std::future::pending().await
                 }
             }, if has_irx => {
+                if is_main_document_intercept(&intercepted, &page_id) {
+                    loader_id = intercepted.request_id.clone();
+                    document_request_started = true;
+                }
                 emit_intercepted_request(
                     intercepted,
                     ctx,
@@ -1882,6 +2058,22 @@ async fn process_with_interception(
                         let _ = new_tx.send(json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string());
                     }
                     ServerMessage::Cdp(msg) => {
+                        if let Ok(command) = serde_json::from_str::<CdpRequest>(&msg.text) {
+                            let same_page = command.session_id.as_ref()
+                                .and_then(|session| ctx.sessions.get(session)) == Some(&page_id);
+                            let stop = command.method == "Page.stopLoading" && same_page;
+                            let close = (command.method == "Page.close" && same_page)
+                                || (command.method == "Target.closeTarget"
+                                    && command.params.get("targetId").and_then(|id| id.as_str()) == Some(page_id.as_str()));
+                            if stop || close {
+                                if let Some(cancel) = cancel_tx.take() { let _ = cancel.send(()); }
+                                if stop {
+                                    let response = crate::types::CdpResponse::success(command.id, json!({}), command.session_id);
+                                    if let Ok(json) = serde_json::to_string(&response) { let _ = msg.reply_tx.send(json); }
+                                    continue;
+                                }
+                            }
+                        }
                         if msg.text.contains("Fetch.continueRequest")
                             || msg.text.contains("Fetch.fulfillRequest")
                             || msg.text.contains("Fetch.failRequest")
@@ -1890,7 +2082,7 @@ async fn process_with_interception(
                             // op inside the spawned nav task. No V8 enter on
                             // this side; the actual V8 work happens back on
                             // the nav task's thread.
-                            handle_fetch_resolution(&msg.text, ctx, &msg.reply_tx, intercepted_paused);
+                            handle_fetch_resolution(&msg.text, &msg.reply_tx, intercepted_paused);
                         } else {
                             // UNSAFE during nav: would route through dispatch,
                             // which can `suspend_js` other pages and trip the
@@ -1926,28 +2118,53 @@ async fn process_with_interception(
     // (it drains `deferred` before pulling the next message off `rx`).
 
     let mut page = page_back.expect("navigation task should return the page");
+    let committed = page.network_events.iter().any(|event| event.resource_type == "Document")
+        || page.js.as_ref().is_some_and(|js| previous_url.as_ref().is_some_and(|url| js.document_url() != url.as_str()));
+    if cancelled {
+        page.stop_loading();
+        if committed {
+            page.lifecycle = obscura_browser::LifecycleState::Failed;
+            page.push_history(page.url_string());
+        } else {
+            page.url = previous_url;
+            page.lifecycle = previous_lifecycle;
+        }
+        intercepted_paused.retain(|_, paused| !paused.resolver.is_closed());
+    }
 
     // Fold in network events for script-initiated requests (fetch/XHR/dynamic
     // resource) so they emit as Network.requestWillBeSent / responseReceived
     // alongside the static navigation subresources (#406).
     page.sync_js_network_events();
     let network_events: Vec<_> = page.network_events.drain(..).collect();
+    let failed_document = if document_request_started && navigate_result.is_err()
+        && !network_events.iter().any(|event| event.request_id == loader_id && event.resource_type == "Document") {
+        Some(loader_id.clone())
+    } else { None };
+    let navigation_error = navigate_result.as_ref().err().cloned();
     let page_url = page.url_string();
+    loader_id = network_events.iter().rev().find(|event| event.resource_type == "Document" && event.url == page_url
+        && event.request_id.strip_prefix(&page_id).is_some_and(|suffix| suffix.starts_with('.')))
+        .map(|event| if event.intercepted { event.request_id.clone() } else { initial_loader_id.clone() })
+        .unwrap_or_else(|| failed_document.clone().unwrap_or(initial_loader_id));
     let page_id_for_events = page.id.clone();
     let reached_network_idle = page.lifecycle.is_network_idle();
 
     ctx.pages.push(page);
 
-    #[cfg(feature = "render")]
-    let navigation_succeeded = navigate_result.is_ok();
-    let response = match navigate_result {
+    let response = if cancelled {
+        crate::types::CdpResponse::success(req.id,
+            if is_reload { json!({}) } else if committed { json!({"frameId": frame_id, "loaderId": loader_id}) }
+            else { json!({"frameId": frame_id, "loaderId": loader_id, "errorText": "net::ERR_ABORTED"}) },
+            req.session_id.clone())
+    } else { match navigate_result {
         Ok(()) => crate::types::CdpResponse::success(
             req.id,
             if is_reload { json!({}) } else { json!({"frameId": frame_id, "loaderId": loader_id}) },
             req.session_id.clone(),
         ),
         Err(e) => crate::types::CdpResponse::error(req.id, -32000, e, req.session_id.clone()),
-    };
+    }};
 
     if send_command_response {
         if let Ok(json) = serde_json::to_string(&response) {
@@ -1960,20 +2177,28 @@ async fn process_with_interception(
     // makes `page.goto()` resolve to a Response, and the #192 per-isolated-
     // world fresh context ids. Pushes to `ctx.pending_events`; we then drain
     // to the WS reply channel.
-    crate::domains::page::emit_navigation_events(
-        ctx,
-        &session_for_events,
-        &frame_id,
-        &loader_id,
-        &page_url,
-        &page_id_for_events,
-        &network_events,
-        wait_until,
-        reached_network_idle,
-    );
-    #[cfg(feature = "render")]
-    if navigation_succeeded {
-        crate::domains::page::schedule_screencast_frame(ctx, &session_for_events);
+    if !(cancelled && !committed) {
+        if let (Some(request_id), Some(error)) = (&failed_document, &navigation_error) {
+            let error = error.strip_prefix("Network error: ").unwrap_or(error);
+            let error_text = if error.starts_with("net::ERR_") { error } else { "net::ERR_FAILED" };
+            crate::domains::page::emit_navigation_failure(ctx, &session_for_events, request_id, &page_id_for_events, error_text);
+        }
+    }
+    if cancelled && !committed {
+        crate::domains::page::emit_aborted_navigation(ctx, &session_for_events, &frame_id,
+            &loader_id, &navigation_url, &navigation_method, &page_id_for_events, document_request_started);
+    } else {
+        crate::domains::page::emit_navigation_events(
+            ctx,
+            &session_for_events,
+            &frame_id,
+            &loader_id,
+            &page_url,
+            &page_id_for_events,
+            &network_events,
+            wait_until,
+            reached_network_idle,
+        );
     }
     for event in ctx.pending_events.drain(..) {
         if let Ok(json) = serde_json::to_string(&event) {
@@ -1987,6 +2212,15 @@ async fn process_cdp_message(
     ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
 ) {
+    process_cdp_message_with_pending(text, ctx, reply_tx, None).await;
+}
+
+async fn process_cdp_message_with_pending(
+    text: &str,
+    ctx: &mut CdpContext,
+    reply_tx: &mpsc::UnboundedSender<String>,
+    pending_runtime: Option<&mut Vec<PendingRuntimeReply>>,
+) {
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
         Err(e) => {
@@ -1998,7 +2232,16 @@ async fn process_cdp_message(
     tracing::debug!("CDP: {} (id={}, s={:?})", req.method, req.id, req.session_id);
 
     service_live_page_render_resources(ctx);
-    let response = dispatch::dispatch(&req, ctx).await;
+    let mut evaluation = None;
+    let is_awaited = matches!(req.method.as_str(), "Runtime.evaluate" | "Runtime.callFunctionOn")
+        && req.params.get("awaitPromise").and_then(|value| value.as_bool()) == Some(true);
+    let response = if pending_runtime.as_ref().is_some_and(|pending| pending.len() >= MAX_DEFERRED_MESSAGES) && is_awaited {
+        crate::types::CdpResponse::error(req.id, -32000, "Too many pending evaluations".into(), req.session_id.clone())
+    } else if pending_runtime.is_some() {
+        dispatch::dispatch_with_deferred(&req, ctx, Some(&mut evaluation)).await
+    } else {
+        dispatch::dispatch(&req, ctx).await
+    };
     service_live_page_render_resources(ctx);
 
     // Chromium CDP semantics: events emitted as a side-effect of a command
@@ -2013,37 +2256,47 @@ async fn process_cdp_message(
         }
     }
 
-    if let Ok(json) = serde_json::to_string(&response) {
-        let _ = reply_tx.send(json);
+    if let (Some(evaluation), Some(pending)) = (evaluation, pending_runtime) {
+        pending.push(PendingRuntimeReply {
+            id: req.id, session_id: req.session_id, reply_tx: reply_tx.clone(), evaluation,
+        });
+    } else {
+        if let Ok(json) = serde_json::to_string(&response) { let _ = reply_tx.send(json); }
     }
 
 }
 
+/// Lossy text view of a base64 CDP field, for the two callers that serve it
+/// as a string. `decode_base64_bytes` is the decoder; this only flattens its
+/// result the way those call sites already expect.
 pub(crate) fn decode_base64(input: &str) -> String {
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
+    String::from_utf8_lossy(&decode_base64_bytes(input).unwrap_or_default()).to_string()
+}
+
+/// Read an optional CDP `binary` parameter as the bytes it encodes.
+///
+/// `Ok(None)` means the field was absent, which is "leave this alone" rather
+/// than "make it empty". An unparseable value is an error rather than a
+/// best-effort decode: base64 that is not base64 is a client mistake, and
+/// answering it silently is what let a raw-text `postData` reach the wire as
+/// mangled bytes with nothing anywhere saying so.
+pub(crate) fn decode_optional_binary(
+    params: &serde_json::Value,
+    field: &str,
+    what: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(value) = params.get(field) else {
+        return Ok(None);
+    };
+    let raw = value.as_str().ok_or_else(|| format!("{what} must be a base64 string"))?;
+    match decode_base64_bytes(raw) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(why) => Err(format!("{what} is not valid base64: {why}")),
     }
-    let bytes: Vec<u8> = input.bytes().filter_map(val).collect();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        let b = [
-            chunk.first().copied().unwrap_or(0),
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-            chunk.get(3).copied().unwrap_or(0),
-        ];
-        out.push((b[0] << 2) | (b[1] >> 4));
-        if chunk.len() > 2 { out.push((b[1] << 4) | (b[2] >> 2)); }
-        if chunk.len() > 3 { out.push((b[2] << 6) | b[3]); }
-    }
-    String::from_utf8_lossy(&out).to_string()
+}
+
+fn decode_base64_bytes(input: &str) -> Result<Vec<u8>, String> {
+    BASE64.decode(input).map_err(|error| error.to_string())
 }
 
 fn fast_path_response(text: &str) -> Option<String> {
@@ -2175,6 +2428,105 @@ mod tests {
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn connection_memory_trim_preserves_interval_and_idle_behavior() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let last = AtomicU64::new(0);
+        for (now, idle, expected, timestamp) in [
+            (100, false, true, 100),
+            (100, false, false, 100),
+            (5_099, false, false, 100),
+            (5_100, false, true, 5_100),
+            (5_101, true, true, 5_101),
+            (100, true, true, 5_101),
+            (5_102, false, false, 5_101),
+        ] {
+            assert_eq!(super::claim_connection_memory_trim(&last, now, idle), expected);
+            assert_eq!(last.load(Ordering::Relaxed), timestamp);
+        }
+    }
+
+    #[test]
+    fn busy_connection_memory_trim_has_one_winner_per_interval() {
+        use std::sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Barrier};
+        let last = AtomicU64::new(0);
+        let winners = AtomicUsize::new(0);
+        let barrier = Barrier::new(16);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    for round in 1..=2_000 {
+                        barrier.wait();
+                        if super::claim_connection_memory_trim(&last, round * 5_000, false) {
+                            winners.fetch_add(1, Ordering::Relaxed);
+                        }
+                        barrier.wait();
+                    }
+                });
+            }
+        });
+        assert_eq!(winners.load(Ordering::Relaxed), 2_000);
+    }
+
+    #[test]
+    fn intercepted_request_is_observable_without_sharing_fetch_control() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let page = ctx.create_page();
+        let other = ctx.create_page();
+        ctx.sessions.insert("driver".into(), page.clone());
+        ctx.sessions.insert("observer".into(), page.clone());
+        ctx.sessions.insert("unrelated".into(), other);
+        let (resolver, _resolution) = tokio::sync::oneshot::channel();
+        let intercepted = obscura_js::ops::InterceptedRequest {
+            request_id: "fetch-1".into(), page_id: page.clone(), url: "https://example.test/data".into(),
+            method: "GET".into(), headers: Default::default(), resource_type: "Fetch".into(), resolver,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut paused = HashMap::new();
+        super::emit_intercepted_request(intercepted, &ctx, Some((&page, "frame-1", Some("driver".into()))), &tx, &mut paused);
+        let driver: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        let observer: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        let pause: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(driver["method"], "Network.requestWillBeSent");
+        assert_eq!(observer["method"], driver["method"]);
+        assert_eq!(observer["params"], driver["params"]);
+        assert_eq!(observer["sessionId"], "observer");
+        assert_eq!(pause["method"], "Fetch.requestPaused");
+        assert_eq!(pause["sessionId"], "driver");
+        assert_eq!(paused.len(), 1);
+        assert!(paused.contains_key("fetch-1"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn intercepted_documents_keep_their_own_loader_and_page_identity() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let navigating = ctx.create_page();
+        let other = ctx.create_page();
+        ctx.sessions.insert("driver".into(), navigating.clone());
+        ctx.sessions.insert("other-driver".into(), other.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut paused = HashMap::new();
+        let navigation_id = format!("{navigating}.1");
+        let other_id = format!("{other}.1");
+        for (page, request_id, expected_loader) in [(&navigating, navigation_id.as_str(), navigation_id.as_str()),
+            (&other, other_id.as_str(), ""), (&navigating, "fetch-iframe", "")] {
+            let (resolver, _resolution) = tokio::sync::oneshot::channel();
+            let intercepted = obscura_js::ops::InterceptedRequest {
+                request_id: request_id.into(), page_id: page.clone(), url: "http://example.test/".into(),
+                method: "GET".into(), headers: Default::default(), resource_type: "Document".into(), resolver,
+            };
+            super::emit_intercepted_request(intercepted, &ctx,
+                Some((&navigating, "frame-nav", Some("driver".into()))), &tx, &mut paused);
+            let request: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            let pause: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(request["params"]["requestId"], request_id);
+            assert_eq!(request["params"]["loaderId"], expected_loader);
+            assert_eq!(pause["params"]["networkId"], request_id);
+        }
+        assert_eq!(paused.len(), 3);
+    }
 
     #[test]
     fn lifecycle_subscription_commands_reach_the_stateful_dispatcher() {
@@ -2347,6 +2699,118 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.expect("connection and I/O threads must stop on socket close");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_fetch_progresses_during_continuously_ready_page_tasks() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::time::{Duration, Instant};
+        use tokio_tungstenite::tungstenite::Message;
+
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/hydrate", http.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for _ in 0..3 {
+                let (mut stream, _) = http.accept().unwrap();
+                let mut request = [0u8; 2048];
+                stream.read(&mut request).unwrap();
+                std::thread::sleep(Duration::from_millis(20));
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\nhydrated").unwrap();
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let live = Arc::new(AtomicUsize::new(1));
+        let live_server = live.clone();
+        let accept = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let context = crate::dispatch::CdpContext::new().default_context;
+            super::run_connection(stream.into_std().unwrap(), context.clone(), context,
+                Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server);
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}/devtools/browser")).await.unwrap();
+        accept.await.unwrap();
+        ws.send(Message::Text(json!({"id":1,"method":"Target.createTarget","params":{"url":"about:blank"}}).to_string().into())).await.unwrap();
+        let mut session = None;
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+            if let Message::Text(text) = message {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if let Some(id) = value["params"]["sessionId"].as_str() { session = Some(id.to_string()); }
+                if value["id"] == 1 { break; }
+            }
+        }
+        let body = format!(r#"
+            const channel = new MessageChannel();
+            const deadline = Date.now() + 5000;
+            let turns = 0;
+            channel.port1.onmessage = () => {{
+                turns++;
+                const taskEnd = Date.now() + 60;
+                while (Date.now() < taskEnd) {{}}
+                if (Date.now() < deadline) channel.port2.postMessage(null);
+            }};
+            channel.port2.postMessage(null);
+            const text = await (await fetch({url:?})).text();
+            channel.port1.close(); channel.port2.close();
+            return {{text, turns}};
+        "#);
+        for (id, method, params) in [
+            (2, "Runtime.evaluate", json!({"expression":format!("(async()=>{{{body}}})()"),"awaitPromise":true,"returnByValue":true})),
+            (3, "Runtime.callFunctionOn", json!({"functionDeclaration":format!("async function(){{{body}}}"),"awaitPromise":true,"returnByValue":true})),
+        ] {
+            let started = Instant::now();
+            ws.send(Message::Text(json!({"id":id,"method":method,"sessionId":session,"params":params}).to_string().into())).await.unwrap();
+            loop {
+                let message = tokio::time::timeout(Duration::from_secs(8), ws.next()).await.unwrap().unwrap().unwrap();
+                if let Message::Text(text) = message {
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if value["id"] == id {
+                        assert_eq!(value["result"]["result"]["value"]["text"], "hydrated", "{value}");
+                        assert!(value["result"]["result"]["value"]["turns"].as_f64().unwrap() > 0.0);
+                        break;
+                    }
+                }
+            }
+            assert!(started.elapsed() < Duration::from_secs(2),
+                "{method} starved network work behind ready page tasks: {:?}", started.elapsed());
+        }
+        ws.send(Message::Text(json!({"id":4,"method":"Runtime.evaluate","sessionId":session,
+            "params":{"expression":format!("(async()=>{{{body}}})().then(value => globalThis.__autonomousFetch = value); 'armed'"),"returnByValue":true}}).to_string().into())).await.unwrap();
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+            if let Message::Text(text) = message {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["id"] == 4 {
+                    assert_eq!(value["result"]["result"]["value"], "armed", "{value}");
+                    break;
+                }
+            }
+        }
+        // No awaited command drives this fetch: the idle browser pump must
+        // share the owning Tokio runtime with the network tasks too.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        ws.send(Message::Text(json!({"id":5,"method":"Runtime.evaluate","sessionId":session,
+            "params":{"expression":"globalThis.__autonomousFetch","returnByValue":true}}).to_string().into())).await.unwrap();
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+            if let Message::Text(text) = message {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["id"] == 5 {
+                    assert_eq!(value["result"]["result"]["value"]["text"], "hydrated",
+                        "autonomous page tasks starved background networking: {value}");
+                    break;
+                }
+            }
+        }
+        ws.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while live.load(Ordering::Acquire) != 0 { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.expect("connection must release its slot");
     }
 
     fn cookie(name: &str, value: &str) -> CookieInfo {
@@ -2647,6 +3111,53 @@ mod tests {
         assert!(!cookies.iter().any(|c| c.name == "removed"));
     }
 
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorded_navigation_emits_new_document_frame_before_load_completion() {
+        use base64::Engine as _;
+        tokio::task::LocalSet::new().run_until(async {
+            let mut ctx = crate::dispatch::CdpContext::new();
+            let page_id = ctx.create_page();
+            let session = Some(format!("{page_id}-session"));
+            ctx.sessions.insert(session.clone().unwrap(), page_id);
+            crate::domains::page::handle("navigate", &json!({
+                "url":"data:text/html,<body style='background:white'>", "waitUntil":"load"
+            }), &mut ctx, &session).await.unwrap();
+            crate::domains::page::handle("startScreencast", &json!({
+                "format":"png", "maxWidth":8, "maxHeight":8
+            }), &mut ctx, &session).await.unwrap();
+            let stream_id = ctx.screencasts[session.as_ref().unwrap()].session_id;
+            crate::domains::page::handle("screencastFrameAck", &json!({"sessionId":stream_id}),
+                &mut ctx, &session).await.unwrap();
+            ctx.pending_events.clear();
+
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (_server_tx, mut server_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut intercept_rx = None;
+            let mut paused = HashMap::new();
+            let mut deferred = std::collections::VecDeque::new();
+            super::process_with_interception(&json!({
+                "id":1, "method":"Page.navigate", "sessionId":session,
+                "params":{"url":"data:text/html,<body style='background:rgb(0,0,255)'>", "waitUntil":"load"}
+            }).to_string(), &mut ctx, &reply_tx, &mut server_rx,
+                &mut intercept_rx, &mut paused, &mut deferred, true).await;
+            let mut events = Vec::new();
+            while let Ok(text) = reply_rx.try_recv() {
+                events.push(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+            }
+            let frame = events.iter().position(|event| event["method"] == "Page.screencastFrame")
+                .expect("recorded navigation must not wait for a later compositor tick");
+            let loaded = events.iter().position(|event| event["method"] == "Page.loadEventFired")
+                .expect("load completion");
+            assert!(frame < loaded, "a client can stop recording immediately after load");
+            assert_eq!(events[frame]["sessionId"], json!(session));
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(events[frame]["params"]["data"].as_str().unwrap()).unwrap();
+            let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            assert_eq!(image.get_pixel(image.width()/2, image.height()/2).0, [0,0,255,255]);
+        }).await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn intercepted_request_bursts_and_script_navigation_keep_servicing_replies() {
         use std::time::Duration;
@@ -2737,6 +3248,191 @@ mod tests {
                     }
                 }).await.unwrap_or_else(|_| panic!("{method} stalled after {pauses} intercepted requests"));
                 assert_eq!(pauses, 64, "{method} must service every paused request");
+            }
+            drop(server_tx);
+            tokio::time::timeout(Duration::from_secs(2), processor).await.unwrap().unwrap();
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_runtime_evaluations_do_not_block_their_resolver() {
+        use super::{cdp_processor, CdpContext, CdpMessage, ServerMessage};
+        use serde_json::Value;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+        tokio::task::LocalSet::new().run_until(async {
+            let (server_tx, server_rx) = mpsc::unbounded_channel();
+            let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+            let processor = tokio::task::spawn_local(cdp_processor(
+                server_rx, CdpContext::new().default_context,
+                std::sync::Arc::new(tokio::sync::Notify::new()),
+            ));
+            server_tx.send(ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
+            reply_rx.recv().await.unwrap();
+            let send = |value: Value| {
+                server_tx.send(ServerMessage::Cdp(CdpMessage {
+                    text: value.to_string(), reply_tx: reply_tx.clone(),
+                })).unwrap();
+            };
+            send(json!({"id": 1, "method": "Target.createTarget", "params": {"url": "about:blank"}}));
+            let mut session = None;
+            loop {
+                let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                if let Some(id) = value["params"]["sessionId"].as_str() { session = Some(id.to_string()); }
+                if value["id"] == 1 { break; }
+            }
+            let session = session.expect("attached session");
+            for (id, method, params) in [
+                (2, "Runtime.evaluate", json!({"expression": "new Promise(resolve => globalThis.releasePending = resolve)", "awaitPromise": true, "returnByValue": true})),
+                (3, "Runtime.callFunctionOn", json!({"functionDeclaration": "function(){ return new Promise(resolve => globalThis.releasePending = resolve) }", "awaitPromise": true, "returnByValue": true})),
+            ] {
+                send(json!({"id": id, "method": method, "sessionId": session, "params": params}));
+                send(json!({"id": id + 10, "method": "Runtime.evaluate", "sessionId": session,
+                    "params": {"expression": "releasePending(42); 'released'", "returnByValue": true}}));
+                let mut resolved = false;
+                let mut released = false;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !resolved || !released {
+                        let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                        if value["id"] == id {
+                            assert!(value.get("error").is_none(), "{value}");
+                            assert_eq!(value["result"]["result"]["value"].as_f64(), Some(42.0));
+                            resolved = true;
+                        } else if value["id"] == id + 10 {
+                            assert_eq!(value["result"]["result"]["value"], "released", "{value}");
+                            released = true;
+                        }
+                    }
+                }).await.expect("a pending promise must not block the command that resolves it");
+            }
+            send(json!({"id": 100, "method": "Runtime.evaluate", "sessionId": session,
+                "params": {"expression": "location.href='data:text/html,<title>next</title>'; 42", "awaitPromise": true, "returnByValue": true}}));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                    if value["id"] == 100 {
+                        assert!(value.get("error").is_none(), "plain return must precede navigation: {value}");
+                        assert_eq!(value["result"]["result"]["value"].as_f64(), Some(42.0));
+                        break;
+                    }
+                }
+            }).await.expect("script-initiated navigation must not discard a settled reply");
+            std::env::set_var("OBSCURA_CDP_COMMAND_TIMEOUT_MS", "50");
+            send(json!({"id": 200, "method": "Runtime.evaluate", "sessionId": session,
+                "params": {"expression": "new Promise(resolve => setTimeout(() => resolve({get trap(){while(true){}}}), 10))", "awaitPromise": true, "returnByValue": true}}));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                    if value["id"] == 200 {
+                        assert!(value.get("error").is_some(), "a deferred result getter must remain watchdog-bounded: {value}");
+                        break;
+                    }
+                }
+            }).await.expect("deferred result serialization must not hang the worker");
+            send(json!({"id": 201, "method": "Runtime.evaluate", "sessionId": session,
+                "params": {"expression": "21*2", "returnByValue": true}}));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                    if value["id"] == 201 {
+                        assert_eq!(value["result"]["result"]["value"].as_f64(), Some(42.0), "{value}");
+                        break;
+                    }
+                }
+            }).await.expect("the page must remain usable after a result getter is terminated");
+            drop(server_tx);
+            tokio::time::timeout(Duration::from_secs(2), processor).await.unwrap().unwrap();
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn awaited_runtime_requests_keep_servicing_route_replies() {
+        use super::{cdp_processor, CdpContext, CdpMessage, ServerMessage};
+        use serde_json::Value;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        tokio::task::LocalSet::new().run_until(async {
+            let (server_tx, server_rx) = mpsc::unbounded_channel();
+            let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+            let context = CdpContext::new().default_context;
+            let processor = tokio::task::spawn_local(cdp_processor(
+                server_rx, context, std::sync::Arc::new(tokio::sync::Notify::new()),
+            ));
+            server_tx.send(ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
+            reply_rx.recv().await.unwrap();
+            let send = |value: Value| {
+                server_tx.send(ServerMessage::Cdp(CdpMessage {
+                    text: value.to_string(), reply_tx: reply_tx.clone(),
+                })).unwrap();
+            };
+            send(json!({"id": 1, "method": "Target.createTarget", "params": {"url": "about:blank"}}));
+            let mut session = None;
+            loop {
+                let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                if let Some(id) = value["params"]["sessionId"].as_str() { session = Some(id.to_string()); }
+                if value["id"] == 1 { break; }
+            }
+            let session = session.expect("attached session");
+            send(json!({"id": 2, "method": "Fetch.enable", "sessionId": session,
+                "params": {"patterns": [{"urlPattern": "http://127.0.0.1:9/*"}]}}));
+            loop {
+                let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                if value["id"] == 2 { break; }
+            }
+            let target_id = session.strip_suffix("-session").unwrap();
+            send(json!({"id": 50, "method": "Target.attachToTarget",
+                "params": {"targetId": target_id, "flatten": true}}));
+            let observer = loop {
+                let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                if value["id"] == 50 { break value["result"]["sessionId"].as_str().unwrap().to_string(); }
+            };
+            let body = "let result=''; for(let i=0;i<2;i++) result+=await (await fetch('http://127.0.0.1:9/'+i)).text(); return result";
+            for (id, method, params) in [
+                (3, "Runtime.evaluate", json!({"expression": format!("(async()=>{{{body}}})()"), "awaitPromise": true, "returnByValue": true})),
+                (4, "Runtime.callFunctionOn", json!({"functionDeclaration": format!("async function(){{{body}}}"), "awaitPromise": true, "returnByValue": true})),
+            ] {
+                send(json!({"id": id, "method": method, "sessionId": session, "params": params}));
+                send(json!({"id": 10 + id, "method": "Runtime.evaluate", "sessionId": session,
+                    "params": {"expression": "21*2", "returnByValue": true}}));
+                let mut pauses = 0;
+                let mut completed = false;
+                let mut finished = 0;
+                let mut deferred_completed = false;
+                let mut driver_requests = Vec::new();
+                let mut observer_requests = Vec::new();
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                        if value["method"] == "Network.requestWillBeSent" {
+                            if value["sessionId"] == session {
+                                driver_requests.push(value["params"].clone());
+                            } else if value["sessionId"] == observer {
+                                observer_requests.push(value["params"].clone());
+                            }
+                        }
+                        if value["method"] == "Fetch.requestPaused" {
+                            assert_eq!(value["sessionId"], session);
+                            pauses += 1;
+                            send(json!({"id": 100 + pauses, "method": "Fetch.fulfillRequest", "sessionId": session,
+                                "params": {"requestId": value["params"]["requestId"], "responseCode": 200,
+                                    "body": "b2s=", "responseHeaders": [{"name": "access-control-allow-origin", "value": "*"}]}}));
+                        }
+                        if value["id"] == id {
+                            assert_eq!(value["result"]["result"]["value"], "okok", "{value}");
+                            assert_eq!(pauses, 2);
+                            completed = true;
+                        }
+                        if value["method"] == "Network.loadingFinished" && value["sessionId"] == session { finished += 1; }
+                        if value["id"] == 10 + id {
+                            assert_eq!(value["result"]["result"]["value"].as_f64(), Some(42.0));
+                            deferred_completed = true;
+                        }
+                        if completed && deferred_completed && finished == 2 && observer_requests.len() == 2 { break; }
+                    }
+                }).await.expect("awaited evaluation must service route replies");
+                assert_eq!(driver_requests.len(), 2);
+                assert_eq!(observer_requests, driver_requests);
             }
             drop(server_tx);
             tokio::time::timeout(Duration::from_secs(2), processor).await.unwrap().unwrap();
@@ -2877,16 +3573,464 @@ mod tests {
         assert!(parse_cdp_headers(&json!({"url": "https://example.com"})).is_none());
     }
 
+    async fn assert_navigation_intercept_reply_without_timer(method: &str) {
+        use super::{process_with_interception, CdpMessage, ServerMessage, MAX_DEFERRED_MESSAGES};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use obscura_js::ops::{InterceptedRequest, InterceptResolution};
+
+        tokio::task::LocalSet::new().run_until(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (requested_tx, requested_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let fixture = tokio::task::spawn_local(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                requested_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                let body = b"<!doctype html><title>Finished</title><h1>Finished</h1>";
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            });
+
+            let context = obscura_browser::context::BrowserContext::with_storage_and_network(
+                "interception-test".into(), None, false, None, None, true,
+            );
+            let mut ctx = crate::dispatch::CdpContext::new_with_shared_context(std::sync::Arc::new(context));
+            let page_id = ctx.create_page();
+            let session_id = format!("{page_id}-session");
+            ctx.sessions.insert(session_id.clone(), page_id.clone());
+            let (server_tx, mut server_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (intercept_tx, intercept_rx) = tokio::sync::mpsc::unbounded_channel();
+            ctx.intercept_tx = Some(intercept_tx.clone());
+            let command = json!({"id": 1, "method": "Page.navigate", "sessionId": session_id,
+                "params": {"url": format!("http://{address}/"), "waitUntil": "load"}}).to_string();
+            let navigation_reply = reply_tx.clone();
+            let navigation = tokio::task::spawn_local(async move {
+                let mut intercept_rx = Some(intercept_rx);
+                let mut paused = HashMap::new();
+                let mut deferred = std::collections::VecDeque::new();
+                process_with_interception(&command, &mut ctx, &navigation_reply,
+                    &mut server_rx, &mut intercept_rx, &mut paused, &mut deferred, true).await;
+                (ctx, paused, deferred)
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), requested_rx)
+                .await.expect("navigation must reach the held response").unwrap();
+
+            // The real socket is already connected and its response is gated.
+            // Only the channel handshake below runs with a paused clock. An
+            // unconditional timer auto-advances it, independent of host load.
+            tokio::time::pause();
+            let started = tokio::time::Instant::now();
+            let (resolution_tx, resolution_rx) = tokio::sync::oneshot::channel();
+            intercept_tx.send(InterceptedRequest {
+                page_id: page_id.clone(),
+                request_id: "pending-test".into(), url: format!("http://{address}/pending"),
+                method: "GET".into(), headers: HashMap::new(), resource_type: "Fetch".into(),
+                resolver: resolution_tx,
+            }).unwrap();
+            loop {
+                let value: serde_json::Value = serde_json::from_str(
+                    &tokio::time::timeout(std::time::Duration::from_secs(1), reply_rx.recv())
+                        .await.expect("paused notification").unwrap()).unwrap();
+                assert_ne!(value["id"], 1, "navigation must wait for its response");
+                if value["method"] == "Fetch.requestPaused" {
+                    assert_eq!(value["params"]["requestId"], "pending-test");
+                    break;
+                }
+            }
+            let send = |value: serde_json::Value| {
+                server_tx.send(ServerMessage::Cdp(CdpMessage {
+                    text: value.to_string(), reply_tx: reply_tx.clone(),
+                })).unwrap();
+            };
+            let foreign_count = if method == "failRequest" { MAX_DEFERRED_MESSAGES + 1 } else { 1 };
+            for index in 0..foreign_count {
+                send(json!({"id": 100 + index, "method": "Runtime.evaluate",
+                    "sessionId": session_id, "params": {"expression": "globalThis.foreignRan=true"}}));
+            }
+            let mut params = json!({"requestId": "pending-test"});
+            match method {
+                "continueRequest" => {
+                    params["url"] = json!("https://example.com/rewritten");
+                    params["method"] = json!("POST");
+                    params["headers"] = json!([{"name": "X-Check", "value": "kept"}]);
+                    params["postData"] = json!("cGF5bG9hZA==");
+                }
+                "fulfillRequest" => {
+                    params["responseCode"] = json!(201);
+                    params["responseHeaders"] = json!([{"name": "X-Check", "value": "kept"}]);
+                    params["body"] = json!("aGVsbG8=");
+                }
+                "failRequest" => params["errorReason"] = json!("Aborted"),
+                _ => unreachable!(),
+            }
+            send(json!({"id": 10, "method": format!("Fetch.{method}"),
+                "sessionId": session_id, "params": params}));
+            let mut overflow_responses = 0;
+            loop {
+                let value: serde_json::Value = serde_json::from_str(
+                    &tokio::time::timeout(std::time::Duration::from_secs(1), reply_rx.recv())
+                        .await.expect("Fetch resolution reply").unwrap()).unwrap();
+                assert_ne!(value["id"], 1, "must not acknowledge unfinished navigation");
+                if value["id"] == 10 {
+                    assert!(value.get("error").is_none(), "{value}");
+                    break;
+                }
+                if value.get("id").is_some() {
+                    assert_eq!(value["id"], 100 + MAX_DEFERRED_MESSAGES);
+                    assert_eq!(value["error"]["code"], -32000);
+                    overflow_responses += 1;
+                }
+            }
+            let elapsed = started.elapsed();
+            match (method, resolution_rx.await.unwrap()) {
+                ("continueRequest", InterceptResolution::Continue { url, method, headers, body }) => {
+                    assert_eq!(url.as_deref(), Some("https://example.com/rewritten"));
+                    assert_eq!(method.as_deref(), Some("POST"));
+                    assert_eq!(headers.unwrap().get("X-Check").map(String::as_str), Some("kept"));
+                    assert_eq!(body.as_deref(), Some(b"payload".as_slice()));
+                }
+                ("fulfillRequest", InterceptResolution::Fulfill { status, headers, body, body_base64 }) => {
+                    assert_eq!(status, 201);
+                    assert_eq!(headers.get("X-Check").map(String::as_str), Some("kept"));
+                    assert_eq!(body, "hello");
+                    assert_eq!(body_base64, "aGVsbG8=");
+                }
+                ("failRequest", InterceptResolution::Fail { reason }) => assert_eq!(reason, "Aborted"),
+                _ => panic!("resolution kind changed"),
+            }
+            tokio::time::resume();
+            release_tx.send(()).unwrap();
+            let (ctx, paused, deferred) = tokio::time::timeout(std::time::Duration::from_secs(5), navigation)
+                .await.expect("navigation completion").unwrap();
+            fixture.await.unwrap();
+            assert_eq!(ctx.pages.len(), 1);
+            assert_eq!(ctx.pages[0].url_string(), format!("http://{address}/"));
+            assert!(paused.is_empty());
+            assert_eq!(deferred.len(), foreign_count.min(MAX_DEFERRED_MESSAGES));
+            assert_eq!(overflow_responses, usize::from(foreign_count > MAX_DEFERRED_MESSAGES));
+            let replies: Vec<serde_json::Value> = std::iter::from_fn(|| reply_rx.try_recv().ok())
+                .map(|text| serde_json::from_str(&text).unwrap()).collect();
+            assert_eq!(replies.iter().filter(|reply| reply["id"] == 1).count(), 1);
+            let navigation_reply = replies.iter().find(|reply| reply["id"] == 1).unwrap();
+            assert!(navigation_reply.get("error").is_none(), "{navigation_reply}");
+            assert!(!replies.iter().any(|reply| reply["id"] == 10), "no duplicate resolution reply");
+            assert_eq!(elapsed, std::time::Duration::ZERO, "ready replies must not wait for a timer");
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_intercept_continue_has_no_timer_delay() {
+        assert_navigation_intercept_reply_without_timer("continueRequest").await;
+    }
+
+    async fn assert_stop_loading_cancels_navigation(script: bool, method: &str) {
+        use super::{process_cdp_message, process_with_interception, CdpMessage, ServerMessage};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::task::LocalSet::new().run_until(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (requested_tx, requested_rx) = tokio::sync::oneshot::channel();
+            let fixture = tokio::task::spawn_local(async move {
+                if script {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0; 2048];
+                    stream.read(&mut buffer).await.unwrap();
+                    let body = "<!doctype html><title>Partial</title><script src='/held.js'></script>";
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 2048];
+                assert!(stream.read(&mut buffer).await.unwrap() > 0);
+                requested_tx.send(()).unwrap();
+                // No response: cancellation must drop the pending HTTP request.
+                assert_eq!(stream.read(&mut buffer).await.unwrap(), 0);
+            });
+            let context = obscura_browser::context::BrowserContext::with_storage_and_network(
+                "stop-loading-test".into(), None, false, None, None, true,
+            );
+            let mut ctx = crate::dispatch::CdpContext::new_with_shared_context(std::sync::Arc::new(context));
+            let page_id = ctx.create_page();
+            let other_page = ctx.create_page();
+            let session = format!("{page_id}-session");
+            ctx.sessions.insert(session.clone(), page_id.clone());
+            ctx.sessions.insert("raw-session".into(), page_id.clone());
+            ctx.sessions.insert("other-session".into(), other_page.clone());
+            ctx.get_page_mut(&page_id).unwrap().resume_js();
+            let original_url = ctx.pages[0].url_string();
+            let (server_tx, mut server_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+            let navigation_reply = reply_tx.clone();
+            let url = format!("http://{address}/");
+            let command = json!({"id": 1, "method": "Page.navigate", "sessionId": session,
+                "params": {"url": url, "waitUntil": "load"}}).to_string();
+            let navigation = tokio::task::spawn_local(async move {
+                let mut paused = HashMap::new();
+                let mut deferred = std::collections::VecDeque::new();
+                process_with_interception(&command, &mut ctx, &navigation_reply,
+                    &mut server_rx, &mut None, &mut paused, &mut deferred, true).await;
+                (ctx, paused, deferred)
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), requested_rx)
+                .await.expect("fixture request").unwrap();
+            for (id, session) in [(2, "other-session"), (3, "raw-session")] {
+                server_tx.send(ServerMessage::Cdp(CdpMessage {
+                    text: json!({"id": id, "method": if id == 2 { "Page.stopLoading" } else { method },
+                        "sessionId": session, "params": {"targetId": page_id}}).to_string(),
+                    reply_tx: reply_tx.clone(),
+                })).unwrap();
+            }
+            let (mut ctx, paused, deferred) = tokio::time::timeout(std::time::Duration::from_secs(2), navigation)
+                .await.expect("Page.stopLoading must cancel without waiting for the HTTP timeout").unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), fixture)
+                .await.expect("pending request socket must close").unwrap();
+            assert!(paused.is_empty());
+            assert_eq!(deferred.len(), if method == "Page.stopLoading" { 1 } else { 2 },
+                "another target's stop must not cancel this navigation");
+            for message in deferred {
+                if let ServerMessage::Cdp(message) = message {
+                    process_cdp_message(&message.text, &mut ctx, &message.reply_tx).await;
+                }
+            }
+            let replies: Vec<serde_json::Value> = std::iter::from_fn(|| reply_rx.try_recv().ok())
+                .map(|text| serde_json::from_str(&text).unwrap()).collect();
+            assert_eq!(replies.iter().filter(|reply| reply["id"] == 3).count(), 1);
+            let stopped = replies.iter().find(|reply| reply["id"] == 3).unwrap();
+            assert!(stopped.get("error").is_none(), "{stopped}");
+            let aborted = replies.iter().find(|reply| reply["id"] == 1).unwrap();
+            assert!(aborted.get("error").is_none(), "{aborted}");
+            if !script {
+                assert_eq!(aborted["result"]["errorText"], "net::ERR_ABORTED", "{aborted}");
+            }
+            assert!(!replies.iter().any(|reply| reply["method"] == "Page.loadEventFired"));
+            assert!(replies.iter().any(|reply| reply["method"] == "Page.frameStoppedLoading"));
+            assert!(ctx.get_page(&other_page).is_some());
+            if method != "Page.stopLoading" {
+                assert!(ctx.get_page(&page_id).is_none());
+                assert_eq!(replies.iter().filter(|reply| reply["method"] == "Target.targetDestroyed").count(), 1);
+                return;
+            }
+            assert_eq!(ctx.get_page(&page_id).unwrap().url_string(), if script { url } else { original_url });
+            assert_eq!(ctx.get_page_mut(&page_id).unwrap().evaluate("1 + 2").as_f64(), Some(3.0));
+            process_cdp_message(&json!({"id": 4, "method": "Page.navigate", "sessionId": session,
+                "params": {"url": "about:blank"}}).to_string(), &mut ctx, &reply_tx).await;
+            assert_eq!(ctx.get_page(&page_id).unwrap().url_string(), "about:blank");
+        }).await;
+    }
+
+    async fn routed_document_events(scenario: &str) -> Vec<serde_json::Value> {
+        tokio::task::LocalSet::new().run_until(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/start", listener.local_addr().unwrap());
+            drop(listener);
+            let context = obscura_browser::context::BrowserContext::with_storage_and_network(
+                "routed-lifecycle".into(), None, false, None, None, true,
+            );
+            let mut ctx = crate::dispatch::CdpContext::new_with_shared_context(std::sync::Arc::new(context));
+            let page_id = ctx.create_page();
+            let session = format!("{page_id}-session");
+            ctx.sessions.insert(session.clone(), page_id.clone());
+            let mut intercept_rx = Some(ctx.get_page_mut(&page_id).unwrap().enable_interception());
+            let (server_tx, mut server_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+            let command = json!({"id": 1, "method": "Page.navigate", "sessionId": session,
+                "params": {"url": url}}).to_string();
+            let mut paused = HashMap::new();
+            let mut deferred = std::collections::VecDeque::new();
+            let navigation = async {
+                super::process_with_interception(&command, &mut ctx, &reply_tx,
+                    &mut server_rx, &mut intercept_rx, &mut paused, &mut deferred, true).await;
+                let _ = done_tx.send(());
+            };
+            let client = async {
+                use base64::Engine as _;
+                let mut events = Vec::new();
+                let mut pauses = 0;
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some(text) = reply_rx.recv() => {
+                            let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                            if event["method"] == "Fetch.requestPaused" {
+                                pauses += 1;
+                                let request_id = &event["params"]["requestId"];
+                                let stop = scenario == "chain-stop" && pauses == 2;
+                                let method = if stop { "Page.stopLoading" }
+                                    else if scenario == "abort" { "Fetch.failRequest" }
+                                    else if scenario == "transport" || (scenario == "chain-fail" && pauses == 2) { "Fetch.continueRequest" }
+                                    else { "Fetch.fulfillRequest" };
+                                let body = if pauses == 1 && scenario.starts_with("chain") {
+                                    "<script>location.replace('/finish')</script>"
+                                } else if pauses == 1 && scenario == "repeat" {
+                                    "<script>location.reload()</script>"
+                                } else { "<title>Finished</title>" };
+                                server_tx.send(super::ServerMessage::Cdp(super::CdpMessage {
+                                    text: json!({"id": pauses + 1, "method": method, "sessionId": session,
+                                        "params": {"requestId": request_id, "errorReason": "Aborted", "responseCode": 200,
+                                            "responseHeaders": [{"name": "Content-Type", "value": "text/html"}],
+                                            "body": base64::engine::general_purpose::STANDARD.encode(body)}}).to_string(),
+                                    reply_tx: reply_tx.clone(),
+                                })).unwrap();
+                            }
+                            events.push(event);
+                        }
+                        _ = &mut done_rx => break,
+                    }
+                }
+                events
+            };
+            let (_, events) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(navigation, client)
+            }).await.expect("routed navigation must finish");
+            events
+        }).await
+    }
+
+    fn assert_routed_completions(events: &[serde_json::Value], finished: usize, failed: usize) {
+        let requests: Vec<_> = events.iter().filter(|event| event["method"] == "Network.requestWillBeSent").collect();
+        let completed: Vec<_> = events.iter().filter(|event| event["method"] == "Network.loadingFinished").collect();
+        let errors: Vec<_> = events.iter().filter(|event| event["method"] == "Network.loadingFailed").collect();
+        assert_eq!(requests.len(), finished + failed, "{events:?}");
+        assert_eq!(completed.len(), finished, "{events:?}");
+        assert_eq!(errors.len(), failed, "{events:?}");
+        for request in requests {
+            let id = &request["params"]["requestId"];
+            assert_eq!(completed.iter().chain(errors.iter()).filter(|event| &event["params"]["requestId"] == id).count(), 1,
+                "each published request must finish exactly once: {events:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn routed_document_transport_failure_finishes_its_request() {
+        assert_routed_completions(&routed_document_events("transport").await, 0, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn routed_document_abort_finishes_once_with_canonical_error() {
+        let events = routed_document_events("abort").await;
+        assert_routed_completions(&events, 0, 1);
+        let error = events.iter().find(|event| event["method"] == "Network.loadingFailed").unwrap();
+        assert_eq!(error["params"]["errorText"], "net::ERR_ABORTED");
+        assert_eq!(error["params"]["canceled"], true);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn routed_document_script_navigation_preserves_both_completions() {
+        assert_routed_completions(&routed_document_events("chain").await, 2, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn routed_document_reload_preserves_both_completions() {
+        assert_routed_completions(&routed_document_events("repeat").await, 2, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn routed_document_script_navigation_failure_finishes_both_requests() {
+        assert_routed_completions(&routed_document_events("chain-fail").await, 1, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn routed_document_script_navigation_stop_finishes_both_requests() {
+        assert_routed_completions(&routed_document_events("chain-stop").await, 1, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_loading_finishes_the_intercepted_document_request() {
+        tokio::task::LocalSet::new().run_until(async {
+            let mut ctx = crate::dispatch::CdpContext::new();
+            let page_id = ctx.create_page();
+            let session = format!("{page_id}-session");
+            ctx.sessions.insert(session.clone(), page_id.clone());
+            let mut intercept_rx = Some(ctx.get_page_mut(&page_id).unwrap().enable_interception());
+            let (server_tx, mut server_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let command = json!({"id": 1, "method": "Page.navigate", "sessionId": session,
+                "params": {"url": "http://127.0.0.1:9/paused"}}).to_string();
+            let mut paused = HashMap::new();
+            let mut deferred = std::collections::VecDeque::new();
+            let client = async {
+                let mut network_id = None;
+                let mut request_events = 0;
+                while let Some(text) = reply_rx.recv().await {
+                    let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if event["method"] == "Network.requestWillBeSent" { request_events += 1; }
+                    if event["method"] == "Fetch.requestPaused" {
+                        network_id = Some(event["params"]["networkId"].clone());
+                        server_tx.send(super::ServerMessage::Cdp(super::CdpMessage {
+                            text: json!({"id": 2, "method": "Page.stopLoading", "sessionId": session}).to_string(),
+                            reply_tx: reply_tx.clone(),
+                        })).unwrap();
+                    }
+                    if event["method"] == "Network.loadingFailed" {
+                        assert_eq!(Some(event["params"]["requestId"].clone()), network_id,
+                            "cancellation must finish the request that was paused");
+                        assert_eq!(request_events, 1, "a paused request must not be published twice");
+                        break;
+                    }
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(super::process_with_interception(&command, &mut ctx, &reply_tx,
+                    &mut server_rx, &mut intercept_rx, &mut paused, &mut deferred, true), client);
+            }).await.unwrap();
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_loading_cancels_a_held_document_request() {
+        assert_stop_loading_cancels_navigation(false, "Page.stopLoading").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_loading_cancels_a_held_parser_script_request() {
+        assert_stop_loading_cancels_navigation(true, "Page.stopLoading").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_loading_cancels_for_page_close() {
+        assert_stop_loading_cancels_navigation(false, "Page.close").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_loading_cancels_for_target_close() {
+        assert_stop_loading_cancels_navigation(false, "Target.closeTarget").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_intercept_fulfill_has_no_timer_delay() {
+        assert_navigation_intercept_reply_without_timer("fulfillRequest").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_intercept_fail_keeps_deferral_bounded_without_delay() {
+        assert_navigation_intercept_reply_without_timer("failRequest").await;
+    }
+
     #[test]
     fn fetch_resolution_is_handled_once_by_the_outer_processor() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false})]);
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let mut ctx = crate::dispatch::CdpContext::new();
-
+        assert!(!handle_fetch_resolution(
+            r#"{"id":16,"method":"Network.getResponseBody","params":{"requestId":"request-1"}}"#,
+            &reply_tx,
+            &mut paused,
+        ));
+        assert!(paused.contains_key("request-1"), "unrelated commands must not consume the resolver");
         assert!(handle_fetch_resolution(
             r#"{"id":17,"method":"Fetch.continueRequest","params":{"requestId":"request-1"}}"#,
-            &mut ctx,
             &reply_tx,
             &mut paused,
         ));
@@ -2898,6 +4042,61 @@ mod tests {
             serde_json::from_str(&reply_rx.try_recv().expect("one command response")).unwrap();
         assert_eq!(response["id"], 17);
         assert!(reply_rx.try_recv().is_err(), "must not emit a duplicate response");
+
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        paused.insert("request-2".into(), super::PausedIntercept {resolver: resolution_tx, main_document: false});
+        assert!(handle_fetch_resolution(
+            r#"{"id":18,"method":"Fetch.failRequest","sessionId":"page-session","params":{"requestId":"request-2","errorReason":"Aborted"}}"#,
+            &reply_tx, &mut paused,
+        ));
+        assert!(matches!(resolution_rx.try_recv(), Ok(obscura_js::ops::InterceptResolution::Fail { reason }) if reason == "Aborted"));
+        let event: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(event["method"], "Network.loadingFailed");
+        assert_eq!(event["sessionId"], "page-session");
+        assert_eq!(event["params"]["requestId"], "request-2");
+        assert_eq!(event["params"]["errorText"], "net::ERR_ABORTED");
+        assert_eq!(event["params"]["canceled"], true);
+        let response: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(response["id"], 18);
+        assert!(reply_rx.try_recv().is_err(), "abort emits one failure and one response");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn indexeddb_versionchange_rearms_an_idle_page_until_its_delayed_close() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let id = ctx.create_page();
+            let session = Some(format!("{id}-session"));
+            ctx.sessions.insert(session.clone().unwrap(),id.clone());
+            crate::domains::page::handle("navigate", &json!({"url":"data:text/html,<body>idb</body>"}), &mut ctx, &session).await.unwrap();
+            ctx.get_page_mut(&id).unwrap().js.as_mut().unwrap().set_url("https://idb.test/");
+            ids.push(id);
+        }
+        let mut idle = Default::default();
+        ctx.get_page_mut(&ids[0]).unwrap().evaluate(r#"(() => {
+            const r = indexedDB.open('idle-upgrade',1);
+            globalThis.opened = false;
+            r.onsuccess = () => {globalThis.opened = true;
+                r.result.onversionchange = () => setTimeout(() => r.result.close(),10);};
+        })()"#);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !pump_live_page_event_loop(&mut ctx,&mut idle).await.unwrap() {}
+        }).await.unwrap();
+        assert!(idle.contains(&ids[0]));
+        assert_eq!(ctx.get_page_mut(&ids[0]).unwrap().evaluate("opened"),json!(true));
+        ctx.get_page_mut(&ids[1]).unwrap().evaluate(r#"(() => {
+            globalThis.upgraded = false;
+            setTimeout(() => {const r = indexedDB.open('idle-upgrade',2);
+                r.onsuccess = () => globalThis.upgraded = r.result.version === 2;},10);
+        })()"#);
+        idle.remove(&ids[1]);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                pump_live_page_event_loop(&mut ctx,&mut idle).await.unwrap();
+                if ctx.get_page_mut(&ids[1]).unwrap().evaluate("upgraded") == json!(true) {break;}
+            }
+        }).await.expect("versionchange must wake the idle page and retain its delayed-close work");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2966,6 +4165,188 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while !pump_live_page_event_loop(&mut ctx, &mut idle_pages).await.unwrap() {}
         }).await.expect("all idle pages must disarm the pump instead of spinning");
+    }
+
+    // #569 / #365 — postData is declared `binary` in the CDP domain, so a
+    // client sends it base64-encoded. Passing the encoded text straight through
+    // made the request body the base64 itself, which a server reads as neither
+    // the JSON nor the form the page meant to send.
+    #[test]
+    fn continue_request_decodes_a_base64_post_data() {
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false})]);
+        let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        // base64 of {"a":1}
+        assert!(handle_fetch_resolution(
+            r#"{"id":1,"method":"Fetch.continueRequest","params":{"requestId":"request-1","postData":"eyJhIjoxfQ=="}}"#,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        let Ok(obscura_js::ops::InterceptResolution::Continue { body, .. }) = resolution_rx.try_recv() else {
+            panic!("continueRequest must resolve as Continue");
+        };
+        assert_eq!(
+            body.as_deref(),
+            Some(br#"{"a":1}"#.as_slice()),
+            "the request body must be the bytes the client encoded, not the base64 text"
+        );
+    }
+
+    // The body a client rewrites is not always text -- a protobuf, a gzip
+    // stream, a multipart file part. Carrying it through `String` replaced
+    // every non-UTF-8 sequence with U+FFFD before it reached the wire.
+    #[test]
+    fn continue_request_keeps_a_non_utf8_post_data_intact() {
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false})]);
+        let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        // base64 of the three bytes 00 FF FE, which are not valid UTF-8
+        assert!(handle_fetch_resolution(
+            r#"{"id":1,"method":"Fetch.continueRequest","params":{"requestId":"request-1","postData":"AP/+"}}"#,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        let Ok(obscura_js::ops::InterceptResolution::Continue { body, .. }) = resolution_rx.try_recv() else {
+            panic!("continueRequest must resolve as Continue");
+        };
+        assert_eq!(
+            body.as_deref(),
+            Some([0x00u8, 0xFF, 0xFE].as_slice()),
+            "a binary body must reach the wire byte for byte"
+        );
+    }
+
+    // Base64 that is not base64 is a client mistake. Answering it silently is
+    // how raw text reached the wire as mangled bytes; answering it with an
+    // error while keeping the pause lets the client correct itself.
+    #[test]
+    fn continue_request_rejects_post_data_that_is_not_base64_without_wedging_it() {
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false})]);
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        assert!(handle_fetch_resolution(
+            r#"{"id":9,"method":"Fetch.continueRequest","params":{"requestId":"request-1","postData":"!!!not-base64"}}"#,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        let rejected: serde_json::Value =
+            serde_json::from_str(&reply_rx.try_recv().expect("one command response")).unwrap();
+        assert_eq!(rejected["id"], 9);
+        assert_eq!(rejected["error"]["code"], -32602);
+        assert!(
+            rejected["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("continueRequest postData is not valid base64"),
+            "the error must name the field, got {:?}",
+            rejected["error"]["message"]
+        );
+        assert!(
+            resolution_rx.try_recv().is_err(),
+            "a rejected command must not resolve the pause"
+        );
+        assert!(
+            paused.contains_key("request-1"),
+            "a rejected command must leave the request paused so it can be answered again"
+        );
+
+        // the same requestId, answered correctly, still drives the fetch
+        assert!(handle_fetch_resolution(
+            r#"{"id":10,"method":"Fetch.continueRequest","params":{"requestId":"request-1","postData":"eyJhIjoxfQ=="}}"#,
+            &reply_tx,
+            &mut paused,
+        ));
+        let Ok(obscura_js::ops::InterceptResolution::Continue { body, .. }) = resolution_rx.try_recv() else {
+            panic!("the corrected continueRequest must resolve as Continue");
+        };
+        assert_eq!(body.as_deref(), Some(br#"{"a":1}"#.as_slice()));
+    }
+
+    // The same strictness on the other arm carrying a CDP `binary` field.
+    #[test]
+    fn fulfill_request_preserves_repeated_set_cookie_headers() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("document-1".into(), super::PausedIntercept { resolver: tx, main_document: true })]);
+        let (reply_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        assert!(handle_fetch_resolution(r#"{"id":1,"method":"Fetch.fulfillRequest","params":{"requestId":"document-1","responseCode":200,"responseHeaders":[{"name":"Set-Cookie","value":"first=1; Path=/"},{"name":"Set-Cookie","value":"second=2; Path=/"},{"name":"set-cookie","value":"third=3; Path=/"},{"name":"Content-Type","value":"text/html"}]}}"#,
+            &reply_tx, &mut paused));
+        let Ok(obscura_js::ops::InterceptResolution::Fulfill { headers, .. }) = rx.try_recv() else {
+            panic!("fulfillment must resolve the paused document");
+        };
+        assert_eq!(headers.get("set-cookie").unwrap(), "first=1; Path=/\nsecond=2; Path=/\nthird=3; Path=/");
+        assert_eq!(headers.get("Content-Type").unwrap(), "text/html");
+    }
+
+    #[test]
+    fn fulfill_request_rejects_a_body_that_is_not_base64() {
+        let (resolution_tx, _resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false})]);
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        assert!(handle_fetch_resolution(
+            r#"{"id":11,"method":"Fetch.fulfillRequest","params":{"requestId":"request-1","responseCode":200,"body":"<html>"}}"#,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        let rejected: serde_json::Value =
+            serde_json::from_str(&reply_rx.try_recv().expect("one command response")).unwrap();
+        assert_eq!(rejected["error"]["code"], -32602);
+        assert!(
+            rejected["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("fulfillRequest body is not valid base64")
+        );
+        assert!(paused.contains_key("request-1"), "the request must stay paused");
+    }
+
+    #[test]
+    fn continue_request_rejects_invalid_binary_values_and_allows_retry() {
+        for value in [json!(null), json!(42), json!("AA="), json!("AB=="), json!("====")] {
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept { resolver: tx, main_document: false })]);
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+            let command = json!({"id": 1, "method": "Fetch.continueRequest",
+                "params": {"requestId": "request-1", "postData": value}}).to_string();
+            assert!(handle_fetch_resolution(&command, &reply_tx, &mut paused));
+            let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
+            assert_eq!(reply["error"]["code"], -32602, "accepted invalid postData: {value}");
+            assert!(matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+            assert!(paused.contains_key("request-1"));
+            assert!(handle_fetch_resolution(
+                r#"{"id":2,"method":"Fetch.continueRequest","params":{"requestId":"request-1","postData":""}}"#,
+                &reply_tx, &mut paused,
+            ));
+            assert!(matches!(rx.try_recv(), Ok(obscura_js::ops::InterceptResolution::Continue { body: Some(body), .. }) if body.is_empty()));
+            let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
+            assert!(reply.get("error").is_none());
+        }
+    }
+
+    // An absent postData still means "leave the body alone", not "send empty".
+    #[test]
+    fn continue_request_without_post_data_leaves_the_body_alone() {
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false})]);
+        let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        assert!(handle_fetch_resolution(
+            r#"{"id":1,"method":"Fetch.continueRequest","params":{"requestId":"request-1"}}"#,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        let Ok(obscura_js::ops::InterceptResolution::Continue { body, .. }) = resolution_rx.try_recv() else {
+            panic!("continueRequest must resolve as Continue");
+        };
+        assert!(body.is_none(), "an absent postData must not become an empty body");
     }
 
     #[cfg(feature = "render")]

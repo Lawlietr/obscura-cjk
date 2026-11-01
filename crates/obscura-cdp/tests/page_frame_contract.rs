@@ -13,6 +13,18 @@ async fn serve() -> String {
                 let mut buffer = [0u8; 2048];
                 let read = socket.read(&mut buffer).await.unwrap_or(0);
                 let request = String::from_utf8_lossy(&buffer[..read]);
+                let redirect = if request.starts_with("GET /redirect-chain.html ") {
+                    Some(("302 Found", "/redirect.html"))
+                } else if request.starts_with("GET /redirect.html ") {
+                    Some(("307 Temporary Redirect", "/child.html"))
+                } else {
+                    None
+                };
+                if let Some((status, location)) = redirect {
+                    let response = format!("HTTP/1.1 {status}\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    return;
+                }
                 let body = if request.starts_with("GET /child.html ") {
                     "<html><body>child</body></html>"
                 } else {
@@ -97,6 +109,42 @@ fn assert_frame_contract(frame: &Value) {
         frame["gatedAPIFeatures"].is_array(),
         "gatedAPIFeatures is missing: {frame}"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn redirected_document_response_is_bound_to_the_committed_loader() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session_id = format!("{page_id}-session");
+    ctx.sessions.insert(session_id.clone(), page_id);
+    let base = serve().await;
+    for path in ["child.html", "redirect.html", "redirect-chain.html"] {
+        ctx.pending_events.clear();
+        let navigation = cdp(&mut ctx, 1, "Page.navigate",
+            json!({"url": format!("{base}{path}"), "waitUntil": "load"}),
+            Some(&session_id)).await;
+        let loader = &navigation["loaderId"];
+        let request = ctx.pending_events.iter().position(|event|
+            event.method == "Network.requestWillBeSent" && event.params["type"] == "Document"
+        ).expect("document request");
+        let commit = ctx.pending_events.iter().position(|event|
+            event.method == "Page.frameNavigated"
+        ).expect("frame commit");
+        assert!(request < commit, "document request must precede frame commit");
+        assert_eq!(ctx.pending_events[request].params["requestId"], *loader);
+        assert_eq!(ctx.pending_events[request].params["request"]["url"], format!("{base}child.html"));
+        let response = ctx.pending_events.iter().find(|event|
+            event.method == "Network.responseReceived" && event.params["type"] == "Document"
+        ).expect("document response");
+        assert_eq!(response.params["requestId"], *loader);
+        assert_eq!(response.params["response"]["url"], format!("{base}child.html"));
+        assert_eq!(response.params["response"]["status"], 200);
+        let body = cdp(&mut ctx, 2, "Network.getResponseBody",
+            json!({"requestId": loader}), Some(&session_id)).await;
+        assert_eq!(body["body"], "<html><body>child</body></html>");
+        assert_eq!(body["base64Encoded"], false);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
